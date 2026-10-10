@@ -4,6 +4,10 @@
 
 下载的是**源码**，不是自带模型、数据库和 API 密钥的桌面安装包。以下步骤用于配置自己的模型服务、启动文档问答并上传资料。
 
+**首次部署请按本页的源码流程操作。** 根目录 `setup.ps1` / `setup.sh` 是上游保留的 Docker 安装器，默认使用上游已构建镜像，可能显示 DocsGPT 界面。它们不是知源当前推荐的启动入口。
+
+从 GitHub 下载 ZIP 时，先解压，再进入包含 `pyproject.toml` 的目录；不需要再执行 `git clone`。本页所有命令都从这个仓库根目录开始。
+
 ## 已经能打开网页？直接从这里开始
 
 1. 打开主页，点击 **管理 / 上传知识库**。也可在 **设置 → 知识库** 打开上传入口。
@@ -20,14 +24,27 @@
 
 ### 1. 安装依赖
 
+先检查工具是否可用：
+
 ```powershell
-uv sync
+uv --version
+node --version
+npm --version
+```
+
+Node.js 使用 **22.x**。若使用 Docker 启动数据库，再执行 `docker compose version` 并确保 Docker 服务运行。工具提示“找不到命令”时，先安装对应工具，重新打开终端后再检查。
+
+明确指定 Python 3.12，按仓库锁文件安装依赖，避免误用电脑上原有的 Python 3.10：
+
+```powershell
+uv sync --python 3.12 --locked
+uv run python --version
 Set-Location frontend
 npm ci --include=dev
 Set-Location ..
 ```
 
-macOS / Linux 将 `Set-Location` 改为 `cd`。
+macOS / Linux 将 `Set-Location` 改为 `cd`。确认 Python 输出为 3.12.x 后继续。依赖、Python 和 embedding 模型的首次准备都可能需要网络；不要因下载尚未完成就重复启动安装。
 
 ### 2. 准备数据库与配置
 
@@ -91,16 +108,31 @@ uv run python -m docsgpt beat
 
 然后打开 **http://localhost:5173**。API 默认在 **http://localhost:7091**；本地 Vite 页面是 5173。普通知识查询需要 worker，不能只开一个前端页面。Windows 当前 CLI 的 `--ui` 子进程使用 `npm`，本机实测得到 `FileNotFoundError`，因此指南使用上述分别启动的方式；PowerShell 中的 `npm run dev` 可以解析到 `npm.cmd`。
 
-**macOS / Linux：**可以在终端一使用 `uv run python -m docsgpt dev --ui`，由开发命令同时启动 API、worker 和前端。Windows 的终端二对应 `cd frontend`，适用于需要单独启动前端的情况。
+**macOS / Linux：**可以在终端一使用 `uv run python -m docsgpt dev --ui`，由开发命令同时启动 API、worker 和前端。需要单独启动前端时，使用 `cd frontend` 后执行 `npm run dev`。
 
 无付费生成的界面连通性检查：Windows 将终端一改为 `uv run python -m docsgpt dev --mock-llm`，保留另外两个终端；macOS / Linux 使用 `uv run python -m docsgpt dev --ui --mock-llm`。完成后切回真实配置，才能检验回答质量。修改前端 `.env.local` 后重启前端命令，页面才会读取新地址。
 
 不要用上游已构建的远程镜像替代本仓库源码 UI，否则会看不到知源的名称、语言选择和使用指南。
 
+### 5. 确认启动完成
+
+1. API / worker 终端保持运行，日志中没有持续出现数据库连接或认证错误。
+2. 前端终端显示实际访问地址；如果 5173 被占用，使用它打印的地址，而不是继续访问旧页面。
+3. 页面显示“知源”名称，能打开固定使用指南，并可切换 English。
+4. 按本页开头的示例 TXT 完成一次“上传 → 等待入库 → 选来源 → 提问 → 打开引用”。只有页面能打开，还不能证明文档问答可用。
+
+结束本地使用时，在启动服务的各终端按 `Ctrl+C`。若数据库由本页的 Docker Compose 启动，可执行 `docker compose -f deployment/docker-compose-dev.yaml stop`；该命令停止服务并保留数据库卷。下一次仍使用本页的启动命令。
+
 ## 常见问题
 
 | 现象 | 先检查 |
 |---|---|
+| 提示找不到 uv / npm / Docker | 是否安装对应工具、是否重新打开终端、命令是否已进入 PATH |
+| Python 版本不支持 | 使用 `uv sync --python 3.12 --locked`，再用 `uv run python --version` 检查项目环境 |
+| npm 提示 Node 版本不符合要求 | 使用 Node.js 22.x；不要在不同 Node 版本之间反复混用同一份安装目录 |
+| 5432 / 6379 端口已被占用 | 复用已有 PostgreSQL / Redis 并修改 `.env`，或调整 Compose 端口与连接地址 |
+| 打开的是 DocsGPT 而不是知源 | 是否运行了旧 setup 安装器或上游镜像；按本页启动源码前端并使用它打印的地址 |
+| 首次启动长时间等待模型下载 | 查看下载日志和网络；默认 embedding 模型不包含在源码 ZIP 内 |
 | 上传了却答不出 | 处理是否完成、聊天中是否选中正确来源、原文是否含答案 |
 | 文档入库失败 | worker 是否运行、INTERNAL_KEY 是否一致、文件是否能提取文字 |
 | 模型连接失败 | API 地址、模型名、密钥、额度和服务商状态 |
@@ -119,6 +151,8 @@ uv run python -m docsgpt beat
 - 当前版本不会自动执行回答中的命令。
 
 ## English quick guide
+
+Use the source-development steps on this page. The legacy root `setup.ps1` / `setup.sh` installers default to upstream images and may show the original DocsGPT UI. After extracting the ZIP, open the directory containing `pyproject.toml`. Run `uv sync --python 3.12 --locked` and verify with `uv run python --version`; use Node.js 22.x for `npm ci --include=dev` in `frontend/`.
 
 This download contains source code, not a standalone desktop installer. Install Python 3.12, Node.js 22, uv and Docker, then follow the dependency, database and `.env` steps above with your own model credentials. Copy **frontend/.env.example** to **frontend/.env.local** without overwriting an existing configuration; the frontend needs both API URLs to point to your local backend. Never put model keys in frontend variables. On **Windows**, use three terminals: `uv run python -m docsgpt dev`; `cd frontend` then `npm run dev`; and `uv run python -m docsgpt beat`. Keep them running and open **http://localhost:5173**. The current CLI cannot locate the Windows npm executable when using `--ui`, so the frontend starts separately. On **macOS/Linux**, use `uv run python -m docsgpt dev --ui`.
 
