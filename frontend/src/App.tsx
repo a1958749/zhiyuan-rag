@@ -22,6 +22,7 @@ import { Button } from './components/ui/button';
 import { ToastViewport } from './components/ui/toast';
 import UploadToast from './components/UploadToast';
 import Conversation from './conversation/Conversation';
+import UserGuide from './UserGuide';
 import { SharedConversation } from './conversation/SharedConversation';
 import { EventStreamProvider } from './events/EventStreamProvider';
 import { useDarkTheme, useMediaQuery } from './hooks';
@@ -190,6 +191,7 @@ export default function App() {
           }
         >
           <Route index element={<Conversation />} />
+          <Route path="/help" element={<UserGuide />} />
           {/* One dynamic route (accepting "new" or a UUID) so the
               /c/new → /c/<id> replace doesn't remount Conversation. */}
           <Route path="/c/:conversationId" element={<Conversation />} />

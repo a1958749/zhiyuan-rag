@@ -65,5 +65,24 @@
     "source_settings_ui_verified": true
   },
   "frontend_source_isolated_from_running_evaluation": true,
-  "product_scope": "Customizable personal RAG knowledge assistant; AI developer documentation is the demonstration and evaluation scenario."
+  "product_scope": "Customizable personal RAG knowledge assistant; AI developer documentation is the demonstration and evaluation scenario.",
+  "first_run_onboarding": {
+    "verified_at_utc": "2026-10-10T09:09:57.060594+00:00",
+    "tests_passed": 64,
+    "build_exit_code": 0,
+    "targeted_lint_errors": 0,
+    "existing_slice_lint_warnings": 4,
+    "static_product_question_no_model_handlers": true,
+    "normal_and_attached_queries_keep_retrieval": true,
+    "saved_product_help_raw_server_record_preserved": true,
+    "native_zh_help_answer_ui_verified": true,
+    "native_zh_en_user_guide_verified": true,
+    "sample_asset_exact_bytes_verified_ports": [
+      7091,
+      7095
+    ],
+    "sample_asset_sha256": "0fa273bd925f3e03fe3bc279d05f2649c74695cdbb175e725172dfcf74edccde",
+    "fresh_machine_install_executed": false,
+    "paid_ui_calls_for_this_change": 0
+  }
 }

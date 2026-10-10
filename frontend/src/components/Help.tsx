@@ -29,6 +29,12 @@ const Help = () => {
           </Button>
         </DropdownMenuTrigger>
         <DropdownMenuContent side="top" align="start" className="w-48">
+          <DropdownMenuItem asChild>
+            <Link to="/help">
+              <FileText />
+              {t('productHelp.title')}
+            </Link>
+          </DropdownMenuItem>
           {isAdmin && (
             <DropdownMenuItem asChild>
               <Link to="/admin">

@@ -3381,5 +3381,62 @@
     "productName": "知源",
     "productSubtitle": "个人 RAG 知识助手",
     "fullName": "知源 · 个人 RAG 知识助手"
+  },
+  "productHelp": {
+    "title": "User guide",
+    "fixedNotice": "Fixed product documentation · No AI call or web search",
+    "about": "知源 · Personal RAG Knowledge Assistant helps you find information in your own documents and check answers against cited sources. Upload notes, manuals or project materials. AI developer documentation is one demo topic.",
+    "homeSteps": "First time here? Upload documents → Wait for indexing → Select a knowledge source → Ask and inspect citations.",
+    "stepsTitle": "Get started in four steps",
+    "openKnowledge": "Manage / upload knowledge",
+    "openChat": "Start asking",
+    "language": "Change language",
+    "steps": {
+      "upload": {
+        "title": "Upload original documents",
+        "body": "Open Settings → Knowledge and choose Upload. Use TXT, Markdown, PDF or DOCX, depending on the configured parser. No manual chunking is required. Start with one plain-text file."
+      },
+      "wait": {
+        "title": "Wait for parsing and indexing",
+        "body": "The app parses, chunks, embeds and indexes the content. Wait until processing is complete or the source is available. An upload receipt alone does not mean the source is indexed."
+      },
+      "select": {
+        "title": "Select your knowledge source",
+        "body": "Return to chat and use the knowledge-source picker next to the message input to select the new source. Upload and select different topics separately."
+      },
+      "ask": {
+        "title": "Ask and inspect citations",
+        "body": "Name the subject and relevant conditions, for example: “According to my manual, what steps are needed for offline deployment?” Open the cited source and check that it supports the answer."
+      }
+    },
+    "exampleTitle": "Try a small end-to-end check",
+    "example": "Create a TXT file containing: “Project: Star River. Demo owner: Lin. Demo time: Friday at 3 pm.” Upload it, wait until available, then select that source in chat.",
+    "exampleQuestion": "Ask: “Who owns the Star River demo, and when does it start? Cite the source.” Check for “Lin” and “Friday at 3 pm”, with a source you can open. This is sample data, not your real project record.",
+    "factsTitle": "Capabilities and limitations",
+    "facts": {
+      "custom": {
+        "title": "Bring your own topic",
+        "body": "Knowledge is not limited to AI development. Select the relevant source after uploading. A chat with no selected source cannot demonstrate document-grounded answers."
+      },
+      "training": {
+        "title": "No model training is needed to add files",
+        "body": "Ingestion parses, chunks, creates embeddings and builds a retrieval index. It does not fine-tune the language model. Changed documents need new ingestion or indexing."
+      },
+      "chunking": {
+        "title": "Chunking can be configured",
+        "body": "Source settings expose chunking strategies and parameters. Re-index to apply changes. Keep defaults for a first attempt. Parsing quality depends on format; OCR for scanned PDFs depends on deployment configuration."
+      },
+      "privacy": {
+        "title": "Cloud models can receive document excerpts",
+        "body": "A cloud answer model receives your question and retrieved document excerpts. Remote embedding services also receive text. Local storage does not mean all processing is offline."
+      },
+      "demo": {
+        "title": "Demo scope and answer limitations",
+        "body": "The AI developer demo uses an October 2024 snapshot, not the latest documentation. Reported metrics apply to that dataset. New uploads do not automatically inherit the same measured improvements. Answers can be wrong even with citations; the app does not automatically execute repair commands."
+      }
+    },
+    "troubleshootingTitle": "What if the answer is unexpected?",
+    "troubleshooting": "Check that processing finished, the correct source is selected, and the document contains the answer. For ingestion failures, check whether text can be extracted. For model connection errors, check your API configuration and service status. An answer with no supporting source is not a verified fact.",
+    "downloadExample": "Download sample TXT"
   }
 }

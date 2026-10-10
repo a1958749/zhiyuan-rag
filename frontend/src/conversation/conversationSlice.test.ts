@@ -17,8 +17,10 @@ import preferenceReducer, {
 import uploadReducer, { addAttachment } from '../upload/uploadSlice';
 import {
   handleFetchAnswer,
+  handleFetchAnswerSteaming,
   handleSubmitToolActions,
 } from './conversationHandlers';
+import i18n from '../locale/i18n';
 import reducer, {
   addQuery,
   applyMessageTail,
@@ -283,6 +285,78 @@ const makeStore = () =>
       preference: () => preferenceStub,
     },
   });
+
+describe('fixed product help without model calls', () => {
+  beforeEach(async () => {
+    vi.mocked(handleFetchAnswer)
+      .mockClear()
+      .mockResolvedValue(null as never);
+    vi.mocked(handleFetchAnswerSteaming).mockClear();
+    await i18n.changeLanguage('zh');
+  });
+
+  it('answers the reported product question locally and ends loading', async () => {
+    const store = makeStore();
+    store.dispatch(addQuery({ prompt: '知源 是什么' }));
+    await store.dispatch(fetchAnswer({ question: '知源 是什么' }));
+    expect(store.getState().conversation.queries[0].response).toContain(
+      '个人 RAG 知识助手',
+    );
+    expect(store.getState().conversation.queries[0].response).toContain('等待');
+    expect(store.getState().conversation.status).toBe('idle');
+    expect(handleFetchAnswer).not.toHaveBeenCalled();
+    expect(handleFetchAnswerSteaming).not.toHaveBeenCalled();
+  });
+
+  it('uses fixed English help after an explicit language switch', async () => {
+    await i18n.changeLanguage('en');
+    const store = makeStore();
+    store.dispatch(addQuery({ prompt: 'How do I use Zhiyuan?' }));
+    await store.dispatch(fetchAnswer({ question: 'How do I use Zhiyuan?' }));
+    expect(store.getState().conversation.queries[0].response).toContain(
+      'Personal RAG Knowledge Assistant',
+    );
+    expect(handleFetchAnswer).not.toHaveBeenCalled();
+    expect(handleFetchAnswerSteaming).not.toHaveBeenCalled();
+    await i18n.changeLanguage('zh');
+  });
+
+  it.each(['JSONLoader 怎么使用', '知源论文里的混合检索方法是什么'])(
+    'keeps knowledge queries on the retrieval path: %s',
+    async (question) => {
+      const store = makeStore();
+      store.dispatch(addQuery({ prompt: question }));
+      await store.dispatch(fetchAnswer({ question }));
+      expect(handleFetchAnswer).toHaveBeenCalledOnce();
+    },
+  );
+
+  it('does not replace an attached-document question with app help', async () => {
+    const store = makeStore();
+    store.dispatch(addQuery({ prompt: '知源是什么' }));
+    await store.dispatch(
+      fetchAnswer({ question: '知源是什么', attachmentIds: ['my-file'] }),
+    );
+    expect(handleFetchAnswer).toHaveBeenCalledOnce();
+  });
+
+  it('shows current fixed help when reopening the old bad product introduction', () => {
+    const raw = {
+      prompt: '知源 是什么',
+      status: 'complete',
+      response:
+        '<think>不知道知源是什么</think>[TOOL_CALL]WebSearch[/TOOL_CALL]',
+      thought: '猜测产品名称',
+      sources: [{ title: 'unrelated' }],
+    };
+    const displayed = mapServerQueryToClient(raw);
+    expect(displayed.response).toContain('个人 RAG 知识助手');
+    expect(displayed.response).not.toContain('<think>');
+    expect(displayed.thought).toBeUndefined();
+    expect(displayed.sources).toBeUndefined();
+    expect(raw.response).toContain('[TOOL_CALL]');
+  });
+});
 
 describe('fetchAnswer — attachment ids on the wire', () => {
   beforeEach(() => {

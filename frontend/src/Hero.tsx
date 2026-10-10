@@ -207,6 +207,21 @@ export default function Hero({
             <p className="text-muted-foreground text-sm">
               {t('brand.productSubtitle')}
             </p>
+            <p className="text-muted-foreground mt-3 max-w-lg text-center text-sm">
+              {t('productHelp.homeSteps')}
+            </p>
+            <div className="mt-3 flex gap-3">
+              <Button size="sm" onClick={() => navigate('/settings/knowledge')}>
+                {t('productHelp.openKnowledge')}
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => navigate('/help')}
+              >
+                {t('productHelp.title')}
+              </Button>
+            </div>
           </div>
         </div>
         {/* Model Selector */}

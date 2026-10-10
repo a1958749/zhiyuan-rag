@@ -1,0 +1,11 @@
+知源首次使用示例 / Zhiyuan first-use example
+
+本文件仅供入库与引用验证，不是真实项目资料。
+This file is sample data for ingestion and citation checks, not a real project record.
+
+项目名称 / Project: 星河 / Star River
+演示负责人 / Demo owner: 小林 / Lin
+演示时间 / Demo time: 周五下午三点 / Friday at 3 pm
+
+可以提问：星河项目由谁负责演示，什么时候开始？请引用原文。
+Try asking: Who owns the Star River demo, and when does it start? Cite the source.

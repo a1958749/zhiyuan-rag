@@ -1,4 +1,6 @@
 import { envVar } from '@/env';
+import i18n from '../locale/i18n';
+import { isProductHelpQuestion, productHelpAnswer } from '../productHelp';
 import {
   createAsyncThunk,
   createListenerMiddleware,
@@ -136,6 +138,23 @@ export function mapServerQueryToClient(raw: any): Query {
     query.error = stored.message;
     setErrorDetail(query, stored.code, stored.params);
   }
+  if (
+    isTerminalComplete &&
+    !query.attachments?.length &&
+    isProductHelpQuestion(query.prompt)
+  ) {
+    // Product documentation is fixed UI content. Preserve the server record,
+    // but never use a historical model guess as the current product guide.
+    return {
+      ...query,
+      response: productHelpAnswer(),
+      notice: i18n.t('productHelp.fixedNotice'),
+      thought: undefined,
+      sources: undefined,
+      tool_calls: undefined,
+      segments: undefined,
+    };
+  }
   return query;
 }
 
@@ -254,12 +273,41 @@ export const fetchAnswer = createAsyncThunk<
   { question: string; indx?: number; attachmentIds?: string[] }
 >('fetchAnswer', async (arg, { dispatch, getState }) => {
   const { question, indx } = arg;
+  const state = getState() as RootState;
+  const boundAttachments =
+    arg.attachmentIds ?? selectSendableAttachmentIds(state);
+  if (boundAttachments.length === 0 && isProductHelpQuestion(question)) {
+    const answer = productHelpAnswer();
+    dispatch(
+      updateQuery({
+        index: indx ?? state.conversation.queries.length - 1,
+        query: {
+          response: answer,
+          notice: i18n.t('productHelp.fixedNotice'),
+          sources: [],
+          thought: '',
+          tool_calls: [],
+          messageStatus: 'complete',
+        },
+      }),
+    );
+    dispatch(conversationSlice.actions.setStatus('idle'));
+    return {
+      answer,
+      query: question,
+      result: 'product_help',
+      conversationId: state.conversation.conversationId,
+      title: null,
+      thought: '',
+      sources: [],
+      tool_calls: [],
+    };
+  }
   if (abortController) abortController.abort();
   abortController = new AbortController();
   const { signal } = abortController;
 
   let isSourceUpdated = false;
-  const state = getState() as RootState;
   // Explicit ids (new sends and retries pass the ids bound to the turn)
   // keep the wire payload in sync with what the query row displays.
   // The fallback reads the composer state for callers that predate the
