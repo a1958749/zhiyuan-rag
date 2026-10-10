@@ -1,0 +1,23 @@
+{
+  "dataset": "freshstack/oct-2024/langchain",
+  "corpus_path": "data/corpus.parquet",
+  "questions_path": "data/queries.parquet",
+  "corpus_duplicate_policy": "official_last",
+  "corpus_duplicate_audit_required": true,
+  "corpus_archive_policy": "preserve every original raw row; use audited official last-row ID selection",
+  "fixture_path": "tests/fixtures/mini_freshstack.json",
+  "dev_count": 53,
+  "split_seed": 20261008,
+  "near_duplicate_similarity": 0.9,
+  "near_duplicate_policy": "NFKC/casefold/word normalization; SequenceMatcher; connected components",
+  "alpha": 0.5,
+  "cutoffs": [5, 10, 20, 50],
+  "empty_qrels_policy": "zero metrics; retain query and annotation rows",
+  "coverage_denominator": "all nuggets, including empty/unjudged nuggets; official FreshStack convention",
+  "ndcg_relevance": "binary positive union; supplemental independent metric",
+  "alpha_ideal_policy": "ndeval greedy maximum marginal novelty; descending document-ID tie break",
+  "alpha_official_supported_max_cutoff": 20,
+  "alpha_above_20_policy": "independent extension; not an official headline metric",
+  "bootstrap_seed": 20261008,
+  "bootstrap_samples": 2000
+}

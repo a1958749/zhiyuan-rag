@@ -1,0 +1,53 @@
+# In-cluster Qdrant. OPT-IN: this file and services/qdrant-service.yaml are not
+# in kustomization.yaml; the default stack keeps vectors in pgvector. To use
+# Qdrant instead, apply both and set in docsgpt-secrets.yaml:
+#   VECTOR_STORE: qdrant
+#   QDRANT_URL: http://qdrant:6333
+#   kubectl apply -f deployment/k8s/deployments/qdrant-deploy.yaml \
+#     -f deployment/k8s/services/qdrant-service.yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: qdrant-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+
+---
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: qdrant
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: qdrant
+  template:
+    metadata:
+      labels:
+        app: qdrant
+    spec:
+      containers:
+      - name: qdrant
+        image: qdrant/qdrant:v1.19.1
+        ports:
+        - containerPort: 6333
+        resources:
+          limits:
+            memory: "2Gi"  # Adjust based on your needs
+            cpu: "1"       # Adjust based on your needs
+          requests:
+            memory: "1Gi"  # Adjust based on your needs
+            cpu: "500m"    # Adjust based on your needs
+        volumeMounts:
+        - name: qdrant-data
+          mountPath: /qdrant/storage
+      volumes:
+      - name: qdrant-data
+        persistentVolumeClaim:
+          claimName: qdrant-pvc

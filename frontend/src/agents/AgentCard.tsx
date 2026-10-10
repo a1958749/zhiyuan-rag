@@ -1,0 +1,412 @@
+import { useState } from 'react';
+import { useDispatch, useSelector } from 'react-redux';
+import { useNavigate } from 'react-router-dom';
+import { useTranslation } from 'react-i18next';
+import {
+  Activity,
+  Copy,
+  Download,
+  Eye,
+  Folder,
+  Pencil,
+  Pin,
+  PinOff,
+  Trash2,
+  Users,
+} from 'lucide-react';
+
+import userService from '../api/services/userService';
+import RoleBadge from '../components/RoleBadge';
+import { Avatar } from '../components/ui/avatar';
+import { Button } from '../components/ui/button';
+import { Card, CardDescription, CardTitle } from '../components/ui/card';
+import { ActionMenu, type MenuOption } from '../components/ui/dropdown-menu';
+import { Modal } from '../components/ui/modal';
+import ConfirmationModal from '../modals/ConfirmationModal';
+import MoveToFolderModal from '../modals/MoveToFolderModal';
+import { ActiveState } from '../models/misc';
+import { useSidebarLevel } from '../navigation/SidebarLevelProvider';
+import ShareToTeamModal from '../teams/ShareToTeamModal';
+import {
+  selectAgents,
+  selectToken,
+  setAgents,
+  setSelectedAgent,
+} from '../preferences/preferenceSlice';
+import {
+  agentChatPath,
+  agentEditPath,
+  agentLogsPath,
+  sharedAgentPath,
+} from './paths';
+import { can } from '../utils/accessUtils';
+import { canAgent } from './agentAccess';
+import { Agent } from './types';
+
+type AgentCardProps = {
+  agent: Agent;
+  agents: Agent[];
+  updateAgents?: (agents: Agent[]) => void;
+  section: string;
+};
+
+export default function AgentCard({
+  agent,
+  agents,
+  updateAgents,
+  section,
+}: AgentCardProps) {
+  const { t } = useTranslation();
+  const navigate = useNavigate();
+  // Opening an agent is a level change, so it goes through the sidebar's
+  // navigator: the panel starts sliding on the click rather than waiting for
+  // the editor to mount.
+  const { goToLevel } = useSidebarLevel();
+  const dispatch = useDispatch();
+  const token = useSelector(selectToken);
+  const userAgents = useSelector(selectAgents);
+
+  const [deleteConfirmation, setDeleteConfirmation] =
+    useState<ActiveState>('INACTIVE');
+  const [moveModalState, setMoveModalState] = useState<ActiveState>('INACTIVE');
+  const [shareModalOpen, setShareModalOpen] = useState(false);
+  const [exportError, setExportError] = useState<string | null>(null);
+  const [deleteError, setDeleteError] = useState<string>();
+
+  const openEditor = () => {
+    if (agent.agent_type === 'workflow') {
+      goToLevel(agentEditPath(agent.id, true));
+    } else {
+      goToLevel(agentEditPath(agent.id));
+    }
+  };
+
+  const pinOption: MenuOption = {
+    icon: agent.pinned ? PinOff : Pin,
+    label: agent.pinned ? t('agents.card.unpin') : t('agents.card.pin'),
+    onClick: () => togglePin(),
+  };
+
+  const ownedMenu: MenuOption[] = [
+    ...(canAgent(agent, 'view_logs')
+      ? [
+          {
+            icon: Activity,
+            label: t('agents.form.buttons.logs'),
+            onClick: () => goToLevel(agentLogsPath(agent.id)),
+          },
+        ]
+      : []),
+    // Opening the editor is `view`; a role that can't `edit` gets it as View.
+    ...(can(agent, 'view')
+      ? [
+          can(agent, 'edit')
+            ? { icon: Pencil, label: t('agents.edit'), onClick: openEditor }
+            : { icon: Eye, label: t('agents.view'), onClick: openEditor },
+        ]
+      : []),
+    ...(can(agent, 'export')
+      ? [
+          {
+            icon: Download,
+            label: t('agents.exportAgent'),
+            onClick: () => handleExport(),
+          },
+        ]
+      : []),
+    ...(can(agent, 'share')
+      ? [
+          {
+            icon: Users,
+            label: t('agents.shareWithTeam'),
+            onClick: () => setShareModalOpen(true),
+          },
+        ]
+      : []),
+    ...(canAgent(agent, 'pin') ? [pinOption] : []),
+    ...(can(agent, 'move_folder')
+      ? [
+          {
+            icon: Folder,
+            label: t('agents.folders.moveToFolder'),
+            onClick: () => setMoveModalState('ACTIVE'),
+          },
+        ]
+      : []),
+    ...(can(agent, 'delete')
+      ? [
+          {
+            icon: Trash2,
+            label: t('agents.form.buttons.delete'),
+            onClick: () => setDeleteConfirmation('ACTIVE'),
+            variant: 'destructive' as const,
+          },
+        ]
+      : []),
+  ];
+
+  const menuOptionsConfig: Record<string, MenuOption[]> = {
+    template: [
+      {
+        icon: Copy,
+        label: t('modals.prompts.duplicate'),
+        onClick: () => handleDuplicate(),
+      },
+    ],
+    // My agents and the Team section share one menu, built from what the
+    // caller's role allows on this agent (`allowed_actions` from the API).
+    // Editors get Logs, Edit, Export and Pin; viewers only Pin. Share, Move
+    // and Delete stay with the owner unless the owner's switches widen them.
+    user: ownedMenu,
+    team: ownedMenu,
+    // Discovered (link-opened) agents: the card itself opens the agent.
+    shared: [
+      pinOption,
+      {
+        icon: Trash2,
+        label: t('agents.card.remove'),
+        onClick: () => handleHideSharedAgent(),
+        variant: 'destructive',
+      },
+    ],
+  };
+  const menuOptions = menuOptionsConfig[section] || [];
+
+  const handleClick = () => {
+    // Team-shared agents open/run exactly like the user's own published
+    // agents (the run + GetAgent routes authorize team grantees server-side).
+    if (section === 'user' || section === 'team') {
+      if (agent.status === 'published') {
+        dispatch(setSelectedAgent(agent));
+        navigate(agent.id ? agentChatPath(agent.id) : '/c/new');
+      }
+    }
+    if (section === 'shared') {
+      navigate(sharedAgentPath(agent.shared_token));
+    }
+  };
+
+  const togglePin = async () => {
+    try {
+      const response = await userService.togglePinAgent(agent.id ?? '', token);
+      if (!response.ok) throw new Error('Failed to pin agent');
+      const updatedAgents = agents.map((prevAgent) => {
+        if (prevAgent.id === agent.id)
+          return { ...prevAgent, pinned: !prevAgent.pinned };
+        return prevAgent;
+      });
+      updateAgents?.(updatedAgents);
+    } catch (error) {
+      console.error('Error:', error);
+    }
+  };
+
+  const handleHideSharedAgent = async () => {
+    try {
+      const response = await userService.removeSharedAgent(
+        agent.id ?? '',
+        token,
+      );
+      if (!response.ok) throw new Error('Failed to hide shared agent');
+      const updatedAgents = agents.filter(
+        (prevAgent) => prevAgent.id !== agent.id,
+      );
+      updateAgents?.(updatedAgents);
+    } catch (error) {
+      console.error('Error:', error);
+    }
+  };
+
+  const handleExport = async () => {
+    try {
+      const response = await userService.exportAgent(agent.id ?? '', token);
+      if (!response.ok) {
+        const message = await response
+          .json()
+          .then((data) => data?.message)
+          .catch(() => null);
+        // Server-side refusals (e.g. a workflow referencing too many
+        // resources) carry an actionable message; flag it so the catch can
+        // tell it apart from a transport error like "Failed to fetch".
+        const error = new Error(message || t('agents.exportAgentFailed'));
+        error.name = 'ExportRefused';
+        throw error;
+      }
+      const yamlText = await response.text();
+      const blob = new Blob([yamlText], { type: 'application/x-yaml' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `${agent.slug || agent.name || 'agent'}.agent.yaml`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+    } catch (error) {
+      console.error('Error:', error);
+      setExportError(
+        error instanceof Error && error.name === 'ExportRefused'
+          ? error.message
+          : t('agents.exportAgentFailed'),
+      );
+    }
+  };
+
+  // Returned to ConfirmationModal: it stays pending while this runs and
+  // keeps a failure in the dialog (the server's message when it gives one).
+  const handleDelete = async () => {
+    setDeleteError(undefined);
+    const response = await userService.deleteAgent(agent.id ?? '', token);
+    if (!response.ok) {
+      const message = await response
+        .json()
+        .then((data: { message?: string }) => data?.message)
+        .catch(() => null);
+      setDeleteError(message || undefined);
+      throw new Error(message || 'Failed to delete agent');
+    }
+    const updatedAgents = agents.filter(
+      (prevAgent) => prevAgent.id !== agent.id,
+    );
+    updateAgents?.(updatedAgents);
+  };
+
+  const handleDuplicate = async () => {
+    try {
+      const response = await userService.adoptAgent(agent.id ?? '', token);
+      if (!response.ok) throw new Error('Failed to duplicate agent');
+      const data = await response.json();
+      if (userAgents) {
+        const updatedAgents = [...userAgents, data.agent];
+        dispatch(setAgents(updatedAgents));
+      } else dispatch(setAgents([data.agent]));
+    } catch (error) {
+      console.error('Error:', error);
+    }
+  };
+
+  const handleMoveSuccess = (folderId: string | null) => {
+    const updatedAgents = agents.map((prevAgent) => {
+      if (prevAgent.id === agent.id) {
+        return { ...prevAgent, folder_id: folderId ?? undefined };
+      }
+      return prevAgent;
+    });
+    updateAgents?.(updatedAgents);
+  };
+  // Same rule as handleClick: a Discovered card always opens, an own or team
+  // agent once it's published.
+  const canOpen =
+    section === 'shared' ||
+    ((section === 'user' || section === 'team') &&
+      agent.status === 'published');
+  const title = (
+    <CardTitle title={agent.name} className="truncate capitalize">
+      {agent.name}
+    </CardTitle>
+  );
+  return (
+    // DESIGN "A clickable card that holds a link": a stretched button on the
+    // title opens the agent; the menu and badge sit above it as siblings.
+    <Card
+      variant="filled"
+      interactive={canOpen ? 'within' : false}
+      padding="lg"
+      className="relative h-44 gap-1"
+    >
+      <div className="mb-1 flex w-full items-center gap-1 px-1">
+        {/* Decorative: the title beside it names the agent. */}
+        <Avatar
+          src={agent.image}
+          alt=""
+          size="xs"
+          shape="circle"
+          imgClassName="size-7 object-contain"
+        />
+        {agent.status === 'draft' && (
+          <p className="text-foreground text-xs opacity-50">
+            ({t('agents.card.draft')})
+          </p>
+        )}
+      </div>
+      {canOpen ? (
+        <button
+          type="button"
+          onClick={handleClick}
+          className="w-full min-w-0 cursor-pointer px-1 text-left outline-none after:absolute after:inset-0 after:rounded-2xl"
+        >
+          {title}
+        </button>
+      ) : (
+        <div className="px-1">{title}</div>
+      )}
+      <CardDescription size="xs" className="mx-1 line-clamp-3">
+        {agent.description}
+      </CardDescription>
+      {/* After the open target, so Tab reaches the agent before its menu. */}
+      {menuOptions.length > 0 && (
+        <div className="absolute top-3 right-3 z-10">
+          <ActionMenu
+            options={menuOptions}
+            triggerLabel={t('agents.card.actions')}
+            align="end"
+          />
+        </div>
+      )}
+      {/* Team access badge — pinned to the top row, left of the ⋯ menu
+          (right-11 clears the 28px trigger at right-3) so the two align. */}
+      <RoleBadge item={agent} className="absolute top-4 right-11 z-10" />
+      <ConfirmationModal
+        message={t('agents.deleteConfirmation', {
+          interpolation: { escapeValue: false },
+          name: agent.name,
+        })}
+        description={t('agents.deleteConsequence')}
+        modalState={deleteConfirmation}
+        setModalState={setDeleteConfirmation}
+        submitLabel={t('agents.form.buttons.delete')}
+        handleSubmit={handleDelete}
+        error={deleteError ?? t('agents.deleteFailed')}
+        cancelLabel={t('cancel')}
+        variant="destructive"
+      />
+      <Modal
+        mobileVariant="dialog"
+        open={exportError !== null}
+        onOpenChange={(open) => {
+          if (!open) setExportError(null);
+        }}
+        title={t('agents.exportAgentFailed')}
+        size="sm"
+        footer={
+          <Button
+            type="button"
+            onClick={() => setExportError(null)}
+            size="lg"
+            shape="pill"
+          >
+            {t('agents.close')}
+          </Button>
+        }
+      >
+        <p className="text-muted-foreground text-sm">{exportError}</p>
+      </Modal>
+      <MoveToFolderModal
+        modalState={moveModalState}
+        setModalState={setMoveModalState}
+        agentName={agent.name}
+        agentId={agent.id ?? ''}
+        currentFolderId={agent.folder_id}
+        onMoveSuccess={handleMoveSuccess}
+      />
+      {shareModalOpen && agent.id && (
+        <ShareToTeamModal
+          resourceType="agent"
+          resourceId={agent.id}
+          resourceName={agent.name}
+          onClose={() => setShareModalOpen(false)}
+        />
+      )}
+    </Card>
+  );
+}

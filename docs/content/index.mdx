@@ -1,0 +1,74 @@
+---
+title: DocsGPT
+description: Documentation for DocsGPT, the open-source platform for building AI agents and assistants with document retrieval, tools and multi-model support.
+lastUpdated: 2026-10-07
+---
+
+import { Cards } from 'nextra/components'
+import { HomeReel } from '../components/HomeReel'
+
+# DocsGPT
+
+DocsGPT is an open-source platform for building AI agents and assistants that answer from your documents, with source citations. Agents can search your knowledge, call tools and APIs, run workflows and schedules, and be reached from the web app, an API, widgets or chat integrations. You can run it on your own hardware with cloud or local models, or use [DocsGPT Cloud](https://www.docsgpt.cloud/).
+
+<HomeReel />
+
+*A 20-second tour of DocsGPT: a question is answered with numbered citations and its source opens beside the answer; a knowledge graph maps the sources; an agent asks for approval before it acts; a workflow runs node by node; an agent builds an HTML report with a chart; and a wall of screens shows analytics, traces, guardrails, MCP tools, connectors and admin.*
+
+## Get started
+
+<Cards num={3}>
+  <Cards.Card title="Quickstart" href="/quickstart" />
+  <Cards.Card title="Concepts" href="/Concepts" />
+  <Cards.Card title="Using the web app" href="/Using/web-app" />
+  <Cards.Card title="Add knowledge" href="/Sources/adding-knowledge" />
+  <Cards.Card title="Choose a deployment" href="/Deploying" />
+  <Cards.Card title="Architecture" href="/Concepts/Architecture" />
+</Cards>
+
+## Build
+
+<Cards num={3}>
+  <Cards.Card title="Agent basics" href="/Agents/basics" />
+  <Cards.Card title="Workflow nodes" href="/Agents/nodes" />
+  <Cards.Card title="Customizing prompts" href="/Agents/prompts" />
+  <Cards.Card title="Connectors" href="/Sources/Connectors" />
+  <Cards.Card title="Tools basics" href="/Tools/basics" />
+  <Cards.Card title="Cloud providers" href="/Models/cloud-providers" />
+</Cards>
+
+## Integrate
+
+<Cards num={3}>
+  <Cards.Card title="API overview" href="/API" />
+  <Cards.Card title="OpenAI-compatible API" href="/API/openai-compatible" />
+  <Cards.Card title="MCP server" href="/API/mcp-server" />
+  <Cards.Card title="Chat widget" href="/Extensions/chat-widget" />
+  <Cards.Card title="Search widget" href="/Extensions/search-widget" />
+  <Cards.Card title="Community integrations" href="/Extensions/community" />
+</Cards>
+
+## Deploy and operate
+
+<Cards num={3}>
+  <Cards.Card title="Docker setup" href="/Deploying/Docker-Deploying" />
+  <Cards.Card title="Kubernetes" href="/Deploying/Kubernetes-Deploying" />
+  <Cards.Card title="App configuration" href="/Deploying/DocsGPT-Settings" />
+  <Cards.Card title="Security checklist" href="/Deploying/Security" />
+  <Cards.Card title="Upgrading" href="/upgrading" />
+  <Cards.Card title="Troubleshooting" href="/Deploying/Troubleshooting" />
+</Cards>
+
+## Features
+
+- **Agents and workflows:** [Classic and research agents](/Agents/basics) (plus agentic ones through the API or an imported agent YAML file), a visual [workflow builder](/Agents/nodes), [schedules](/Agents/schedules) for recurring and one-time runs, and [guardrails](/Agents/guardrails) that flag, redact or block.
+- **Knowledge:** Upload PDF, Word, PowerPoint and Excel files (legacy formats included), OpenDocument, RTF, EPUB, Markdown, reStructuredText, HTML, CSV, JSON and text; images with [OCR](/Sources/ocr); and audio, which is transcribed. Add web pages, sitemaps and GitHub repositories, keep [wikis](/Sources/Wiki-sources) the agent can edit, and tune [chunking and retrieval per source](/Sources/Per-source-configuration), including hybrid search and [GraphRAG](/Sources/GraphRAG).
+- **Connectors:** Sync [Google Drive, SharePoint and OneDrive, Confluence, GitHub, Amazon S3, Linear and Reddit](/Sources/Connectors) into knowledge. One connection can both sync content and give agents that service's tools.
+- **Grounded answers:** Answers cite the sources they came from, and a [strict prompt](/Agents/prompts) keeps the model to your documents.
+- **Tools:** Built-in tools, any REST API through the [API tool](/Tools/api-tool), [MCP servers](/Tools/mcp-tools), [artifacts and sandboxed code execution](/Tools/artifacts-and-code-execution), and shell commands on a [paired remote device](/Tools/remote-device), with per-action approval.
+- **Models:** OpenAI, Anthropic, Google, Groq, OpenRouter, Novita and any OpenAI-compatible server such as Ollama or vLLM ([cloud](/Models/cloud-providers), [local](/Models/local-inference)), plus per-user [custom models](/Models/custom-models) and [fallback models](/Models/fallback). Vectors go to FAISS, pgvector, Qdrant, Elasticsearch, Milvus or MongoDB Atlas.
+- **APIs and integrations:** The [agent API](/API/agent-api) with streaming, an [OpenAI-compatible `/v1` API](/API/openai-compatible), [webhooks](/API/webhooks), an [MCP server](/API/mcp-server), a [REST API](/API/reference) with [personal access tokens](/API/personal-access-tokens), HTML and React [chat](/Extensions/chat-widget) and [search](/Extensions/search-widget) widgets, a [Chatwoot bridge](/Extensions/Chatwoot-extension), and [community bots](/Extensions/community) for Discord, Slack and Telegram.
+- **Teams and administration:** [SSO with OIDC](/Deploying/OIDC-SSO) and SCIM provisioning, [roles and teams](/Deploying/Access-Control), [usage quotas](/Deploying/Usage-Quotas), [analytics and logs](/Using/analytics-and-logs), and [OpenTelemetry observability](/Deploying/Observability).
+- **Deployment:** A one-command installer, [Docker Compose](/Deploying/Docker-Deploying), [pip](/Deploying/Pip-Install), [Kubernetes](/Deploying/Kubernetes-Deploying) and [air-gapped](/Deploying/Air-Gapped) installs.
+
+DocsGPT is MIT-licensed and developed on [GitHub](https://github.com/arc53/DocsGPT). Contributions are welcome; see the [contributing guide](https://github.com/arc53/DocsGPT/blob/main/CONTRIBUTING.md).

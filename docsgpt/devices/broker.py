@@ -1,0 +1,956 @@
+"""Redis-backed broker that routes invocations to active device sessions.
+
+The device CLI only ever talks to the web process (poll / SSE / output
+POST), but an agent may dispatch a command from *any* process — notably a
+Celery worker during a scheduled run. An in-memory broker can't bridge
+that gap: the worker and the web process don't share Python memory, so a
+worker-side dispatch never reaches the web-side SSE session and the tool
+times out. Routing through Redis makes every hop cross-process.
+
+What lives in Redis (shared) vs. in the process (ephemeral):
+
+* ``dev:cmd:{device_id}``   — list of queued command envelopes (JSON).
+* ``dev:ticket:{device_id}``— poll-issued SSE upgrade ticket (string, TTL).
+* ``dev:inv:{invocation_id}``— invocation metadata hash (status, result).
+* ``dev:out:{invocation_id}``— stream of stdout/stderr/control chunks.
+* ``SessionState`` is per-connection state for the one SSE handler that
+  owns the live socket; it stays in that process's memory.
+
+Lifecycle:
+1. Agent (any process) calls ``dispatch_invocation`` → metadata hash + an
+   RPUSH onto the device's command list.
+2. The web SSE handler blocks on that list (``next_command``) and emits
+   each envelope to the wire; an offline device leaves the envelope queued
+   until its next ``/poll`` issues a ticket and upgrades to SSE.
+3. The CLI POSTs ack + chunked output back; ``submit_output_chunk`` XADDs
+   chunks to the invocation's output stream and updates the hash.
+4. A ``control`` chunk closes the invocation; ``drain_output`` (in the
+   dispatching process) reads the stream from the start and stops on it.
+
+A command handed off to a background job (``docsgpt.background.device_runner``)
+is followed by a poll chain instead of a drain: ``read_output`` reads the
+stream from a cursor without blocking, and the invocation carries its own
+``ttl`` so its keys outlive the job. ``request_cancel`` stops it: a command
+the device never picked up is taken off the queue, a running one gets a
+cancel envelope the session stream sends as ``event: cancel``.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import threading
+import time
+import uuid
+from dataclasses import dataclass, field
+from typing import Any, Dict, Iterator, Optional
+
+import anyio
+
+from docsgpt.cache import get_redis_instance
+from docsgpt.core.settings import settings
+from docsgpt.streaming.async_redis import get_async_redis_instance
+
+
+logger = logging.getLogger(__name__)
+
+
+# Kept for backwards compatibility with callers/tests importing the
+# sentinel; the Redis path signals end-of-output with a ``control`` chunk.
+INVOCATION_DONE = object()
+
+
+def _cmd_key(device_id: str) -> str:
+    return f"dev:cmd:{device_id}"
+
+
+def _ticket_key(device_id: str) -> str:
+    return f"dev:ticket:{device_id}"
+
+
+# Deletes the device's ticket iff it still holds the presented one. Runs
+# server-side so two requests racing with one ticket can't both redeem it.
+_REDEEM_TICKET_LUA = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+    return redis.call('DEL', KEYS[1])
+end
+return 0
+"""
+
+
+#: What :meth:`DeviceBroker.accept_output_chunk` did with a chunk.
+CHUNK_ACCEPTED = "accepted"
+CHUNK_DUPLICATE = "duplicate"
+#: The invocation doesn't exist (expired or cleaned up): the client should stop sending.
+CHUNK_GONE = "gone"
+#: Redis is unavailable or failed: nothing was stored, the client should retry.
+CHUNK_ERROR = "error"
+
+# Takes one output chunk, once. KEYS: the invocation hash, its output stream.
+# ARGV: seq to deduplicate on ("" for none), "1" for the control chunk, the
+# chunk's JSON, the stream's MAXLEN, the TTL, now, then the control chunk's
+# result fields as name/value pairs. Returns -1 for an unknown invocation, 0
+# for a repeat, 1 when appended. One step, so two copies of a resent batch
+# racing each other can't both get in, and a control chunk that was appended
+# has always marked the invocation completed (even if the reply was lost).
+_ACCEPT_CHUNK_LUA = """
+-- accept_chunk
+if redis.call('EXISTS', KEYS[1]) == 0 then
+    return -1
+end
+if ARGV[1] ~= '' then
+    local last = redis.call('HGET', KEYS[1], 'last_seq')
+    if last and tonumber(ARGV[1]) <= tonumber(last) then
+        return 0
+    end
+end
+if ARGV[2] == '1' then
+    if redis.call('HSETNX', KEYS[1], 'control_seen', '1') == 0 then
+        return 0
+    end
+end
+if ARGV[1] ~= '' then
+    redis.call('HSET', KEYS[1], 'last_seq', ARGV[1])
+end
+redis.call('XADD', KEYS[2], 'MAXLEN', '~', ARGV[4], '*', 'c', ARGV[3])
+redis.call('EXPIRE', KEYS[2], ARGV[5])
+if ARGV[2] == '1' then
+    redis.call('HSETNX', KEYS[1], 'started_at', ARGV[6])
+    for i = 7, #ARGV, 2 do
+        redis.call('HSET', KEYS[1], ARGV[i], ARGV[i + 1])
+    end
+    redis.call('EXPIRE', KEYS[1], ARGV[5])
+end
+return 1
+"""
+
+
+def _inv_key(invocation_id: str) -> str:
+    return f"dev:inv:{invocation_id}"
+
+
+def _out_key(invocation_id: str) -> str:
+    return f"dev:out:{invocation_id}"
+
+
+def _as_str(value: Any) -> str:
+    if isinstance(value, (bytes, bytearray)):
+        return value.decode("utf-8", "replace")
+    return str(value)
+
+
+@dataclass
+class Invocation:
+    """Snapshot of an invocation's cross-process state.
+
+    Returned by ``dispatch_invocation`` (fresh) and ``get_invocation`` (read
+    from Redis). Carries enough for ownership checks and audit without the
+    caller touching Redis directly.
+    """
+
+    invocation_id: str
+    device_id: str
+    completed: bool = False
+    exit_code: Optional[int] = None
+    duration_ms: Optional[int] = None
+    error: Optional[str] = None
+    started_at: Optional[float] = None
+    finished_at: Optional[float] = None
+    stdout_bytes: int = 0
+    stderr_bytes: int = 0
+    decision: Optional[str] = None
+    detail: Optional[str] = None
+    truncated: bool = False
+
+    @property
+    def acked(self) -> bool:
+        """The device took the command (accepted, auto-approved or denied it)."""
+        return bool(self.decision)
+
+
+@dataclass
+class SessionState:
+    """Per-connection state for the SSE handler that owns the live socket."""
+
+    session_id: str
+    device_id: str
+    user_id: str
+    last_event_id: int = 0
+    last_activity_at: float = field(default_factory=time.time)
+    closed: threading.Event = field(default_factory=threading.Event)
+
+
+class DeviceBroker:
+    """Cross-process device registry backed by Redis.
+
+    Redis is the source of truth for queued commands, output, and tickets,
+    so dispatch and drain work regardless of which process they run in. A
+    small in-memory map of live SSE sessions stays local to the web process
+    that holds each socket (sessions are inherently per-connection).
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._sessions_by_id: Dict[str, SessionState] = {}
+        self._sessions_by_device: Dict[str, SessionState] = {}
+
+    # ------------------------------------------------------------------
+    # Session lifecycle (web process / CLI side)
+    # ------------------------------------------------------------------
+    def register_session(self, device_id: str, user_id: str) -> SessionState:
+        """Open the SSE session for ``device_id``, adopting its poll ticket.
+
+        The poll-issued ticket becomes the ``session_id`` so the URL the CLI
+        opens matches the live session. A previous local session for the
+        same device is closed and replaced (the CLI reconnected).
+        """
+        redis = get_redis_instance()
+        issued = None
+        if redis is not None:
+            try:
+                issued = redis.get(_ticket_key(device_id))
+                if issued is not None:
+                    redis.delete(_ticket_key(device_id))
+            except Exception:
+                logger.exception("ticket lookup failed for %s", device_id)
+        session_id = _as_str(issued) if issued else f"st_{uuid.uuid4().hex}"
+        return self._adopt_session(session_id, device_id, user_id)
+
+    def redeem_ticket(self, device_id: str, user_id: str, ticket: str) -> Optional[SessionState]:
+        """Consume the device's poll-issued ``ticket`` and open its session under it.
+
+        Returns ``None``, and opens nothing, unless ``ticket`` is still the
+        device's unexpired ticket. The compare and delete are one Redis step,
+        so a replay racing the first redeem can't replace its session.
+        """
+        if not ticket:
+            return None
+        redis = get_redis_instance()
+        if redis is None:
+            return None
+        try:
+            redeemed = redis.eval(_REDEEM_TICKET_LUA, 1, _ticket_key(device_id), ticket)
+        except Exception:
+            logger.exception("ticket redeem failed for %s", device_id)
+            return None
+        if not redeemed:
+            return None
+        return self._adopt_session(ticket, device_id, user_id)
+
+    def _adopt_session(self, session_id: str, device_id: str, user_id: str) -> SessionState:
+        """Make a new session the device's live one, closing the one it replaces."""
+        sess = SessionState(
+            session_id=session_id, device_id=device_id, user_id=user_id
+        )
+        with self._lock:
+            prior = self._sessions_by_device.get(device_id)
+            if prior is not None:
+                prior.closed.set()
+                self._sessions_by_id.pop(prior.session_id, None)
+            self._sessions_by_device[device_id] = sess
+            self._sessions_by_id[session_id] = sess
+        return sess
+
+    def close_session(self, session_id: str, *, reason: str = "closed") -> None:
+        """Close the local session by id.
+
+        Queued-but-undelivered commands stay on the device's Redis list and
+        are picked up by the next session; an in-flight command whose socket
+        drops falls back to the tool's own drain deadline.
+        """
+        with self._lock:
+            sess = self._sessions_by_id.pop(session_id, None)
+            if sess is None:
+                return
+            sess.closed.set()
+            if self._sessions_by_device.get(sess.device_id) is sess:
+                self._sessions_by_device.pop(sess.device_id, None)
+        logger.debug("device session closed: %s (%s)", session_id, reason)
+
+    def get_session(self, session_id: str) -> Optional[SessionState]:
+        with self._lock:
+            return self._sessions_by_id.get(session_id)
+
+    def next_command(
+        self, session: SessionState, timeout: float = 1.0
+    ) -> Optional[Dict[str, Any]]:
+        """Block up to ``timeout`` for the next queued command envelope.
+
+        Returns the decoded envelope, or ``None`` on timeout so the SSE
+        handler can emit a keepalive and re-check the session lifecycle.
+        """
+        redis = get_redis_instance()
+        if redis is None:
+            time.sleep(timeout)
+            return None
+        try:
+            popped = redis.blpop(_cmd_key(session.device_id), timeout=timeout)
+        except Exception:
+            logger.exception("blpop failed for %s", session.device_id)
+            time.sleep(timeout)
+            return None
+        if not popped:
+            return None
+        envelope = self._decode_envelope(popped[1])
+        if envelope is None:
+            return None
+        # Drop an envelope whose invocation was already reaped (timed out /
+        # cleaned up) after it was queued, so a command the user already saw
+        # fail can't still run on the device. Best-effort — it narrows but does
+        # not fully close the BLPOP-vs-cleanup window (see cleanup_invocation).
+        # A cancel envelope for a reaped invocation has nothing left to stop.
+        inv_id = envelope.get("invocation_id")
+        if inv_id and self.get_invocation(inv_id) is None:
+            logger.debug("dropping reaped invocation %s", inv_id)
+            return None
+        return envelope
+
+    async def next_command_async(
+        self, session: SessionState, timeout: float = 1.0
+    ) -> Optional[Dict[str, Any]]:
+        """Await up to ``timeout`` for the next queued command envelope.
+
+        Event-loop twin of :meth:`next_command` for the native-async SSE
+        stream: the same envelope checks over the async Redis client, so an
+        idle device session holds no thread.
+        """
+        redis = await get_async_redis_instance()
+        if redis is None:
+            await anyio.sleep(timeout)
+            return None
+        try:
+            popped = await redis.blpop(_cmd_key(session.device_id), timeout=timeout)
+        except Exception:
+            logger.exception("async blpop failed for %s", session.device_id)
+            await anyio.sleep(timeout)
+            return None
+        if not popped:
+            return None
+        envelope = self._decode_envelope(popped[1])
+        if envelope is None:
+            return None
+        # Same reaped-invocation guard as ``next_command``; a failed lookup
+        # drops the envelope too, as ``get_invocation`` returning None does.
+        inv_id = envelope.get("invocation_id")
+        if inv_id:
+            try:
+                reaped = not await redis.exists(_inv_key(inv_id))
+            except Exception:
+                logger.exception("invocation lookup failed for %s", inv_id)
+                reaped = True
+            if reaped:
+                logger.debug("dropping reaped invocation %s", inv_id)
+                return None
+        return envelope
+
+    @staticmethod
+    def _decode_envelope(raw: Any) -> Optional[Dict[str, Any]]:
+        """Parse a queued command envelope; ``None`` for anything malformed."""
+        try:
+            envelope = json.loads(_as_str(raw))
+        except (TypeError, ValueError):
+            logger.warning("dropping malformed command envelope")
+            return None
+        return envelope if isinstance(envelope, dict) else None
+
+    # ------------------------------------------------------------------
+    # Polling / tickets
+    # ------------------------------------------------------------------
+    def claim_ticket(self, device_id: str, ttl_seconds: float) -> Optional[str]:
+        """Return an SSE upgrade ticket iff the device has queued work.
+
+        Reuses an unexpired ticket so repeated polls don't churn it; the
+        ticket's Redis TTL doubles as the advertised ``expires_in`` window.
+        """
+        redis = get_redis_instance()
+        if redis is None:
+            return None
+        try:
+            if redis.llen(_cmd_key(device_id)) <= 0:
+                return None
+            existing = redis.get(_ticket_key(device_id))
+            if existing:
+                return _as_str(existing)
+            ticket = f"st_{uuid.uuid4().hex}"
+            redis.set(_ticket_key(device_id), ticket, ex=int(ttl_seconds))
+            return ticket
+        except Exception:
+            logger.exception("claim_ticket failed for %s", device_id)
+            return None
+
+    def validate_ticket(self, device_id: str, session_id: str) -> bool:
+        """True iff ``session_id`` is the unexpired ticket issued to the device.
+
+        An absent, mismatched, or expired ticket is rejected; expiry is
+        enforced by Redis's TTL (a ``GET`` of an expired key returns nil).
+        """
+        if not session_id:
+            return False
+        redis = get_redis_instance()
+        if redis is None:
+            return False
+        try:
+            issued = redis.get(_ticket_key(device_id))
+        except Exception:
+            logger.exception("validate_ticket failed for %s", device_id)
+            return False
+        return issued is not None and _as_str(issued) == session_id
+
+    # ------------------------------------------------------------------
+    # Dispatch (server-issued, any process)
+    # ------------------------------------------------------------------
+    def dispatch_invocation(
+        self,
+        device_id: str,
+        user_id: str,
+        envelope: Dict[str, Any],
+        *,
+        ttl_seconds: Optional[int] = None,
+    ) -> Invocation:
+        """Queue an invocation for ``device_id`` and record its metadata.
+
+        Writes the metadata hash, then RPUSHes the envelope onto the
+        device's command list. A live SSE session draining the list picks it
+        up immediately; otherwise it waits for the next poll-issued ticket.
+
+        Args:
+            device_id: The device.
+            user_id: Its owner.
+            envelope: What the device receives.
+            ttl_seconds: How long the invocation's keys live when it must
+                outlast the default (a background command); every later
+                write re-applies it.
+        """
+        invocation_id = envelope["invocation_id"]
+        inv = Invocation(invocation_id=invocation_id, device_id=device_id)
+        redis = get_redis_instance()
+        if redis is None:
+            inv.error = "device broker unavailable"
+            inv.completed = True
+            return inv
+        envelope_json = json.dumps(envelope)
+        ttl = max(int(ttl_seconds or 0), self._inv_ttl())
+        mapping = {
+            "device_id": device_id,
+            "user_id": user_id,
+            "envelope": envelope_json,
+            "completed": "0",
+            "stdout_bytes": "0",
+            "stderr_bytes": "0",
+        }
+        if ttl_seconds:
+            mapping["ttl"] = str(ttl)
+        try:
+            redis.hset(_inv_key(invocation_id), mapping=mapping)
+            redis.expire(_inv_key(invocation_id), ttl)
+            redis.rpush(_cmd_key(device_id), envelope_json)
+            redis.expire(_cmd_key(device_id), max(ttl, self._cmd_ttl()))
+        except Exception:
+            logger.exception("dispatch_invocation failed for %s", invocation_id)
+            # Don't strand the metadata hash (it holds the plaintext command)
+            # if the queue write failed partway through.
+            try:
+                redis.delete(_inv_key(invocation_id))
+            except Exception:
+                logger.debug(
+                    "cleanup after failed dispatch failed for %s", invocation_id
+                )
+            inv.error = "device broker dispatch failed"
+            inv.completed = True
+        return inv
+
+    def get_invocation(self, invocation_id: str, *, strict: bool = False) -> Optional[Invocation]:
+        """Read an invocation's current metadata snapshot from Redis.
+
+        Args:
+            invocation_id: The invocation.
+            strict: Raise when Redis is unavailable or fails, instead of
+                returning None, so a caller can tell "gone" from "can't tell".
+
+        Returns:
+            The snapshot, or None when the invocation doesn't exist.
+
+        Raises:
+            RuntimeError: ``strict`` and Redis is unavailable.
+            Exception: ``strict`` and the read failed.
+        """
+        redis = get_redis_instance()
+        if redis is None:
+            if strict:
+                raise RuntimeError("device broker unavailable")
+            return None
+        try:
+            raw = redis.hgetall(_inv_key(invocation_id))
+        except Exception:
+            if strict:
+                raise
+            logger.exception("get_invocation failed for %s", invocation_id)
+            return None
+        if not raw:
+            return None
+        h = {_as_str(k): _as_str(v) for k, v in raw.items()}
+        return Invocation(
+            invocation_id=invocation_id,
+            device_id=h.get("device_id", ""),
+            completed=h.get("completed") == "1",
+            exit_code=_to_int(h.get("exit_code")),
+            duration_ms=_to_int(h.get("duration_ms")),
+            error=h.get("error") or None,
+            started_at=_to_float(h.get("started_at")),
+            finished_at=_to_float(h.get("finished_at")),
+            stdout_bytes=_to_int(h.get("stdout_bytes")) or 0,
+            stderr_bytes=_to_int(h.get("stderr_bytes")) or 0,
+            decision=h.get("decision") or None,
+            detail=h.get("detail") or None,
+            truncated=h.get("truncated") == "1",
+        )
+
+    def extend_invocation(self, invocation_id: str, ttl_seconds: int) -> bool:
+        """Make an invocation's keys (and its device's queue) live at least ``ttl_seconds``.
+
+        A command handed off to a background job may run far longer than the
+        default TTL; the stored ``ttl`` is re-applied on every later write, so
+        output arriving later can't shorten it again.
+
+        Returns:
+            False when the invocation is gone or Redis is unavailable.
+        """
+        redis = get_redis_instance()
+        if redis is None:
+            return False
+        key = _inv_key(invocation_id)
+        ttl = max(int(ttl_seconds), self._inv_ttl())
+        try:
+            device_id = redis.hget(key, "device_id")
+            if device_id is None:
+                return False
+            redis.hset(key, mapping={"ttl": str(ttl)})
+            redis.expire(key, ttl)
+            redis.expire(_out_key(invocation_id), ttl)
+            redis.expire(_cmd_key(_as_str(device_id)), max(ttl, self._cmd_ttl()))
+        except Exception:
+            logger.exception("extend_invocation failed for %s", invocation_id)
+            return False
+        return True
+
+    def retire_invocation(self, invocation_id: str) -> None:
+        """Let an invocation's keys expire on the default TTL instead of a background job's long one.
+
+        Used once its job ended without the command reporting (cancelled,
+        lost): a cancel envelope still queued for it needs the keys a little
+        longer, so they are not deleted outright.
+        """
+        redis = get_redis_instance()
+        if redis is None:
+            return
+        key = _inv_key(invocation_id)
+        ttl = self._inv_ttl()
+        try:
+            if not redis.exists(key):
+                return
+            redis.hset(key, mapping={"ttl": str(ttl)})
+            redis.expire(key, ttl)
+            redis.expire(_out_key(invocation_id), ttl)
+        except Exception:
+            logger.exception("retire_invocation failed for %s", invocation_id)
+
+    def request_cancel(self, invocation_id: str) -> str:
+        """Stop an invocation: take it off the queue, or ask the device to kill it.
+
+        Returns:
+            ``unqueued`` when the command was still waiting for the device and
+            was removed (it will never run); ``sent`` when a cancel envelope
+            was queued for a command the device already took; ``gone`` when
+            the invocation no longer exists (or Redis is unavailable).
+        """
+        redis = get_redis_instance()
+        if redis is None:
+            return "gone"
+        key = _inv_key(invocation_id)
+        try:
+            raw = redis.hgetall(key)
+            if not raw:
+                return "gone"
+            h = {_as_str(k): _as_str(v) for k, v in raw.items()}
+            device_id = h.get("device_id") or ""
+            queued = h.get("envelope")
+            if queued and not h.get("decision") and redis.lrem(_cmd_key(device_id), 0, queued):
+                return "unqueued"
+            cancel = json.dumps({"type": "cancel", "action": "cancel", "invocation_id": invocation_id})
+            redis.rpush(_cmd_key(device_id), cancel)
+            redis.expire(_cmd_key(device_id), max(self._ttl_of(h), self._cmd_ttl()))
+        except Exception:
+            logger.exception("request_cancel failed for %s", invocation_id)
+            return "gone"
+        return "sent"
+
+    def read_output(
+        self, invocation_id: str, cursor: str = "0-0", count: int = 500
+    ) -> tuple[list[Dict[str, Any]], str]:
+        """Read output chunks after ``cursor`` without blocking.
+
+        Args:
+            invocation_id: The invocation.
+            cursor: The last stream id already read (``0-0`` for the start).
+            count: Most chunks returned.
+
+        Returns:
+            ``(chunks, cursor)``: the stdout/stderr/control chunks, and the id
+            of the last entry read (unchanged when nothing new arrived).
+        """
+        redis = get_redis_instance()
+        if redis is None:
+            return [], cursor
+        try:
+            resp = redis.xread({_out_key(invocation_id): cursor or "0-0"}, count=int(count), block=None)
+        except Exception:
+            logger.exception("read_output failed for %s", invocation_id)
+            return [], cursor
+        chunks: list[Dict[str, Any]] = []
+        last = cursor or "0-0"
+        for _stream_key, entries in resp or []:
+            for entry_id, fields in entries:
+                last = _as_str(entry_id)
+                chunk = _decode_chunk(fields)
+                if chunk is not None:
+                    chunks.append(chunk)
+        return chunks, last
+
+    # ------------------------------------------------------------------
+    # Output streaming (web process / CLI side)
+    # ------------------------------------------------------------------
+    def submit_output_chunk(
+        self, invocation_id: str, chunk: Dict[str, Any]
+    ) -> bool:
+        """Forward one CLI output chunk; ``False`` for an unknown invocation (see :meth:`accept_output_chunk`)."""
+        return self.accept_output_chunk(invocation_id, chunk) in (CHUNK_ACCEPTED, CHUNK_DUPLICATE)
+
+    def accept_output_chunk(
+        self, invocation_id: str, chunk: Dict[str, Any], *, dedupe: bool = False
+    ) -> str:
+        """Forward one CLI output chunk to the dispatching process's poller or drain, once.
+
+        One Lua step decides and appends: a chunk already accepted is dropped,
+        else it is XADDed to the invocation's output stream. Two rules make a
+        resent batch harmless:
+
+        * with ``dedupe`` (a client that resends: ``X-Device-Capabilities:
+          outbox``), a chunk whose ``seq`` is at or below the highest accepted
+          one is a repeat. Such a client sends its chunks in ``seq`` order from
+          one sender. An older client posts stdout and stderr concurrently,
+          out of order, and never resends, so it is not deduplicated;
+        * the closing ``control`` chunk is taken once, whatever the client: a
+          second one (the same report resent) changes nothing.
+
+        Then the metadata hash is updated (byte counts; result fields on the
+        control chunk), after the append, so a reader that sees
+        ``completed=1`` finds every chunk already on the stream.
+
+        Args:
+            invocation_id: The invocation.
+            chunk: One NDJSON line from the client.
+            dedupe: Drop chunks whose ``seq`` was already accepted.
+
+        Returns:
+            ``accepted``, ``duplicate``, ``gone`` (no such invocation: the
+            client should stop), or ``error`` (Redis is unavailable or failed:
+            nothing was stored, the client should retry).
+        """
+        redis = get_redis_instance()
+        if redis is None:
+            return CHUNK_ERROR
+        key = _inv_key(invocation_id)
+        try:
+            device_id, stored_ttl = redis.hmget(key, ["device_id", "ttl"])
+        except Exception:
+            logger.exception("submit_output_chunk read failed for %s", invocation_id)
+            return CHUNK_ERROR
+        if device_id is None:
+            return CHUNK_GONE
+        device_id = _as_str(device_id)
+        ttl = self._ttl_of({"ttl": _as_str(stored_ttl) if stored_ttl is not None else ""})
+        now = time.time()
+        stream = chunk.get("stream")
+        seq = chunk.get("seq")
+        seq_arg = str(int(seq)) if dedupe and isinstance(seq, int) and not isinstance(seq, bool) else ""
+        fields: list = []
+        if stream == "control":
+            for name, value in _control_fields(chunk, now).items():
+                fields.extend([name, value])
+        try:
+            taken = redis.eval(
+                _ACCEPT_CHUNK_LUA,
+                2,
+                key,
+                _out_key(invocation_id),
+                seq_arg,
+                "1" if stream == "control" else "0",
+                json.dumps(chunk),
+                str(self._out_maxlen()),
+                str(ttl),
+                repr(now),
+                *fields,
+            )
+        except Exception:
+            logger.exception("submit_output_chunk append failed for %s", invocation_id)
+            return CHUNK_ERROR
+        taken = int(taken or 0)
+        if taken < 0:
+            return CHUNK_GONE
+        if taken == 0:
+            return CHUNK_DUPLICATE
+        try:
+            if stream in ("stdout", "stderr"):
+                text = chunk.get("chunk")
+                if isinstance(text, str):
+                    field = "stdout_bytes" if stream == "stdout" else "stderr_bytes"
+                    redis.hincrby(key, field, len(text.encode("utf-8")))
+                redis.expire(key, ttl)
+        except Exception:
+            logger.exception("submit_output_chunk bookkeeping failed for %s", invocation_id)
+        # Keep a co-located SSE session alive while output flows (single-worker
+        # web tier); a cross-worker session relies on its own keepalive.
+        with self._lock:
+            sess = self._sessions_by_device.get(device_id)
+        if sess is not None:
+            sess.last_activity_at = now
+        return CHUNK_ACCEPTED
+
+    def submit_ack(
+        self,
+        invocation_id: str,
+        decision: str,
+        reason: Optional[str] = None,
+    ) -> bool:
+        """Record the CLI's accept/deny decision for an invocation."""
+        redis = get_redis_instance()
+        if redis is None:
+            return False
+        key = _inv_key(invocation_id)
+        try:
+            device_id, stored_ttl = redis.hmget(key, ["device_id", "ttl"])
+            if device_id is None:
+                return False
+            ttl = self._ttl_of({"ttl": _as_str(stored_ttl) if stored_ttl is not None else ""})
+            now = time.time()
+            mapping = {"decision": decision}
+            if reason:
+                mapping["decision_reason"] = reason
+            redis.hset(key, mapping=mapping)
+            redis.hsetnx(key, "started_at", repr(now))
+            redis.expire(key, ttl)
+            if decision == "denied":
+                # XADD the synthetic control chunk BEFORE marking completed, so a
+                # racing drain that observes completed=1 always finds the chunk
+                # and reports "denied" rather than a false timeout.
+                redis.xadd(
+                    _out_key(invocation_id),
+                    {"c": json.dumps(
+                        {"stream": "control", "exit_code": None, "error": "denied"}
+                    )},
+                    maxlen=self._out_maxlen(),
+                    approximate=True,
+                )
+                redis.expire(_out_key(invocation_id), ttl)
+                redis.hset(
+                    key,
+                    mapping={
+                        "completed": "1",
+                        "error": "denied",
+                        "finished_at": repr(now),
+                    },
+                )
+        except Exception:
+            logger.exception("submit_ack failed for %s", invocation_id)
+            return False
+        return True
+
+    def drain_output(
+        self,
+        invocation_id: str,
+        timeout: float = 0.5,
+        deadline: Optional[float] = None,
+    ) -> Iterator[Dict[str, Any]]:
+        """Yield queued output chunks for an invocation; stop on ``control``.
+
+        Reads the invocation's output stream from the start (so chunks
+        XADDed before draining began are never missed) and blocks up to
+        ``timeout`` per read. ``deadline`` is an absolute ``time.time()``;
+        once it passes with no closing ``control`` chunk the generator
+        returns so a device that never responds can't loop forever.
+        """
+        redis = get_redis_instance()
+        if redis is None:
+            yield {
+                "stream": "control",
+                "exit_code": None,
+                "error": "device broker unavailable",
+            }
+            return
+        last_id = "0-0"
+        block_ms = max(1, int(timeout * 1000))
+        out_key = _out_key(invocation_id)
+        # ``resp`` is parsed as the RESP2 list shape ``[[key, [(id, fields)]]]``;
+        # the client must stay protocol=2 (redis-py default — see cache.py).
+        tail_flush = False
+        while True:
+            try:
+                # On the final sweep, read non-blocking (block=None) so any
+                # entries that landed after the prior empty read are drained
+                # before returning — closing the completion-vs-control race.
+                resp = redis.xread(
+                    {out_key: last_id},
+                    count=200,
+                    block=None if tail_flush else block_ms,
+                )
+            except Exception:
+                logger.exception("xread failed for %s", invocation_id)
+                return
+            if not resp:
+                if tail_flush:
+                    return
+                done = self._is_completed(redis, invocation_id)
+                timed_out = deadline is not None and time.time() >= deadline
+                if done or timed_out:
+                    # One final non-blocking sweep from last_id, then stop.
+                    tail_flush = True
+                continue
+            for _stream_key, entries in resp:
+                for entry_id, fields in entries:
+                    last_id = _as_str(entry_id)
+                    chunk = _decode_chunk(fields)
+                    if chunk is None:
+                        continue
+                    yield chunk
+                    if chunk.get("stream") == "control":
+                        return
+
+    def cleanup_invocation(self, invocation_id: str) -> None:
+        """Drop an invocation's Redis state, including any undelivered command.
+
+        Deletes the metadata hash first so a concurrent ``next_command`` that
+        just BLPOPped this envelope re-checks ``get_invocation``, sees it gone,
+        and drops it instead of delivering a command the user already saw fail;
+        the ``LREM`` then clears it for the still-queued (offline-device) case.
+        Best-effort: a delivery that wins a tight race with the delete can still
+        reach the device once, and that run's output is discarded.
+        """
+        redis = get_redis_instance()
+        if redis is None:
+            return
+        try:
+            raw = redis.hgetall(_inv_key(invocation_id))
+            device_id = envelope_json = None
+            if raw:
+                h = {_as_str(k): _as_str(v) for k, v in raw.items()}
+                device_id = h.get("device_id")
+                envelope_json = h.get("envelope")
+            redis.delete(_inv_key(invocation_id))
+            redis.delete(_out_key(invocation_id))
+            if device_id and envelope_json:
+                redis.lrem(_cmd_key(device_id), 0, envelope_json)
+        except Exception:
+            logger.exception("cleanup_invocation failed for %s", invocation_id)
+
+    # ------------------------------------------------------------------
+    # Internals
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _is_completed(redis, invocation_id: str) -> bool:
+        try:
+            return _as_str(redis.hget(_inv_key(invocation_id), "completed")) == "1"
+        except Exception:
+            return False
+
+    @staticmethod
+    def _inv_ttl() -> int:
+        return int(settings.REMOTE_DEVICE_INVOCATION_TTL_SECONDS)
+
+    @classmethod
+    def _ttl_of(cls, fields: Dict[str, str]) -> int:
+        """The invocation's own TTL (a background command's), never below the default."""
+        return max(_to_int(fields.get("ttl")) or 0, cls._inv_ttl())
+
+    @staticmethod
+    def _cmd_ttl() -> int:
+        return int(settings.REMOTE_DEVICE_CMD_QUEUE_TTL_SECONDS)
+
+    @staticmethod
+    def _out_maxlen() -> int:
+        return int(settings.REMOTE_DEVICE_OUTPUT_STREAM_MAXLEN)
+
+
+def _decode_chunk(fields: Any) -> Optional[Dict[str, Any]]:
+    """One output stream entry as its chunk dict; None for anything malformed or unknown."""
+    raw = fields.get(b"c")
+    if raw is None:
+        raw = fields.get("c")
+    if raw is None:
+        return None
+    try:
+        chunk = json.loads(_as_str(raw))
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(chunk, dict) or chunk.get("stream") not in ("stdout", "stderr", "control"):
+        return None
+    return chunk
+
+
+def _control_fields(chunk: Dict[str, Any], now: float) -> Dict[str, str]:
+    """What a control chunk records on its invocation: completion, exit code, duration, error, detail, truncation."""
+    fields = {"completed": "1", "finished_at": repr(now)}
+    exit_code = _coerce_int(chunk.get("exit_code"))
+    if exit_code is not None:
+        fields["exit_code"] = str(exit_code)
+    duration = _coerce_int(chunk.get("duration_ms"))
+    if duration is not None:
+        fields["duration_ms"] = str(duration)
+    if chunk.get("error"):
+        fields["error"] = _as_str(chunk["error"])[:200]
+    if chunk.get("detail"):
+        fields["detail"] = _as_str(chunk["detail"])[:500]
+    if chunk.get("truncated") is True:
+        fields["truncated"] = "1"
+    return fields
+
+
+def _coerce_int(value: Any) -> Optional[int]:
+    """A client-sent JSON number as an int; None for null, a bool or junk."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_int(value: Optional[str]) -> Optional[int]:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_float(value: Optional[str]) -> Optional[float]:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+_broker_instance: Optional[DeviceBroker] = None
+_broker_lock = threading.Lock()
+
+
+def get_broker() -> DeviceBroker:
+    """Return the process-wide ``DeviceBroker`` instance."""
+    global _broker_instance
+    if _broker_instance is None:
+        with _broker_lock:
+            if _broker_instance is None:
+                _broker_instance = DeviceBroker()
+    return _broker_instance

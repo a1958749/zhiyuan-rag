@@ -1,0 +1,15 @@
+provider: openai_compatible
+display_provider: devsupport_gateway
+api_key_env: DEVSUPPORT_GATEWAY_API_KEY
+base_url: https://www.xiaoyaoapi.com/v1
+defaults:
+  supports_tools: false
+  supports_streaming: true
+  supports_structured_output: false
+  attachments: []
+  context_window: 128000
+models:
+- id: devsupport-opus
+  display_name: DevSupport Fixed Gateway
+  description: Fixed deepseek-v4-pro route; reported claude-opus-4-8 identity, underlying model unverified.
+  upstream_model_id: deepseek-v4-pro

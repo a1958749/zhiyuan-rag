@@ -1,0 +1,17 @@
+{
+  "description": "ARTIFICIAL TEST FIXTURE ONLY. These are not FreshStack benchmark rows or results.",
+  "corpus": [
+    {"_id": "a", "text": "ARTIFICIAL: widget configuration.", "metadata": {"url": "https://example.invalid/a", "start_byte": 0, "end_byte": 33}},
+    {"_id": "b", "text": "ARTIFICIAL: alternate widget configuration.", "metadata": {"url": "https://example.invalid/b", "start_byte": 0, "end_byte": 43}},
+    {"_id": "c", "text": "ARTIFICIAL: widget retry settings.", "metadata": {"url": "https://example.invalid/c", "start_byte": 0, "end_byte": 33}},
+    {"_id": "d", "text": "ARTIFICIAL: caching a gizmo.", "metadata": {"url": "https://example.invalid/d", "start_byte": 0, "end_byte": 27}},
+    {"_id": "e", "text": "ARTIFICIAL: logging a sprocket.", "metadata": {"url": "https://example.invalid/e", "start_byte": 0, "end_byte": 30}},
+    {"_id": "f", "text": "ARTIFICIAL: unrelated example.", "metadata": {"url": "https://example.invalid/f", "start_byte": 0, "end_byte": 29}}
+  ],
+  "questions": [
+    {"query_id": "q1", "query_title": "Configure widget", "query_text": "How do I configure the artificial widget retry settings?", "answer_text": "ARTIFICIAL offline answer A", "nuggets": [{"_id": "q1_0", "text": "ARTIFICIAL configuration nugget", "relevant_corpus_ids": ["a", "b"], "non_relevant_corpus_ids": ["f"]}, {"_id": "q1_1", "text": "ARTIFICIAL retry nugget", "relevant_corpus_ids": ["c"], "non_relevant_corpus_ids": []}], "metadata": {"source": "artificial"}},
+    {"query_id": "q2", "query_title": "Configure widget!", "query_text": "How do I configure the artificial widget retry settings", "answer_text": "ARTIFICIAL offline answer B", "nuggets": [{"_id": "q2_0", "text": "ARTIFICIAL nugget", "relevant_corpus_ids": ["a", "c"], "non_relevant_corpus_ids": []}], "metadata": {"source": "artificial"}},
+    {"query_id": "q3", "query_title": "Gizmo cache", "query_text": "Where is gizmo cache expiration documented?", "answer_text": "ARTIFICIAL offline answer C", "nuggets": [{"_id": "q3_0", "text": "ARTIFICIAL nugget", "relevant_corpus_ids": ["d"], "non_relevant_corpus_ids": []}], "metadata": {"source": "artificial"}},
+    {"query_id": "q4", "query_title": "Sprocket logging", "query_text": "Enable sprocket log output", "answer_text": "ARTIFICIAL offline answer D", "nuggets": [{"_id": "q4_0", "text": "ARTIFICIAL nugget", "relevant_corpus_ids": ["e"], "non_relevant_corpus_ids": []}], "metadata": {"source": "artificial"}}
+  ]
+}

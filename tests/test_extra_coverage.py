@@ -1,0 +1,387 @@
+"""Grab-bag of tests targeting remaining coverage gaps.
+
+Covers edge cases in:
+  - docsgpt/api/user/tools/routes.py
+  - docsgpt/api/user/sources/upload.py (remaining)
+  - docsgpt/api/connector/routes.py (exception paths)
+  - docsgpt/seed/seeder.py (remaining)
+  - docsgpt/api/user/agents/routes.py (remaining)
+"""
+
+from contextlib import contextmanager
+from unittest.mock import MagicMock, patch
+
+import pytest
+from flask import Flask
+
+
+@pytest.fixture
+def app():
+    return Flask(__name__)
+
+
+@contextmanager
+def _patch_tools_db(conn):
+    @contextmanager
+    def _yield():
+        yield conn
+
+    with patch(
+        "docsgpt.api.user.tools.routes.db_session", _yield
+    ), patch(
+        "docsgpt.api.user.tools.routes.db_readonly", _yield
+    ):
+        yield
+
+
+@contextmanager
+def _patch_upload_db(conn):
+    @contextmanager
+    def _yield():
+        yield conn
+
+    with patch(
+        "docsgpt.api.user.sources.upload.db_session", _yield
+    ), patch(
+        "docsgpt.api.user.sources.upload.db_readonly", _yield
+    ), patch(
+        "docsgpt.connectors.service.db_session", _yield
+    ), patch(
+        "docsgpt.connectors.service.db_readonly", _yield
+    ):
+        yield
+
+
+@contextmanager
+def _patch_conn_db(conn):
+    @contextmanager
+    def _yield():
+        yield conn
+
+    with patch(
+        "docsgpt.api.connector.routes.db_session", _yield
+    ), patch(
+        "docsgpt.api.connector.routes.db_readonly", _yield
+    ), patch(
+        "docsgpt.connectors.service.db_session", _yield
+    ), patch(
+        "docsgpt.connectors.service.db_readonly", _yield
+    ):
+        yield
+
+
+# ---------------------------------------------------------------------------
+# tools/routes.py — remaining branches
+# ---------------------------------------------------------------------------
+
+
+class TestToolsRoutesExtra:
+    def test_create_tool_unknown_name_returns_404(self, app, pg_conn):
+        from docsgpt.api.user.tools.routes import CreateTool
+
+        with _patch_tools_db(pg_conn), app.test_request_context(
+            "/api/create_tool", method="POST",
+            json={
+                "name": "not_a_real_tool_name",
+                "displayName": "x",
+                "description": "d",
+                "config": {},
+            },
+        ):
+            from flask import request
+            request.decoded_token = {"sub": "u"}
+            response = CreateTool().post()
+        # Unknown tool name can return 400 or 404 depending on validation order
+        assert response.status_code in (400, 404)
+
+    def test_delete_tool_missing_id_returns_400(self, app):
+        from docsgpt.api.user.tools.routes import DeleteTool
+
+        with app.test_request_context(
+            "/api/delete_tool", method="POST", json={},
+        ):
+            from flask import request
+            request.decoded_token = {"sub": "u"}
+            response = DeleteTool().post()
+        assert response.status_code == 400
+
+    def test_update_tool_missing_id(self, app):
+        from docsgpt.api.user.tools.routes import UpdateTool
+
+        with app.test_request_context(
+            "/api/update_tool", method="POST", json={"displayName": "n"},
+        ):
+            from flask import request
+            request.decoded_token = {"sub": "u"}
+            response = UpdateTool().post()
+        assert response.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# sources/upload.py — ingestion task error paths
+# ---------------------------------------------------------------------------
+
+
+class TestSourcesUploadExtra:
+    def test_remote_github_missing_repo_url(self, app):
+        from docsgpt.api.user.sources.upload import UploadRemote
+        import json as _json
+
+        fake_task = MagicMock(id="t")
+        with patch(
+            "docsgpt.api.user.sources.upload.ingest_remote.apply_async",
+            return_value=fake_task,
+        ), app.test_request_context(
+            "/api/remote", method="POST",
+            data={
+                "user": "u", "source": "github", "name": "g",
+                "data": _json.dumps({}),  # empty dict, no repo_url
+            },
+            content_type="multipart/form-data",
+        ):
+            from flask import request
+            request.decoded_token = {"sub": "u"}
+            response = UploadRemote().post()
+        # Still returns 200 with task_id; source_data is just None
+        assert response.status_code == 200
+
+    def test_remote_connector_missing_session_token(self, app):
+        from docsgpt.api.user.sources.upload import UploadRemote
+        import json as _json
+
+        with patch(
+            "docsgpt.parser.connectors.connector_creator.ConnectorCreator"
+            ".get_supported_connectors",
+            return_value={"google_drive"},
+        ), app.test_request_context(
+            "/api/remote", method="POST",
+            data={
+                "user": "u", "source": "google_drive", "name": "g",
+                "data": _json.dumps({}),
+            },
+            content_type="multipart/form-data",
+        ):
+            from flask import request
+            request.decoded_token = {"sub": "u"}
+            response = UploadRemote().post()
+        assert response.status_code == 400
+
+    def test_remote_connector_triggers_task(self, app, pg_conn):
+        from docsgpt.api.user.sources.upload import UploadRemote
+        from docsgpt.storage.db.repositories.connector_sessions import ConnectorSessionsRepository
+        import json as _json
+
+        repo = ConnectorSessionsRepository(pg_conn)
+        session = repo.upsert("u", "google_drive", status="authorized")
+        repo.update(str(session["id"]), {"session_token": "st"})
+
+        fake_task = MagicMock(id="conn-t")
+        with _patch_upload_db(pg_conn), patch(
+            "docsgpt.parser.connectors.connector_creator.ConnectorCreator"
+            ".get_supported_connectors",
+            return_value={"google_drive"},
+        ), patch(
+            "docsgpt.api.user.sources.upload.ingest_connector_task.apply_async",
+            return_value=fake_task,
+        ), app.test_request_context(
+            "/api/remote", method="POST",
+            data={
+                "user": "u", "source": "google_drive", "name": "g",
+                "data": _json.dumps({
+                    "session_token": "st",
+                    "file_ids": "a, b, c",
+                    "folder_ids": ["f1"],
+                    "recursive": True,
+                }),
+            },
+            content_type="multipart/form-data",
+        ):
+            from flask import request
+            request.decoded_token = {"sub": "u"}
+            response = UploadRemote().post()
+        assert response.status_code == 200
+        assert response.json["task_id"] == "conn-t"
+
+
+# ---------------------------------------------------------------------------
+# connector/routes.py — extra exception paths
+# ---------------------------------------------------------------------------
+
+
+class TestConnectorExtra:
+    def test_disconnect_exception_returns_500(self, app):
+        from docsgpt.api.connector.routes import ConnectorDisconnect
+
+        @contextmanager
+        def _broken():
+            raise RuntimeError("boom")
+            yield
+
+        with patch(
+            "docsgpt.connectors.service.db_readonly", _broken
+        ), app.test_request_context(
+            "/api/connectors/disconnect", method="POST",
+            json={"provider": "x", "session_token": "y"},
+        ):
+            from flask import request
+            request.decoded_token = {"sub": "u"}
+            response = ConnectorDisconnect().post()
+        assert response.status_code == 500
+
+    def test_callback_status_exception_returns_500(self, app):
+        from docsgpt.api.connector.routes import ConnectorCallbackStatus
+
+        # An exception inside is hard to trigger naturally; use a patched
+        # ``html.escape`` raising to exercise the except branch.
+        with patch(
+            "docsgpt.api.connector.routes.html.escape",
+            side_effect=RuntimeError("boom"),
+        ), app.test_request_context(
+            "/api/connectors/callback-status?status=success"
+        ):
+            response = ConnectorCallbackStatus().get()
+        assert response.status_code == 500
+
+    def test_validate_session_token_refresh_failure(self, app, pg_conn):
+        from docsgpt.api.connector.routes import ConnectorValidateSession
+        from docsgpt.storage.db.repositories.connector_sessions import (
+            ConnectorSessionsRepository,
+        )
+
+        user = "u-refresh-fail"
+        repo = ConnectorSessionsRepository(pg_conn)
+        session = repo.upsert(user, "google_drive", status="authorized")
+        repo.update(
+            str(session["id"]),
+            {
+                "session_token": "st-fail",
+                "token_info": {"access_token": "old", "refresh_token": "rt"},
+            },
+        )
+
+        fake_auth = MagicMock()
+        fake_auth.is_token_expired.return_value = True
+        fake_auth.refresh_access_token.side_effect = RuntimeError("fail")
+
+        with _patch_conn_db(pg_conn), patch(
+            "docsgpt.api.connector.routes.ConnectorCreator.create_auth",
+            return_value=fake_auth,
+        ), app.test_request_context(
+            "/api/connectors/validate-session", method="POST",
+            json={"provider": "google_drive", "session_token": "st-fail"},
+        ):
+            from flask import request
+            request.decoded_token = {"sub": user}
+            response = ConnectorValidateSession().post()
+        assert response.status_code == 401  # expired, refresh failed
+
+    def test_sync_exception_returns_400(self, app):
+        from docsgpt.api.connector.routes import ConnectorSync
+
+        @contextmanager
+        def _broken():
+            raise RuntimeError("boom")
+            yield
+
+        with patch(
+            "docsgpt.api.connector.routes.db_readonly", _broken
+        ), app.test_request_context(
+            "/api/connectors/sync", method="POST",
+            json={"source_id": "x", "session_token": "y"},
+        ):
+            from flask import request
+            request.decoded_token = {"sub": "u"}
+            response = ConnectorSync().post()
+        assert response.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# seeder.py — remaining paths
+# ---------------------------------------------------------------------------
+
+
+class TestSeederExtra:
+    def test_seed_initial_data_loads_and_seeds(self, pg_conn, tmp_path):
+        from docsgpt.seed.seeder import DatabaseSeeder
+
+        # Write a valid YAML config file
+        config_file = tmp_path / "premade.yaml"
+        config_file.write_text(
+            "agents:\n"
+            "  - name: SeedAgent\n"
+            "    description: desc\n"
+            "    agent_type: classic\n"
+        )
+
+        @contextmanager
+        def _yield():
+            yield pg_conn
+
+        seeder = DatabaseSeeder()
+        with patch(
+            "docsgpt.seed.seeder.db_session", _yield
+        ), patch(
+            "docsgpt.seed.seeder.db_readonly", _yield
+        ):
+            seeder.seed_initial_data(
+                config_path=str(config_file), force=True,
+            )
+
+    def test_handle_tools_empty_success(self, pg_conn):
+        from docsgpt.seed.seeder import DatabaseSeeder
+
+        @contextmanager
+        def _yield():
+            yield pg_conn
+
+        seeder = DatabaseSeeder()
+        with patch(
+            "docsgpt.seed.seeder.db_session", _yield
+        ), patch(
+            "docsgpt.seed.seeder.db_readonly", _yield
+        ):
+            # Agent config with tools list, but tool name is bogus
+            got = seeder._handle_tools({
+                "name": "a",
+                "tools": [
+                    {"name": "nonexistent_tool", "config": {}},
+                ],
+            })
+        assert got == []
+
+
+# ---------------------------------------------------------------------------
+# agents/routes.py — remaining edge cases
+# ---------------------------------------------------------------------------
+
+
+class TestAgentsRoutesRemainingGaps:
+    def test_get_agents_lists_source_less_agents(self, app, pg_conn):
+        """An agent with neither source nor retriever is still listed: it
+        skips retrieval at run time and answers from the model and tools."""
+        from docsgpt.api.user.agents.routes import GetAgents
+        from docsgpt.storage.db.repositories.agents import AgentsRepository
+
+        @contextmanager
+        def _yield():
+            yield pg_conn
+
+        user = "u-filter"
+        AgentsRepository(pg_conn).create(
+            user, "ok", "published", retriever="classic",
+        )
+        # No source, no retriever, not a workflow agent.
+        AgentsRepository(pg_conn).create(user, "bare", "published")
+
+        with patch(
+            "docsgpt.api.user.agents.routes.db_session", _yield
+        ), patch(
+            "docsgpt.api.user.agents.routes.db_readonly", _yield
+        ), app.test_request_context("/api/get_agents"):
+            from flask import request
+            request.decoded_token = {"sub": user}
+            response = GetAgents().get()
+        assert response.status_code == 200
+        names = [a["name"] for a in response.json]
+        assert "ok" in names
+        assert "bare" in names

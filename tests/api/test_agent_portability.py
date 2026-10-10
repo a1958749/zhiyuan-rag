@@ -1,0 +1,914 @@
+"""Tests for agent YAML export/import (docsgpt.api.user.agents.portability).
+
+These exercise real SQL against the ephemeral ``pg_conn`` fixture, calling
+the dependency-injected serialize/plan/apply functions directly so the
+logic is covered without a running Flask app.
+"""
+
+from __future__ import annotations
+
+from unittest.mock import Mock
+
+import pytest
+
+from docsgpt.agents.default_tools import default_tool_id
+from docsgpt.api.user.agents.portability import (
+    API_VERSION,
+    AgentImportError,
+    agent_to_yaml,
+    apply_import,
+    ensure_agent_slug,
+    parse_agent_yaml,
+    plan_import,
+    serialize_agent,
+)
+from docsgpt.storage.db.repositories.agents import AgentsRepository
+from docsgpt.storage.db.repositories.prompts import PromptsRepository
+from docsgpt.storage.db.repositories.sources import SourcesRepository
+from docsgpt.storage.db.repositories.user_tools import UserToolsRepository
+
+
+pytestmark = pytest.mark.integration
+
+
+def _make_agent(conn, user, **kwargs):
+    defaults = dict(description="d", chunks=2, retriever="classic")
+    defaults.update(kwargs)
+    return AgentsRepository(conn).create(user, kwargs.pop("name", "Bot"), "published", **defaults)
+
+
+def _doc(**spec):
+    spec.setdefault("name", "Imported")
+    return {
+        "apiVersion": API_VERSION,
+        "kind": "Agent",
+        "metadata": {"slug": spec.pop("_slug", "imported")},
+        "spec": spec,
+    }
+
+
+def test_serialize_redacts_tool_secret(pg_conn):
+    user = "u_redact"
+    src = SourcesRepository(pg_conn).create("Docs", user_id=user, type="file")
+    prompt = PromptsRepository(pg_conn).create(user, "P", "You are helpful")
+    tool = UserToolsRepository(pg_conn).create(
+        user,
+        "brave",
+        config={"encrypted_credentials": "SECRETBLOB", "region": "US"},
+        custom_name="My Brave",
+        display_name="Brave Search",
+        description="search",
+        config_requirements={"token": {"secret": True, "required": True}, "region": {}},
+        actions=[],
+    )
+    agent = AgentsRepository(pg_conn).create(
+        user,
+        "Support Bot",
+        "published",
+        description="help desk",
+        chunks=3,
+        retriever="classic",
+        prompt_id=str(prompt["id"]),
+        source_id=str(src["id"]),
+        tools=[str(tool["id"])],
+    )
+
+    export = serialize_agent(pg_conn, agent, user)
+    text = agent_to_yaml(export)
+
+    assert "SECRETBLOB" not in text
+    assert "encrypted_credentials" not in text
+    tool_entry = export["spec"]["tools"][0]
+    assert tool_entry["type"] == "brave"
+    assert tool_entry["requires_secrets"] == ["token"]
+    assert "encrypted_credentials" not in tool_entry["config"]
+    assert tool_entry["config"] == {"region": "US"}
+    assert export["spec"]["prompt"] == {"name": "P", "content": "You are helpful"}
+    assert export["spec"]["sources"][0]["name"] == "Docs"
+
+
+def test_export_assigns_unique_slug(pg_conn):
+    user = "u_slug"
+    a1 = AgentsRepository(pg_conn).create(user, "My Bot", "draft")
+    a2 = AgentsRepository(pg_conn).create(user, "My Bot", "draft")
+
+    s1 = ensure_agent_slug(pg_conn, a1, user)
+    a2_reload = AgentsRepository(pg_conn).get(str(a2["id"]), user)
+    s2 = ensure_agent_slug(pg_conn, a2_reload, user)
+
+    assert s1 == "my-bot"
+    assert s2 == "my-bot-2"
+
+
+def test_round_trip_same_user_idempotent(pg_conn):
+    user = "u_round"
+    src = SourcesRepository(pg_conn).create("KB", user_id=user, type="file")
+    prompt = PromptsRepository(pg_conn).create(user, "Sys", "Be nice")
+    scheduler_id = default_tool_id("scheduler")
+    agent = AgentsRepository(pg_conn).create(
+        user,
+        "Bot",
+        "published",
+        description="d",
+        chunks=2,
+        retriever="classic",
+        prompt_id=str(prompt["id"]),
+        source_id=str(src["id"]),
+        tools=[scheduler_id],
+    )
+    ensure_agent_slug(pg_conn, agent, user)
+    agent = AgentsRepository(pg_conn).get(str(agent["id"]), user)
+
+    doc = parse_agent_yaml(agent_to_yaml(serialize_agent(pg_conn, agent, user)))
+    r1 = apply_import(pg_conn, user, doc)
+    r2 = apply_import(pg_conn, user, doc)
+
+    assert r1["agent_id"] == r2["agent_id"] == str(agent["id"])  # matched by id
+    assert len(PromptsRepository(pg_conn).list_for_user(user)) == 1  # no dup prompt
+    imported = AgentsRepository(pg_conn).get(r1["agent_id"], user)
+    assert imported["status"] == "published"  # update preserves the live status
+    assert [str(s) for s in imported["extra_source_ids"]] == [str(src["id"])]
+    assert imported["tools"] == [scheduler_id]  # builtin passthrough
+
+
+def test_update_preserves_published_status(pg_conn):
+    """Re-importing over a published agent must not revert it to draft.
+
+    The agent's API key and any active users keep working; only the content
+    is synced. A new agent (no match) still lands as a draft.
+    """
+    user = "u_pub"
+    agent = AgentsRepository(pg_conn).create(
+        user,
+        "Live Bot",
+        "published",
+        description="old",
+        chunks=2,
+        retriever="classic",
+    )
+    slug = ensure_agent_slug(pg_conn, agent, user)
+    doc = {
+        "apiVersion": API_VERSION,
+        "kind": "Agent",
+        "metadata": {"id": str(agent["id"]), "slug": slug},
+        "spec": {"name": "Live Bot", "description": "new", "retriever": "classic"},
+    }
+
+    result = apply_import(pg_conn, user, doc)
+
+    assert result["action"] == "updated"
+    assert result["status"] == "published"  # response reports the preserved status
+    updated = AgentsRepository(pg_conn).get(str(agent["id"]), user)
+    assert updated["status"] == "published"  # stayed live
+    assert updated["description"] == "new"  # content still synced
+
+
+def test_import_by_slug_idempotent(pg_conn):
+    user = "u_slug_import"
+    doc = _doc(name="Slug Bot", _slug="slug-bot", retriever="classic")
+
+    r1 = apply_import(pg_conn, user, doc)
+    r2 = apply_import(pg_conn, user, doc)
+
+    assert r1["action"] == "created"
+    assert r2["action"] == "updated"
+    assert r1["agent_id"] == r2["agent_id"]
+    assert len(AgentsRepository(pg_conn).list_for_user(user)) == 1
+
+
+def test_import_without_chunks_uses_the_default(pg_conn):
+    user = "u_default_chunks"
+    result = apply_import(pg_conn, user, _doc(name="Plain Bot", _slug="plain-bot"))
+    agent = AgentsRepository(pg_conn).get(result["agent_id"], user)
+    assert agent["chunks"] == 6
+
+
+def test_import_with_invalid_chunks_uses_the_default(pg_conn):
+    user = "u_invalid_chunks"
+    result = apply_import(pg_conn, user, _doc(name="Odd Bot", _slug="odd-bot", chunks="lots"))
+    agent = AgentsRepository(pg_conn).get(result["agent_id"], user)
+    assert agent["chunks"] == 6
+
+
+def test_import_keeps_explicit_chunks(pg_conn):
+    user = "u_explicit_chunks"
+    result = apply_import(pg_conn, user, _doc(name="Off Bot", _slug="off-bot", chunks=0))
+    agent = AgentsRepository(pg_conn).get(result["agent_id"], user)
+    assert agent["chunks"] == 0
+
+
+def test_import_missing_source_drafts_and_warns(pg_conn):
+    user = "u_missing"
+    doc = _doc(
+        name="No Source Bot",
+        _slug="no-source",
+        sources=[{"name": "Nonexistent KB", "type": "file"}],
+    )
+
+    result = apply_import(pg_conn, user, doc)
+
+    assert result["status"] == "draft"  # new agents are created as drafts
+    assert any("Nonexistent KB" in w for w in result["warnings"])
+    agent = AgentsRepository(pg_conn).get(result["agent_id"], user)
+    assert agent["status"] == "draft"
+    assert list(agent["extra_source_ids"]) == []
+
+
+def test_import_matches_existing_source_by_name(pg_conn):
+    user = "u_match"
+    src = SourcesRepository(pg_conn).create("Product Docs", user_id=user, type="file")
+    doc = _doc(
+        name="Matcher",
+        _slug="matcher",
+        sources=[{"name": "product docs", "type": "file"}],  # case-insensitive
+    )
+
+    result = apply_import(pg_conn, user, doc)
+
+    agent = AgentsRepository(pg_conn).get(result["agent_id"], user)
+    assert [str(s) for s in agent["extra_source_ids"]] == [str(src["id"])]
+    assert result["warnings"] == []
+
+
+def test_plan_classifies_references(pg_conn):
+    user = "u_plan"
+    SourcesRepository(pg_conn).create("Known", user_id=user, type="file")
+    tool = UserToolsRepository(pg_conn).create(
+        user, "brave", custom_name="My Brave", display_name="Brave", config={},
+    )
+    doc = _doc(
+        name="Plan Bot",
+        sources=[{"name": "Known"}, {"name": "Unknown"}],
+        tools=[
+            {"type": "scheduler", "builtin": True},
+            {"type": "brave", "name": "My Brave"},
+        ],
+    )
+
+    plan = plan_import(pg_conn, user, doc)
+
+    statuses = {s["name"]: s["status"] for s in plan["sources"]}
+    assert statuses == {"Known": "matched", "Unknown": "missing"}
+    tool_statuses = [t["status"] for t in plan["tools"]]
+    assert tool_statuses[0] == "builtin"
+    assert tool_statuses[1] == "reuse"
+    assert plan["tools"][1]["target_id"] == str(tool["id"])
+    assert plan["target"]["action"] == "create"
+
+
+def test_apply_creates_tool_with_supplied_secret(pg_conn, monkeypatch):
+    user = "u_tool"
+    fake_tool = Mock()
+    fake_tool.get_config_requirements.return_value = {
+        "api_key": {"secret": True, "required": True, "label": "API Key"}
+    }
+    fake_tool.get_actions_metadata.return_value = []
+    monkeypatch.setattr(
+        "docsgpt.api.user.agents.portability._tool_instance",
+        lambda tool_type: fake_tool,
+    )
+    doc = _doc(
+        name="Tool Bot",
+        _slug="tool-bot",
+        tools=[
+            {
+                "type": "brave",
+                "name": "My API",
+                "config": {},
+                "requires_secrets": ["api_key"],
+            }
+        ],
+    )
+
+    # No secret supplied -> tool skipped, agent still created.
+    res = apply_import(pg_conn, user, doc)
+    agent = AgentsRepository(pg_conn).get(res["agent_id"], user)
+    assert agent["tools"] == []
+    assert any("api_key" in w for w in res["warnings"])
+
+    # Secret supplied via resolution -> tool created and linked, secret encrypted.
+    res2 = apply_import(
+        pg_conn,
+        user,
+        doc,
+        resolution={"tools": {"tool-0": {"secrets": {"api_key": "PLAINTEXT_KEY"}}}},
+    )
+    agent2 = AgentsRepository(pg_conn).get(res2["agent_id"], user)
+    assert len(agent2["tools"]) == 1
+    tool_row = UserToolsRepository(pg_conn).get_any(agent2["tools"][0], user)
+    assert "PLAINTEXT_KEY" not in str(tool_row["config"])
+    assert "encrypted_credentials" in tool_row["config"]
+
+
+def test_parse_rejects_bad_documents():
+    with pytest.raises(AgentImportError):
+        parse_agent_yaml("kind: NotAgent\napiVersion: docsgpt.arc53.com/v1\nspec:\n  name: x\n")
+    with pytest.raises(AgentImportError):
+        parse_agent_yaml("kind: Agent\napiVersion: other/v1\nspec:\n  name: x\n")
+    with pytest.raises(AgentImportError):
+        parse_agent_yaml("kind: Agent\napiVersion: docsgpt.arc53.com/v1\nspec: {}\n")
+    # A workflow agent without a graph parses (drafts may have none)…
+    doc = parse_agent_yaml(
+        "kind: Agent\napiVersion: docsgpt.arc53.com/v1\n"
+        "spec:\n  name: x\n  agent_type: workflow\n"
+    )
+    assert doc["spec"]["agent_type"] == "workflow"
+    # …but a present workflow block must be well-formed.
+    with pytest.raises(AgentImportError):
+        parse_agent_yaml(
+            "kind: Agent\napiVersion: docsgpt.arc53.com/v1\n"
+            "spec:\n  name: x\n  agent_type: workflow\n  workflow: nonsense\n"
+        )
+    with pytest.raises(AgentImportError):
+        parse_agent_yaml(
+            "kind: Agent\napiVersion: docsgpt.arc53.com/v1\n"
+            "spec:\n  name: x\n  agent_type: workflow\n"
+            "  workflow:\n    nodes: {}\n    edges: []\n"
+        )
+    with pytest.raises(AgentImportError):
+        parse_agent_yaml(
+            "kind: Agent\napiVersion: docsgpt.arc53.com/v1\n"
+            "spec:\n  name: x\n  agent_type: workflow\n"
+            "  workflow:\n    nodes:\n      - id: n1\n    edges: []\n"
+        )
+
+
+def test_parse_rejects_yaml_aliases():
+    bomb = (
+        "kind: Agent\napiVersion: docsgpt.arc53.com/v1\n"
+        "spec:\n  name: &a x\n  description: *a\n"
+    )
+    with pytest.raises(AgentImportError):
+        parse_agent_yaml(bomb)
+
+
+def test_update_clears_removed_json_schema(pg_conn):
+    """On update the YAML is authoritative — removing json_schema clears it."""
+    user = "u_clear"
+    agent = AgentsRepository(pg_conn).create(
+        user,
+        "Clear Bot",
+        "published",
+        description="d",
+        chunks=2,
+        retriever="classic",
+        json_schema={"type": "object"},
+    )
+    slug = ensure_agent_slug(pg_conn, agent, user)
+    doc = {
+        "apiVersion": API_VERSION,
+        "kind": "Agent",
+        "metadata": {"slug": slug},
+        "spec": {"name": "Clear Bot", "retriever": "classic", "json_schema": None},
+    }
+
+    result = apply_import(pg_conn, user, doc)
+
+    assert result["action"] == "updated"
+    updated = AgentsRepository(pg_conn).get(str(agent["id"]), user)
+    assert updated["json_schema"] is None
+
+
+def test_custom_tool_dedup_across_reimport(pg_conn):
+    user = "u_dedup"
+    tool = UserToolsRepository(pg_conn).create(
+        user, "brave", custom_name="My Brave", display_name="Brave", config={},
+    )
+    agent = AgentsRepository(pg_conn).create(
+        user,
+        "Dedup Bot",
+        "published",
+        description="d",
+        chunks=2,
+        retriever="classic",
+        tools=[str(tool["id"])],
+    )
+    ensure_agent_slug(pg_conn, agent, user)
+    agent = AgentsRepository(pg_conn).get(str(agent["id"]), user)
+    doc = parse_agent_yaml(agent_to_yaml(serialize_agent(pg_conn, agent, user)))
+
+    apply_import(pg_conn, user, doc)
+    apply_import(pg_conn, user, doc)
+
+    assert len(UserToolsRepository(pg_conn).list_for_user(user)) == 1  # reused, never duplicated
+    final = AgentsRepository(pg_conn).get(str(agent["id"]), user)
+    assert final["tools"] == [str(tool["id"])]
+
+
+def test_import_rejects_ssrf_tool_url(pg_conn, monkeypatch):
+    user = "u_ssrf"
+    fake_tool = Mock()
+    fake_tool.get_config_requirements.return_value = {}
+    fake_tool.get_actions_metadata.return_value = []
+    monkeypatch.setattr(
+        "docsgpt.api.user.agents.portability._tool_instance",
+        lambda tool_type: fake_tool,
+    )
+    doc = _doc(
+        name="SSRF Bot",
+        _slug="ssrf",
+        tools=[
+            {
+                "type": "mcp_tool",
+                "name": "evil",
+                "config": {"server_url": "http://169.254.169.254/latest/meta-data"},
+            }
+        ],
+    )
+
+    result = apply_import(pg_conn, user, doc)
+
+    agent = AgentsRepository(pg_conn).get(result["agent_id"], user)
+    assert agent["tools"] == []
+    assert any("unsafe" in w.lower() for w in result["warnings"])
+
+
+def test_import_rejects_unowned_source_mapping(pg_conn):
+    owner, attacker = "u_owner", "u_attacker"
+    src = SourcesRepository(pg_conn).create("Secret KB", user_id=owner, type="file")
+    doc = _doc(name="IDOR Bot", _slug="idor", sources=[{"name": "Their Source"}])
+
+    # Attacker maps the missing source to the owner's source id.
+    result = apply_import(
+        pg_conn, attacker, doc, resolution={"sources": {"Their Source": str(src["id"])}}
+    )
+
+    agent = AgentsRepository(pg_conn).get(result["agent_id"], attacker)
+    assert list(agent["extra_source_ids"]) == []  # not linked
+    assert any("not yours" in w for w in result["warnings"])
+
+
+def test_apply_tolerates_plan_shaped_resolution(pg_conn):
+    """Echoing the plan's list-shaped resolution back must not crash apply."""
+    user = "u_shape"
+    doc = _doc(name="Shape Bot", _slug="shape", sources=[{"name": "X"}])
+
+    result = apply_import(
+        pg_conn, user, doc, resolution={"sources": [], "tools": [], "models": []}
+    )
+
+    assert result["action"] == "created"
+
+
+def test_update_clears_models_and_resets_prompt(pg_conn):
+    """A re-imported file that drops models and prompt clears them on update."""
+    user = "u_clear2"
+    prompt = PromptsRepository(pg_conn).create(user, "Sys", "Be terse")
+    agent = AgentsRepository(pg_conn).create(
+        user,
+        "Model Bot",
+        "published",
+        description="d",
+        chunks=2,
+        retriever="classic",
+        prompt_id=str(prompt["id"]),
+        models=["gpt-4o"],
+        default_model_id="gpt-4o",
+    )
+    slug = ensure_agent_slug(pg_conn, agent, user)
+    doc = {
+        "apiVersion": API_VERSION,
+        "kind": "Agent",
+        "metadata": {"slug": slug},
+        "spec": {
+            "name": "Model Bot",
+            "retriever": "classic",
+            "prompt": "default",
+            "model": {"default": "", "available": []},
+        },
+    }
+
+    apply_import(pg_conn, user, doc)
+
+    updated = AgentsRepository(pg_conn).get(str(agent["id"]), user)
+    assert not updated["models"]
+    assert not updated["default_model_id"]
+    assert updated["prompt_id"] is None  # reset to default
+
+
+def test_tool_skipped_when_encryption_fails(pg_conn, monkeypatch):
+    user = "u_encfail"
+    fake_tool = Mock()
+    fake_tool.get_config_requirements.return_value = {
+        "api_key": {"secret": True, "required": True}
+    }
+    fake_tool.get_actions_metadata.return_value = []
+    monkeypatch.setattr(
+        "docsgpt.api.user.agents.portability._tool_instance",
+        lambda tool_type: fake_tool,
+    )
+    # Force credential encryption to fail (returns "").
+    monkeypatch.setattr(
+        "docsgpt.api.user.tools.routes.encrypt_credentials",
+        lambda creds, user_id: "",
+    )
+    doc = _doc(
+        name="EncFail Bot",
+        _slug="encfail",
+        tools=[{"type": "brave", "name": "X", "config": {}, "requires_secrets": ["api_key"]}],
+    )
+
+    result = apply_import(
+        pg_conn,
+        user,
+        doc,
+        resolution={"tools": {"tool-0": {"secrets": {"api_key": "K"}}}},
+    )
+
+    agent = AgentsRepository(pg_conn).get(result["agent_id"], user)
+    assert agent["tools"] == []
+    assert any("encryption failed" in w for w in result["warnings"])
+
+
+# ---------------------------------------------------------------------------
+# Action customizations (per-parameter fixed values / filled_by_llm flags)
+# ---------------------------------------------------------------------------
+
+
+_SEND_MESSAGE_META = {
+    "name": "telegram_send_message",
+    "description": "Send a message",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "chat_id": {"type": "string", "description": "Chat id"},
+            "text": {"type": "string", "description": "Message text"},
+        },
+        "required": ["chat_id", "text"],
+    },
+}
+_GET_UPDATES_META = {
+    "name": "telegram_get_updates",
+    "description": "Poll updates",
+    "parameters": {"type": "object", "properties": {}, "required": []},
+}
+
+
+def _fake_telegram(monkeypatch):
+    import copy as _copy
+
+    fake_tool = Mock()
+    fake_tool.get_config_requirements.return_value = {
+        "token": {"secret": True, "required": True, "label": "Bot token"}
+    }
+    fake_tool.get_actions_metadata.side_effect = lambda: _copy.deepcopy(
+        [_SEND_MESSAGE_META, _GET_UPDATES_META]
+    )
+    monkeypatch.setattr(
+        "docsgpt.api.user.agents.portability._tool_instance",
+        lambda tool_type: fake_tool,
+    )
+    return fake_tool
+
+
+def _stored_telegram_actions():
+    """The shape ``update_tool_actions`` persists after the user fixes chat_id
+    and disables the updates action."""
+    return [
+        {
+            "name": "telegram_send_message",
+            "description": "Send a message",
+            "active": True,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "chat_id": {
+                        "type": "string",
+                        "description": "Chat id",
+                        "filled_by_llm": False,
+                        "value": "123456789",
+                    },
+                    "text": {
+                        "type": "string",
+                        "description": "Message text",
+                        "filled_by_llm": True,
+                        "value": "",
+                    },
+                },
+                "required": ["chat_id", "text"],
+            },
+        },
+        {
+            "name": "telegram_get_updates",
+            "description": "Poll updates",
+            "active": False,
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    ]
+
+
+def test_action_customizations_round_trip(pg_conn, monkeypatch):
+    user = "u_actions"
+    _fake_telegram(monkeypatch)
+    tool = UserToolsRepository(pg_conn).create(
+        user,
+        "telegram",
+        config={"encrypted_credentials": "BLOB"},
+        custom_name="My TG",
+        display_name="Telegram",
+        description="tg",
+        config_requirements={"token": {"secret": True, "required": True}},
+        actions=_stored_telegram_actions(),
+    )
+    agent = AgentsRepository(pg_conn).create(
+        user, "TG Bot", "published", description="d", tools=[str(tool["id"])]
+    )
+
+    export = serialize_agent(pg_conn, agent, user)
+    overrides = export["spec"]["tools"][0]["actions"]
+    # Only deviations from factory defaults travel: the fixed chat_id and the
+    # disabled action — the default-state ``text`` param does not.
+    assert overrides == [
+        {
+            "name": "telegram_send_message",
+            "parameters": {"chat_id": {"filled_by_llm": False, "value": "123456789"}},
+        },
+        {"name": "telegram_get_updates", "active": False},
+    ]
+
+    # Import as a fresh user (tool re-created with the supplied secret).
+    doc = parse_agent_yaml(agent_to_yaml(export))
+    importer = "u_actions_2"
+    result = apply_import(
+        pg_conn,
+        importer,
+        doc,
+        resolution={"tools": {"tool-0": {"decision": "create", "secrets": {"token": "tok"}}}},
+    )
+    imported_agent = AgentsRepository(pg_conn).get(result["agent_id"], importer)
+    row = UserToolsRepository(pg_conn).get_any(imported_agent["tools"][0], importer)
+    by_name = {a["name"]: a for a in row["actions"]}
+    chat_id = by_name["telegram_send_message"]["parameters"]["properties"]["chat_id"]
+    text = by_name["telegram_send_message"]["parameters"]["properties"]["text"]
+    assert chat_id["filled_by_llm"] is False
+    assert chat_id["value"] == "123456789"
+    assert text["filled_by_llm"] is True and text["value"] == ""
+    assert by_name["telegram_get_updates"]["active"] is False
+    assert by_name["telegram_send_message"]["active"] is True
+
+
+def test_action_header_values_never_exported(pg_conn):
+    user = "u_actions_hdr"
+    tool = UserToolsRepository(pg_conn).create(
+        user,
+        "custom_http",
+        config={},
+        custom_name="HTTP",
+        display_name="HTTP",
+        description="",
+        config_requirements={},
+        actions=[
+            {
+                "name": "call",
+                "active": True,
+                "headers": {
+                    "properties": {
+                        "Authorization": {
+                            "type": "string",
+                            "filled_by_llm": False,
+                            "value": "Bearer sk-live-XYZ",
+                        }
+                    }
+                },
+            }
+        ],
+    )
+    agent = AgentsRepository(pg_conn).create(
+        user, "Hdr Bot", "published", description="d", tools=[str(tool["id"])]
+    )
+
+    export = serialize_agent(pg_conn, agent, user)
+    text = agent_to_yaml(export)
+    assert "Bearer sk-live-XYZ" not in text
+    # The flag still travels so the imported action keeps its shape.
+    override = export["spec"]["tools"][0]["actions"][0]
+    assert override["headers"]["Authorization"] == {"filled_by_llm": False}
+
+
+def test_action_override_for_removed_action_warns(pg_conn, monkeypatch):
+    user = "u_actions_gone"
+    _fake_telegram(monkeypatch)
+    doc = _doc(
+        name="Drifted Bot",
+        _slug="drifted",
+        tools=[
+            {
+                "type": "telegram",
+                "name": "My TG",
+                "config": {},
+                "requires_secrets": ["token"],
+                "actions": [
+                    {"name": "telegram_removed_action", "active": False},
+                    {
+                        "name": "telegram_send_message",
+                        "parameters": {
+                            "gone_param": {"filled_by_llm": False, "value": "x"},
+                            "chat_id": {"filled_by_llm": False, "value": "42"},
+                        },
+                    },
+                ],
+            }
+        ],
+    )
+    result = apply_import(
+        pg_conn,
+        user,
+        doc,
+        resolution={"tools": {"tool-0": {"secrets": {"token": "tok"}}}},
+    )
+    agent = AgentsRepository(pg_conn).get(result["agent_id"], user)
+    row = UserToolsRepository(pg_conn).get_any(agent["tools"][0], user)
+    by_name = {a["name"]: a for a in row["actions"]}
+    # The surviving customization applied; the drifted ones warned and skipped.
+    chat_id = by_name["telegram_send_message"]["parameters"]["properties"]["chat_id"]
+    assert chat_id["filled_by_llm"] is False and chat_id["value"] == "42"
+    assert any("telegram_removed_action" in w for w in result["warnings"])
+    assert any("gone_param" in w for w in result["warnings"])
+
+
+def _fake_api_tool(monkeypatch):
+    """api_tool's live surface: no declared config, no column actions."""
+    fake_tool = Mock()
+    fake_tool.get_config_requirements.return_value = {}
+    fake_tool.get_actions_metadata.return_value = []
+    monkeypatch.setattr(
+        "docsgpt.api.user.agents.portability._tool_instance",
+        lambda tool_type: fake_tool,
+    )
+    # The sanitizer SSRF-gates each action URL; DNS isn't available in tests.
+    monkeypatch.setattr(
+        "docsgpt.api.user.agents.portability.validate_url", lambda url: url
+    )
+    return fake_tool
+
+
+def _stored_api_tool_config():
+    """``config["actions"]`` as ToolConfig persists it (dict keyed by name)."""
+    return {
+        "actions": {
+            "get_pet": {
+                "name": "get_pet",
+                "url": "https://api.example.com/pets/{petId}?api_key=QSSECRET",
+                "method": "GET",
+                "active": True,
+                "headers": {
+                    "properties": {
+                        "Authorization": {
+                            "type": "string",
+                            "filled_by_llm": False,
+                            "value": "Bearer sk-live-XYZ",
+                        }
+                    }
+                },
+                "query_params": {
+                    "properties": {
+                        "petId": {
+                            "type": "string",
+                            "filled_by_llm": True,
+                            "value": "",
+                        }
+                    }
+                },
+            }
+        }
+    }
+
+
+def test_api_tool_actions_round_trip_redacted(pg_conn, monkeypatch):
+    """api_tool actions live in config, not the actions column — they must
+    travel (redacted) or the imported tool is dead (executor resolves calls
+    exclusively through ``config["actions"]``)."""
+    user = "u_api_tool"
+    _fake_api_tool(monkeypatch)
+    tool = UserToolsRepository(pg_conn).create(
+        user,
+        "api_tool",
+        config=_stored_api_tool_config(),
+        custom_name="Petstore",
+        display_name="Petstore",
+        description="pets",
+        config_requirements={},
+        actions=[],
+    )
+    agent = AgentsRepository(pg_conn).create(
+        user, "Pet Bot", "published", description="d", tools=[str(tool["id"])]
+    )
+
+    export = serialize_agent(pg_conn, agent, user)
+    text = agent_to_yaml(export)
+    assert "sk-live-XYZ" not in text and "QSSECRET" not in text
+    exported = export["spec"]["tools"][0]["config"]["actions"]["get_pet"]
+    # Shape travels; the URL loses its query string; the pinned header
+    # value is blanked while its flag and schema survive.
+    assert exported["url"] == "https://api.example.com/pets/{petId}"
+    auth = exported["headers"]["properties"]["Authorization"]
+    assert auth["filled_by_llm"] is False and auth["value"] == ""
+    assert exported["query_params"]["properties"]["petId"]["filled_by_llm"] is True
+
+    doc = parse_agent_yaml(text)
+    importer = "u_api_tool_2"
+    result = apply_import(
+        pg_conn,
+        importer,
+        doc,
+        resolution={"tools": {"tool-0": {"decision": "create"}}},
+    )
+    imported_agent = AgentsRepository(pg_conn).get(result["agent_id"], importer)
+    row = UserToolsRepository(pg_conn).get_any(imported_agent["tools"][0], importer)
+    action = row["config"]["actions"]["get_pet"]
+    assert action["url"] == "https://api.example.com/pets/{petId}"
+    assert action["method"] == "GET"
+    # The blanked pinned header is called out — the request would silently
+    # omit it until the importer sets a value in the tool's settings.
+    assert any("Authorization" in w for w in result["warnings"])
+
+
+def test_api_tool_without_actions_imports_with_warning(pg_conn, monkeypatch):
+    """Older exports carried no actions for api_tool; the tool is created but
+    the dead state is surfaced instead of silent."""
+    user = "u_api_tool_empty"
+    _fake_api_tool(monkeypatch)
+    doc = _doc(
+        name="Dead API Bot",
+        _slug="dead-api",
+        tools=[{"type": "api_tool", "name": "Legacy", "config": {}}],
+    )
+    result = apply_import(
+        pg_conn,
+        user,
+        doc,
+        resolution={"tools": {"tool-0": {"decision": "create"}}},
+    )
+    assert any("without any actions" in w for w in result["warnings"])
+    agent = AgentsRepository(pg_conn).get(result["agent_id"], user)
+    row = UserToolsRepository(pg_conn).get_any(agent["tools"][0], user)
+    assert row["config"]["actions"] == {}
+
+
+# --- resource-restricted personal access tokens ------------------------------
+
+
+def _pat_request(app, resource_filter):
+    from flask import request
+
+    ctx = app.test_request_context("/api/import_agent", method="POST")
+    ctx.push()
+    request.decoded_token = {
+        "sub": "u_pat_import",
+        "auth_method": "pat",
+        "scopes": ["agents:read", "agents:write"],
+        "resource_filter": resource_filter,
+    }
+    return ctx
+
+
+@pytest.fixture
+def flask_ctx_app():
+    from flask import Flask
+
+    return Flask(__name__)
+
+
+def test_restricted_token_may_update_only_its_agents(pg_conn, flask_ctx_app):
+    from docsgpt.api.user.agents.portability import _restricted_token_denial
+
+    user = "u_pat_import"
+    allowed = _make_agent(pg_conn, user, slug="allowed")
+    other = _make_agent(pg_conn, user, slug="other")
+
+    ctx = _pat_request(flask_ctx_app, {"agents": [str(allowed["id"])]})
+    try:
+        assert _restricted_token_denial(pg_conn, user, _doc(_slug="allowed")) is None
+        assert "only update" in _restricted_token_denial(pg_conn, user, _doc(_slug="other"))
+        assert "only update" in _restricted_token_denial(
+            pg_conn, user, {"metadata": {"id": str(other["id"])}}
+        )
+        # A slug that matches nothing would create a new agent: never for a restricted token.
+        assert "only update" in _restricted_token_denial(pg_conn, user, _doc(_slug="brand-new"))
+    finally:
+        ctx.pop()
+
+
+@pytest.mark.parametrize("family", ["sources", "prompts", "tools", "workflows"])
+def test_token_restricted_on_referenced_families_cannot_import(pg_conn, flask_ctx_app, family):
+    from docsgpt.api.user.agents.portability import _restricted_token_denial
+
+    ctx = _pat_request(flask_ctx_app, {family: ["aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"]})
+    try:
+        assert family in _restricted_token_denial(pg_conn, "u_pat_import", _doc())
+    finally:
+        ctx.pop()
+
+
+def test_unrestricted_token_and_sessions_import_freely(pg_conn, flask_ctx_app):
+    from flask import request
+
+    from docsgpt.api.user.agents.portability import _restricted_token_denial
+
+    ctx = _pat_request(flask_ctx_app, {})
+    try:
+        assert _restricted_token_denial(pg_conn, "u_pat_import", _doc()) is None
+        request.decoded_token = {"sub": "u_pat_import"}
+        assert _restricted_token_denial(pg_conn, "u_pat_import", _doc()) is None
+    finally:
+        ctx.pop()

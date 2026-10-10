@@ -1,0 +1,1451 @@
+"""Unit tests for DaytonaSandbox with the Daytona SDK fully mocked (no cloud calls)."""
+
+import sys
+import types
+from unittest import mock
+
+import pytest
+
+from docsgpt.sandbox.base import ExecResult
+
+
+# --- Fakes mirroring the real Daytona SDK shapes -------------------------
+
+
+class _FakeArtifacts:
+    def __init__(self, stdout="", charts=None):
+        self.stdout = stdout
+        self.charts = charts or []
+
+
+class _FakeChart:
+    def __init__(self, png):
+        self.png = png
+
+
+class _FakeExecuteResponse:
+    def __init__(self, exit_code=0, result="", artifacts=None):
+        self.exit_code = exit_code
+        self.result = result
+        self.artifacts = artifacts
+
+
+class _FakeFileInfo:
+    def __init__(self, name, is_dir=False, size=0):
+        self.name = name
+        self.is_dir = is_dir
+        self.size = size
+
+
+class _FakeProcess:
+    def __init__(self):
+        self.code_run = mock.Mock(return_value=_FakeExecuteResponse(exit_code=0, result="hi"))
+
+
+class _FakeFS:
+    def __init__(self):
+        self.create_folder = mock.Mock()
+        self.upload_file = mock.Mock()
+        self.download_file = mock.Mock(return_value=b"payload")
+        self.delete_file = mock.Mock()
+        self.get_file_info = mock.Mock(return_value=_FakeFileInfo("a.txt", size=7))
+        # Path-aware tree: maps an absolute dir to the entries it contains. The
+        # real Daytona fs.list_files is single-level and returns basenames, so the
+        # backend must recurse into subdirs itself. Default tree is a single file.
+        self.tree = {}
+        self.list_files = mock.Mock(side_effect=self._list_files)
+
+    def _list_files(self, path, depth=None, request_timeout=None):
+        if self.tree:
+            return self.tree.get(path, [])
+        return [_FakeFileInfo("a.txt")]
+
+
+class _FakeSandbox:
+    def __init__(self, sandbox_id="sbx-1", labels=None, state="started"):
+        self.id = sandbox_id
+        self.labels = labels or {}
+        self.state = state
+        self.process = _FakeProcess()
+        self.fs = _FakeFS()
+
+
+class _FakeDaytonaClient:
+    def __init__(self, config=None):
+        self.config = config
+        self.created = []
+        self.deleted = []
+        self.started = []
+        # Sandboxes pretend to already exist in the cloud (cross-restart reattach).
+        self.existing = []
+        self.create = mock.Mock(side_effect=self._create)
+        self.delete = mock.Mock(side_effect=self._delete)
+        self.list = mock.Mock(side_effect=self._list)
+        self.start = mock.Mock(side_effect=self._start)
+        self.get = mock.Mock(side_effect=self._get)
+
+    def _get(self, sandbox_id_or_name, request_timeout=None):
+        for _, sandbox in self.created:
+            if sandbox.id == sandbox_id_or_name:
+                return sandbox
+        for sandbox in self.existing:
+            if sandbox.id == sandbox_id_or_name:
+                return sandbox
+        raise KeyError(sandbox_id_or_name)
+
+    def _create(self, params=None, timeout=60):
+        labels = getattr(params, "labels", None) or {}
+        sandbox = _FakeSandbox(sandbox_id=f"sbx-{len(self.created) + 1}", labels=labels)
+        self.created.append((params, sandbox))
+        return sandbox
+
+    def _delete(self, sandbox, timeout=60):
+        self.deleted.append(sandbox)
+
+    def _list(self, query=None, request_timeout=None):
+        wanted = getattr(query, "labels", None) or {}
+        for sandbox in self.existing:
+            labels = getattr(sandbox, "labels", {})
+            if all(labels.get(k) == v for k, v in wanted.items()):
+                yield sandbox
+
+    def _start(self, sandbox, timeout=60):
+        self.started.append(sandbox)
+        sandbox.state = "started"
+
+
+@pytest.fixture()
+def fake_sdk(monkeypatch):
+    """Install a fake ``daytona`` module so DaytonaSandbox imports it without the real SDK."""
+    captured = {}
+
+    def _config(**kwargs):
+        captured["config"] = kwargs
+        return types.SimpleNamespace(**kwargs)
+
+    def _params(**kwargs):
+        return types.SimpleNamespace(**kwargs)
+
+    def _list_query(**kwargs):
+        return types.SimpleNamespace(**kwargs)
+
+    class _SandboxState:
+        STARTED = "started"
+        STOPPED = "stopped"
+
+    fake_module = types.ModuleType("daytona")
+    fake_module.Daytona = _FakeDaytonaClient
+    fake_module.DaytonaConfig = _config
+    fake_module.CreateSandboxFromSnapshotParams = _params
+    fake_module.ListSandboxesQuery = _list_query
+    fake_module.SandboxState = _SandboxState
+    monkeypatch.setitem(sys.modules, "daytona", fake_module)
+    captured["client_cls"] = _FakeDaytonaClient
+    return captured
+
+
+@pytest.fixture()
+def sandbox(fake_sdk):
+    from docsgpt.sandbox.daytona import DaytonaSandbox
+
+    return DaytonaSandbox(api_key="dtn_test", language="python")
+
+
+# --- Construction --------------------------------------------------------
+
+
+def test_requires_api_key(fake_sdk):
+    from docsgpt.sandbox.daytona import DaytonaSandbox
+
+    with pytest.raises(ValueError):
+        DaytonaSandbox(api_key="")
+
+
+def test_config_forwards_optional_knobs(fake_sdk):
+    from docsgpt.sandbox.daytona import DaytonaSandbox
+
+    DaytonaSandbox(api_key="k", api_url="https://api.example", target="us")
+    cfg = fake_sdk["config"]
+    assert cfg["api_key"] == "k"
+    assert cfg["api_url"] == "https://api.example"
+    assert cfg["target"] == "us"
+
+
+def test_config_omits_unset_knobs(fake_sdk):
+    from docsgpt.sandbox.daytona import DaytonaSandbox
+
+    DaytonaSandbox(api_key="k")
+    assert set(fake_sdk["config"].keys()) == {"api_key"}
+
+
+# --- Lifecycle -----------------------------------------------------------
+
+
+def test_open_creates_sandbox_and_primes_workspace(sandbox):
+    handle_id = sandbox.open("conv-1")
+    assert handle_id == "sbx-1"
+    assert sandbox._client.create.call_count == 1
+    _, created = sandbox._client.created[0]
+    created.fs.create_folder.assert_called_once()
+    # label binds the cloud sandbox to the docsgpt session id
+    params = sandbox._client.create.call_args.args[0]
+    assert params.labels["docsgpt_session_id"] == "conv-1"
+
+
+def test_open_twice_reuses_handle(sandbox):
+    sandbox.open("conv-1")
+    sandbox.open("conv-1")
+    assert sandbox._client.create.call_count == 1  # created once
+
+
+def test_attach_reuses_warm_handle(sandbox):
+    sandbox.open("conv-1")
+    assert sandbox.attach("conv-1") == "sbx-1"
+    assert sandbox._client.create.call_count == 1
+
+
+def test_attach_opens_when_no_handle(sandbox):
+    assert sandbox.attach("conv-1") == "sbx-1"
+    assert sandbox._client.create.call_count == 1
+
+
+def test_close_deletes_cloud_sandbox(sandbox):
+    sandbox.open("conv-1")
+    _, created = sandbox._client.created[0]
+    sandbox.close("conv-1")
+    sandbox._client.delete.assert_called_once_with(created)
+    assert not sandbox._handles
+
+
+def test_close_unknown_session_is_noop(sandbox):
+    sandbox.close("never-opened")
+    sandbox._client.delete.assert_not_called()
+
+
+def test_close_swallows_delete_errors(sandbox):
+    sandbox.open("conv-1")
+    sandbox._client.delete.side_effect = RuntimeError("cloud down")
+    sandbox.close("conv-1")  # must not raise
+    assert not sandbox._handles
+
+
+def test_remove_path_deletes_directory_recursively(sandbox):
+    """A token DIRECTORY is removed with a recursive delete (daytona delete_file recursive=True)."""
+    sandbox.open("conv-1")
+    _, created = sandbox._client.created[0]
+    sandbox.remove_path("conv-1", "artifacts/tok")
+    remote, kwargs = created.fs.delete_file.call_args.args, created.fs.delete_file.call_args.kwargs
+    assert remote[0].endswith("/artifacts/tok")
+    assert kwargs.get("recursive") is True
+
+
+def test_remove_path_refuses_workspace_root(sandbox):
+    """remove_path must never delete the workspace root itself."""
+    sandbox.open("conv-1")
+    _, created = sandbox._client.created[0]
+    sandbox.remove_path("conv-1", ".")
+    created.fs.delete_file.assert_not_called()
+
+
+def test_remove_path_falls_back_to_rm_when_no_recursive_kwarg(sandbox):
+    """When delete_file lacks the recursive kwarg, fall back to a contained rm -rf."""
+    sandbox.open("conv-1")
+    _, created = sandbox._client.created[0]
+
+    def _no_recursive(path, recursive=None):
+        if recursive:
+            raise TypeError("delete_file() got an unexpected keyword argument 'recursive'")
+        raise RuntimeError("cannot delete a directory")
+
+    created.fs.delete_file.side_effect = _no_recursive
+    created.process.exec = mock.Mock()
+    sandbox.remove_path("conv-1", "artifacts/tok")
+    cmd = created.process.exec.call_args.args[0]
+    assert cmd.startswith("rm -rf ") and cmd.endswith("/artifacts/tok'")
+
+
+def test_remove_path_never_raises(sandbox):
+    """Any backend error during cleanup is swallowed (cleanup must not fail an op)."""
+    sandbox.open("conv-1")
+    _, created = sandbox._client.created[0]
+    created.fs.delete_file.side_effect = RuntimeError("cloud down")
+    created.process.exec = mock.Mock(side_effect=RuntimeError("also down"))
+    sandbox.remove_path("conv-1", "artifacts/tok")  # must not raise
+
+
+def test_close_handle_deletes_captured_sandbox(sandbox):
+    """close_handle tears down the captured sandbox and drops the registry entry."""
+    sandbox.open("conv-1")
+    _, created = sandbox._client.created[0]
+    sandbox.close_handle("conv-1", created.id)
+    sandbox._client.delete.assert_called_once_with(created)
+    assert not sandbox._handles
+
+
+def test_close_handle_leaves_reopened_sandbox_intact(sandbox):
+    """A concurrent re-open replaced the handle: close_handle deletes the OLD one by id only."""
+    sandbox.open("conv-1")
+    _, old = sandbox._client.created[0]
+    # Simulate a concurrent re-open: a new sandbox is registered for the same session.
+    new = _FakeSandbox(sandbox_id="sbx-new", labels={"docsgpt_session_id": "conv-1"})
+    from docsgpt.sandbox.daytona import _Handle, _WORKSPACE_ROOT
+
+    sandbox._handles["conv-1"] = _Handle(new, new.id, _WORKSPACE_ROOT)
+    sandbox._client.created.append((None, new))  # so client.get(new.id) could resolve
+
+    sandbox.close_handle("conv-1", old.id)  # close the OLD captured id
+
+    # The OLD sandbox was deleted (fetched by id); the NEW handle stays registered.
+    assert old in sandbox._client.deleted
+    assert new not in sandbox._client.deleted
+    assert sandbox._handles["conv-1"].sandbox_id == "sbx-new"
+
+
+def test_invalid_session_id_rejected(sandbox):
+    with pytest.raises(ValueError):
+        sandbox.open("../etc/passwd")
+
+
+def test_open_reattaches_to_existing_cloud_sandbox(sandbox):
+    """A still-live labelled sandbox (e.g. after a process restart) is reused, not re-created."""
+    prior = _FakeSandbox(sandbox_id="sbx-prior", labels={"docsgpt_session_id": "conv-1"})
+    sandbox._client.existing = [prior]
+    handle_id = sandbox.open("conv-1")
+    assert handle_id == "sbx-prior"
+    assert sandbox._client.create.call_count == 0  # no new paid sandbox
+    assert sandbox._handles["conv-1"].sandbox is prior
+
+
+def test_open_reattach_starts_stopped_sandbox(sandbox):
+    prior = _FakeSandbox(sandbox_id="sbx-stopped", labels={"docsgpt_session_id": "conv-1"}, state="stopped")
+    sandbox._client.existing = [prior]
+    sandbox.open("conv-1")
+    sandbox._client.start.assert_called_once()
+    assert prior.state == "started"
+    assert sandbox._client.create.call_count == 0
+
+
+def test_open_ignores_existing_for_other_session(sandbox):
+    other = _FakeSandbox(sandbox_id="sbx-other", labels={"docsgpt_session_id": "conv-OTHER"})
+    sandbox._client.existing = [other]
+    handle_id = sandbox.open("conv-1")
+    assert handle_id == "sbx-1"  # a fresh one is created
+    assert sandbox._client.create.call_count == 1
+
+
+def test_open_enforces_concurrency_cap(fake_sdk):
+    from docsgpt.sandbox.daytona import DaytonaSandbox
+
+    s = DaytonaSandbox(api_key="k", max_sandboxes=2)
+    s.open("conv-1")
+    s.open("conv-2")
+    with pytest.raises(RuntimeError):
+        s.open("conv-3")
+    assert s._client.create.call_count == 2
+
+
+def test_open_deletes_sandbox_if_registration_fails(sandbox):
+    """Crash between create and register must delete the orphaned cloud sandbox."""
+
+    class _BoomSandbox(_FakeSandbox):
+        def __init__(self):
+            super().__init__(sandbox_id="sbx-boom")
+
+        @property
+        def id(self):
+            raise RuntimeError("id blew up")
+
+        @id.setter
+        def id(self, value):
+            pass  # absorb _FakeSandbox.__init__'s assignment
+
+    boom = _BoomSandbox()
+    sandbox._client.create.side_effect = lambda params=None, timeout=60: boom
+    with pytest.raises(RuntimeError):
+        sandbox.open("conv-1")
+    sandbox._client.delete.assert_called_once_with(boom)
+    assert "conv-1" not in sandbox._handles
+
+
+# --- Execution -----------------------------------------------------------
+
+
+def test_exec_maps_success_to_exec_result(sandbox):
+    sandbox.open("conv-1")
+    _, created = sandbox._client.created[0]
+    created.process.code_run.return_value = _FakeExecuteResponse(
+        exit_code=0, result="ignored", artifacts=_FakeArtifacts(stdout="42\n")
+    )
+    res = sandbox.exec("conv-1", "print(42)")
+    assert isinstance(res, ExecResult)
+    assert res.ok and res.stdout == "42\n" and res.exit_code == 0
+
+
+def test_exec_prepends_workspace_chdir(sandbox):
+    sandbox.open("conv-1")
+    _, created = sandbox._client.created[0]
+    sandbox.exec("conv-1", "print('x')")
+    sent_code = created.process.code_run.call_args.args[0]
+    assert "_os.chdir" in sent_code and "print('x')" in sent_code
+
+
+def test_exec_nonzero_exit_is_error(sandbox):
+    sandbox.open("conv-1")
+    _, created = sandbox._client.created[0]
+    created.process.code_run.return_value = _FakeExecuteResponse(
+        exit_code=1, artifacts=_FakeArtifacts(stdout="Traceback...")
+    )
+    res = sandbox.exec("conv-1", "raise ValueError()")
+    assert res.status == "error" and res.exit_code == 1
+    assert res.error_name == "ExecutionError"
+
+
+def test_exec_captures_charts_as_plots(sandbox):
+    sandbox.open("conv-1")
+    _, created = sandbox._client.created[0]
+    created.process.code_run.return_value = _FakeExecuteResponse(
+        exit_code=0, artifacts=_FakeArtifacts(stdout="", charts=[_FakeChart("BASE64PNG")])
+    )
+    res = sandbox.exec("conv-1", "plt.plot(...)")
+    assert len(res.plots) == 1
+    assert res.plots[0].format == "png" and res.plots[0].content_base64 == "BASE64PNG"
+
+
+def test_exec_takes_shown_charts_out_of_stdout(sandbox):
+    sandbox.open("conv-1")
+    _, created = sandbox._client.created[0]
+    stdout = "before\n<<docsgpt-chart:QUJD>>\n<<docsgpt-chart:REVG>>\nafter\n"
+    created.process.code_run.return_value = _FakeExecuteResponse(exit_code=0, artifacts=_FakeArtifacts(stdout=stdout))
+    res = sandbox.exec("conv-1", "plt.show()")
+    assert res.stdout == "before\nafter\n"
+    assert [p.content_base64 for p in res.plots] == ["QUJD", "REVG"]
+
+
+def test_the_chart_hook_runs_first_and_compiles():
+    from docsgpt.sandbox.daytona import DaytonaSandbox
+
+    wrapped = DaytonaSandbox._with_workspace_cwd("/w", "from __future__ import annotations\nprint(1)")
+    assert wrapped.startswith("from __future__ import annotations")
+    assert "_DgPyplotHook" in wrapped and wrapped.index("_DgPyplotHook") < wrapped.index("print(1)")
+    compile(wrapped, "<code>", "exec")
+
+
+def test_exec_sdk_error_becomes_error_result(sandbox):
+    sandbox.open("conv-1")
+    _, created = sandbox._client.created[0]
+    created.process.code_run.side_effect = RuntimeError("boom")
+    res = sandbox.exec("conv-1", "1/0")
+    assert res.status == "error" and res.error_name == "RuntimeError"
+    assert res.exit_code == -1
+
+
+def test_exec_requires_open_session(sandbox):
+    with pytest.raises(KeyError):
+        sandbox.exec("missing", "1+1")
+
+
+# --- File transfer -------------------------------------------------------
+
+
+def test_put_file_uploads_under_workspace(sandbox):
+    sandbox.open("conv-1")
+    _, created = sandbox._client.created[0]
+    sandbox.put_file("conv-1", "out/data.csv", b"a,b\n")
+    data, remote = created.fs.upload_file.call_args.args
+    assert data == b"a,b\n"
+    assert remote.endswith("/docsgpt-sandbox/out/data.csv")
+
+
+def test_put_file_bounds_the_upload(sandbox):
+    # Every other fs.* call is bounded at default_timeout; without this the
+    # upload falls back to the SDK's 30-minute default and a toolbox proxy that
+    # accepts but never answers pins the chat stream for that long.
+    sandbox.open("conv-1")
+    _, created = sandbox._client.created[0]
+    sandbox.put_file("conv-1", "out/data.csv", b"a,b\n")
+    assert created.fs.upload_file.call_args.kwargs["timeout"] == 60
+
+
+def test_get_file_bounds_the_download(sandbox):
+    # download_file takes its timeout positionally and dispatches on
+    # isinstance(arg, int) -- a float would be read as a local destination path.
+    sandbox.open("conv-1")
+    _, created = sandbox._client.created[0]
+    created.fs.download_file.return_value = b"hello"
+    sandbox.get_file("conv-1", "out/data.csv")
+    args = created.fs.download_file.call_args.args
+    assert args[1] == 60
+    assert isinstance(args[1], int)
+
+
+def test_put_file_creates_parent_dirs(sandbox):
+    sandbox.open("conv-1")
+    _, created = sandbox._client.created[0]
+    created.fs.create_folder.reset_mock()
+    sandbox.put_file("conv-1", "out/nested/data.csv", b"x")
+    folder = created.fs.create_folder.call_args.args[0]
+    assert folder.endswith("/docsgpt-sandbox/out/nested")
+
+
+def test_put_file_swallows_existing_folder_error(sandbox):
+    sandbox.open("conv-1")
+    _, created = sandbox._client.created[0]
+    created.fs.create_folder.side_effect = RuntimeError("already exists")
+    sandbox.put_file("conv-1", "out/data.csv", b"x")  # must not raise
+    created.fs.upload_file.assert_called_once()
+
+
+def test_put_file_rejects_nul_path(sandbox):
+    sandbox.open("conv-1")
+    with pytest.raises(ValueError):
+        sandbox.put_file("conv-1", "bad\x00name.csv", b"x")
+
+
+def test_put_file_error_wrapped_as_ioerror(sandbox):
+    sandbox.open("conv-1")
+    _, created = sandbox._client.created[0]
+    created.fs.upload_file.side_effect = RuntimeError("internal://api.daytona/upload")
+    with pytest.raises(IOError) as exc:
+        sandbox.put_file("conv-1", "data.csv", b"x")
+    assert "api.daytona" not in str(exc.value)
+
+
+def test_get_file_error_wrapped_as_ioerror(sandbox):
+    sandbox.open("conv-1")
+    _, created = sandbox._client.created[0]
+    created.fs.download_file.side_effect = RuntimeError("internal://api.daytona/download")
+    with pytest.raises(IOError) as exc:
+        sandbox.get_file("conv-1", "a.txt")
+    assert "api.daytona" not in str(exc.value)
+
+
+def test_put_file_rejects_absolute_path(sandbox):
+    sandbox.open("conv-1")
+    with pytest.raises(ValueError):
+        sandbox.put_file("conv-1", "/etc/passwd", b"x")
+
+
+def test_put_file_rejects_traversal(sandbox):
+    sandbox.open("conv-1")
+    with pytest.raises(ValueError):
+        sandbox.put_file("conv-1", "../../escape", b"x")
+
+
+def test_get_file_returns_bytes(sandbox):
+    sandbox.open("conv-1")
+    _, created = sandbox._client.created[0]
+    created.fs.download_file.return_value = b"hello"
+    created.fs.get_file_info.return_value = _FakeFileInfo("a.txt", size=5)
+    assert sandbox.get_file("conv-1", "a.txt") == b"hello"
+
+
+def test_get_file_too_large_rejected(sandbox):
+    from docsgpt.sandbox.daytona import DaytonaSandbox
+
+    s = DaytonaSandbox(api_key="k", max_file_bytes=3)
+    s.open("conv-1")
+    _, created = s._client.created[0]
+    created.fs.get_file_info.return_value = _FakeFileInfo("a.txt", size=99)
+    from docsgpt.sandbox.base import FileTooLargeError
+
+    with pytest.raises(FileTooLargeError) as caught:
+        s.get_file("conv-1", "a.txt")
+    assert (caught.value.size, caught.value.limit) == (99, 3)
+
+
+def test_get_file_post_download_size_guard(sandbox):
+    """Oversized payloads are rejected even when get_file_info reports no size."""
+    from docsgpt.sandbox.daytona import DaytonaSandbox
+
+    s = DaytonaSandbox(api_key="k", max_file_bytes=3)
+    s.open("conv-1")
+    _, created = s._client.created[0]
+    created.fs.get_file_info.return_value = _FakeFileInfo("a.txt", size=None)
+    created.fs.download_file.return_value = b"way-too-long"
+    with pytest.raises(IOError):
+        s.get_file("conv-1", "a.txt")
+
+
+def test_get_file_none_payload_raises(sandbox):
+    sandbox.open("conv-1")
+    _, created = sandbox._client.created[0]
+    created.fs.download_file.return_value = None
+    with pytest.raises(IOError):
+        sandbox.get_file("conv-1", "a.txt")
+
+
+_WS = "/home/daytona/docsgpt-sandbox"
+
+
+def test_list_files_returns_top_level_files(sandbox):
+    sandbox.open("conv-1")
+    _, created = sandbox._client.created[0]
+    created.fs.tree = {
+        _WS: [_FakeFileInfo("a.txt"), _FakeFileInfo("nested", is_dir=True), _FakeFileInfo("b.json")],
+        f"{_WS}/nested": [],
+    }
+    assert sorted(sandbox.list_files("conv-1")) == ["a.txt", "b.json"]
+
+
+def test_list_files_recurses_into_subdirs(sandbox):
+    sandbox.open("conv-1")
+    _, created = sandbox._client.created[0]
+    created.fs.tree = {
+        _WS: [_FakeFileInfo("top.txt"), _FakeFileInfo("sub", is_dir=True)],
+        f"{_WS}/sub": [_FakeFileInfo("a.txt"), _FakeFileInfo("deep", is_dir=True)],
+        f"{_WS}/sub/deep": [_FakeFileInfo("c.bin")],
+    }
+    assert sorted(sandbox.list_files("conv-1")) == ["sub/a.txt", "sub/deep/c.bin", "top.txt"]
+
+
+def test_list_files_error_wrapped_as_ioerror(sandbox):
+    sandbox.open("conv-1")
+    _, created = sandbox._client.created[0]
+    created.fs.list_files.side_effect = RuntimeError("internal://api.daytona/list")
+    with pytest.raises(IOError) as exc:
+        sandbox.list_files("conv-1")
+    # generic error: no internal endpoint leaked to the model
+    assert "api.daytona" not in str(exc.value)
+
+
+# --- Output cap in _to_result --------------------------------------------
+
+
+def test_to_result_truncates_stdout_over_cap(fake_sdk):
+    """Stdout beyond max_output_bytes is byte-capped, noted, and flagged truncated."""
+    from docsgpt.sandbox.daytona import DaytonaSandbox
+
+    s = DaytonaSandbox(api_key="k", max_output_bytes=10)
+    resp = _FakeExecuteResponse(exit_code=0, artifacts=_FakeArtifacts(stdout="X" * 100))
+    res = s._to_result(resp)
+    assert res.truncated is True
+    prefix = res.stdout.split("\n[output truncated")[0]
+    assert prefix == "X" * 10  # capped to exactly the byte budget before the note
+    assert "[output truncated at 10 bytes]" in res.stdout
+
+
+def test_to_result_keeps_small_stdout_intact(fake_sdk):
+    from docsgpt.sandbox.daytona import DaytonaSandbox
+
+    s = DaytonaSandbox(api_key="k", max_output_bytes=1000)
+    res = s._to_result(_FakeExecuteResponse(exit_code=0, artifacts=_FakeArtifacts(stdout="hello")))
+    assert res.truncated is False
+    assert res.stdout == "hello"
+
+
+def test_to_result_cap_disabled_by_default(fake_sdk):
+    """max_output_bytes defaults to 0 (disabled): a large stdout is passed through whole."""
+    from docsgpt.sandbox.daytona import DaytonaSandbox
+
+    s = DaytonaSandbox(api_key="k")
+    res = s._to_result(_FakeExecuteResponse(exit_code=0, artifacts=_FakeArtifacts(stdout="Y" * 5000)))
+    assert res.truncated is False
+    assert res.stdout == "Y" * 5000
+
+
+def test_to_result_truncation_bounds_error_value(fake_sdk):
+    """On a nonzero exit the capped stdout (not the raw buffer) is what feeds error_value."""
+    from docsgpt.sandbox.daytona import DaytonaSandbox
+
+    s = DaytonaSandbox(api_key="k", max_output_bytes=10)
+    res = s._to_result(_FakeExecuteResponse(exit_code=1, artifacts=_FakeArtifacts(stdout="E" * 100)))
+    assert res.status == "error" and res.truncated is True
+    assert res.error_value == res.stdout
+    assert res.error_value.split("\n[output truncated")[0] == "E" * 10
+
+
+# --- Wake an auto-stopped sandbox on the cached-handle path ---------------
+
+
+def test_exec_wakes_auto_stopped_sandbox_and_retries(sandbox):
+    """A cached handle to an auto-stopped sandbox: exec wakes it and retries once."""
+    sandbox.open("conv-1")
+    _, created = sandbox._client.created[0]
+    created.state = "stopped"  # Daytona auto-stopped it under the still-cached handle
+    created.process.code_run.side_effect = [
+        RuntimeError("sandbox is stopped"),
+        _FakeExecuteResponse(exit_code=0, artifacts=_FakeArtifacts(stdout="woke\n")),
+    ]
+    res = sandbox.exec("conv-1", "print('x')")
+    assert res.ok and res.stdout == "woke\n"
+    sandbox._client.start.assert_called_once()
+    assert created.process.code_run.call_count == 2
+
+
+def test_a_failed_retry_reports_the_retry_error(sandbox):
+    """The retry's own failure (a timeout, say) is the one to report, not the stopped-sandbox error before it."""
+
+    class DaytonaTimeoutError(Exception):
+        pass
+
+    sandbox.open("conv-1")
+    _, created = sandbox._client.created[0]
+    created.state = "stopped"
+    created.process.code_run.side_effect = [
+        RuntimeError("sandbox is stopped"),
+        DaytonaTimeoutError("execution exceeded 60s"),
+    ]
+    res = sandbox.exec("conv-1", "while True: pass")
+    assert res.error_name == "DaytonaTimeoutError"
+    assert res.error_value == "execution exceeded 60s"
+
+
+def test_exec_does_not_retry_when_started(sandbox):
+    """A started sandbox that raises is a genuine transport fault: no wake, no spurious retry."""
+    sandbox.open("conv-1")
+    _, created = sandbox._client.created[0]
+    created.process.code_run.side_effect = RuntimeError("transport blip")
+    res = sandbox.exec("conv-1", "print('x')")
+    assert res.status == "error" and res.error_name == "RuntimeError"
+    sandbox._client.start.assert_not_called()
+    assert created.process.code_run.call_count == 1
+
+
+def test_exec_no_retry_when_wake_fails(sandbox):
+    """If the stopped sandbox cannot be started, exec returns the error without retrying."""
+    sandbox.open("conv-1")
+    _, created = sandbox._client.created[0]
+    created.state = "stopped"
+    sandbox._client.start.side_effect = RuntimeError("cannot start")
+    created.process.code_run.side_effect = RuntimeError("stopped")
+    res = sandbox.exec("conv-1", "print('x')")
+    assert res.status == "error"
+    assert created.process.code_run.call_count == 1
+
+
+def test_put_file_wakes_auto_stopped_sandbox_and_retries(sandbox):
+    """put_file wakes an auto-stopped sandbox and retries the upload once."""
+    sandbox.open("conv-1")
+    _, created = sandbox._client.created[0]
+    created.state = "stopped"
+    created.fs.upload_file.side_effect = [RuntimeError("stopped"), None]
+    sandbox.put_file("conv-1", "data.csv", b"x")
+    sandbox._client.start.assert_called_once()
+    assert created.fs.upload_file.call_count == 2
+
+
+def test_ensure_started_returns_false_when_get_fails(sandbox):
+    """A failed refresh means we cannot wake, so no retry is attempted."""
+    sandbox.open("conv-1")
+    handle = sandbox._handles["conv-1"]
+    sandbox._client.get = mock.Mock(side_effect=KeyError("gone"))
+    assert sandbox._ensure_started(handle) is False
+
+
+# --- from __future__ imports survive the workspace prelude ---------------
+
+
+def test_with_workspace_cwd_hoists_future_import(sandbox):
+    """A leading ``from __future__`` import stays the first statement of the wrapped code."""
+    wrapped = sandbox._with_workspace_cwd("/ws", "from __future__ import annotations\nprint('hi')\n")
+    assert wrapped.startswith("from __future__ import annotations\n")
+    assert wrapped.index("from __future__") < wrapped.index("import os as _os")
+    assert "_os.chdir('/ws')" in wrapped
+    assert wrapped.rstrip().endswith("print('hi')")
+
+
+def test_with_workspace_cwd_no_future_import_is_prelude_prefix(sandbox):
+    """Without a future import the wrapper is just prelude + code, unchanged."""
+    wrapped = sandbox._with_workspace_cwd("/ws", "print('hi')\n")
+    assert wrapped.startswith("import os as _os\n")
+    assert wrapped.endswith("print('hi')\n")
+
+
+def test_split_leading_future_imports_multiple_with_comment():
+    from docsgpt.sandbox.daytona import DaytonaSandbox
+
+    code = "# header\nfrom __future__ import annotations\nfrom __future__ import division\nx = 1\n"
+    hoisted, rest = DaytonaSandbox._split_leading_future_imports(code)
+    assert "from __future__ import annotations" in hoisted
+    assert "from __future__ import division" in hoisted
+    assert rest == "x = 1\n"
+
+
+def test_split_leading_future_imports_none():
+    from docsgpt.sandbox.daytona import DaytonaSandbox
+
+    hoisted, rest = DaytonaSandbox._split_leading_future_imports("x = 1\n")
+    assert hoisted == "" and rest == "x = 1\n"
+
+
+def test_split_leading_future_imports_adds_trailing_newline():
+    from docsgpt.sandbox.daytona import DaytonaSandbox
+
+    hoisted, rest = DaytonaSandbox._split_leading_future_imports("from __future__ import annotations")
+    assert hoisted.endswith("\n")  # ensures the prelude begins on its own line
+    assert rest == ""
+
+
+# --- Registry wiring -----------------------------------------------------
+
+
+def test_sandbox_creator_selects_daytona_backend(fake_sdk, monkeypatch):
+    from docsgpt.core.settings import settings
+    from docsgpt.sandbox import sandbox_creator as sc
+    from docsgpt.sandbox.daytona import DaytonaSandbox
+
+    monkeypatch.setattr(settings, "DAYTONA_API_KEY", "dtn_test", raising=False)
+    sc.SandboxCreator.reset()
+    backend = sc.SandboxCreator.create_backend("daytona")
+    assert isinstance(backend, DaytonaSandbox)
+    sc.SandboxCreator.reset()
+
+
+@pytest.mark.parametrize("configured", [0, -1, -5])
+def test_factory_clamps_nonpositive_auto_delete_interval(fake_sdk, monkeypatch, configured):
+    """A never-expiring auto_delete_interval (<= 0) is replaced so orphans always expire."""
+    from docsgpt.core.settings import settings
+    from docsgpt.sandbox import sandbox_creator as sc
+
+    monkeypatch.setattr(settings, "DAYTONA_API_KEY", "dtn_test", raising=False)
+    monkeypatch.setattr(settings, "DAYTONA_AUTO_DELETE_INTERVAL", configured, raising=False)
+    sc.SandboxCreator.reset()
+    backend = sc.SandboxCreator.create_backend("daytona")
+    assert backend._auto_delete_interval > 0
+    sc.SandboxCreator.reset()
+
+
+def test_factory_forwards_max_sandboxes(fake_sdk, monkeypatch):
+    from docsgpt.core.settings import settings
+    from docsgpt.sandbox import sandbox_creator as sc
+
+    monkeypatch.setattr(settings, "DAYTONA_API_KEY", "dtn_test", raising=False)
+    monkeypatch.setattr(settings, "DAYTONA_MAX_SANDBOXES", 7, raising=False)
+    sc.SandboxCreator.reset()
+    backend = sc.SandboxCreator.create_backend("daytona")
+    assert backend._max_sandboxes == 7
+    sc.SandboxCreator.reset()
+
+
+# --- Regression: a DELETED sandbox must invalidate the runtime (Bug A) ----
+#
+# Daytona auto-STOPS an idle sandbox (auto_stop_interval) and later auto-DELETES
+# it (auto_delete_interval). A stop is recoverable — ``_ensure_started`` wakes it
+# and retries (covered above). A delete is NOT: the cached handle points at a
+# tombstone, ``code_run`` raises "container not found", and ``client.get`` can no
+# longer resolve it. The Jupyter backend handles the equivalent kernel-death by
+# dropping its handle and setting ``runtime_invalidated=True`` so the manager
+# cold-starts on the next call; the Daytona backend must do the same.
+#
+# Without this the manager keeps a dead handle and EVERY subsequent call in the
+# session fails until the idle-TTL reap — observed in prod as one sandbox failing
+# five times across ~18 minutes (error-review ledger #28, Bug A).
+
+
+def test_exec_invalidates_runtime_when_sandbox_deleted(sandbox):
+    """A code_run against an auto-DELETED sandbox drops the handle and flags the
+    runtime invalid so the next open cold-starts."""
+    sandbox.open("conv-1")
+    _, created = sandbox._client.created[0]
+    # Deleted under the still-cached handle: exec fails AND the sandbox can no
+    # longer be resolved (get raises => gone, not merely stopped).
+    created.process.code_run.side_effect = RuntimeError("No such container: sbx-1")
+    sandbox._client.get = mock.Mock(side_effect=KeyError("sbx-1"))
+
+    res = sandbox.exec("conv-1", "print('x')")
+
+    assert res.status == "error"
+    assert res.runtime_invalidated is True  # signals the manager to cold-start
+    assert "conv-1" not in sandbox._handles  # tombstone dropped; next open re-creates
+
+
+def test_exec_does_not_invalidate_live_sandbox_on_transient_error(sandbox):
+    """A blip on a still-live (started) sandbox is NOT an invalidation: the warm
+    handle stays so a later call can reuse it."""
+    sandbox.open("conv-1")
+    _, created = sandbox._client.created[0]
+    created.process.code_run.side_effect = RuntimeError("transient transport blip")
+
+    res = sandbox.exec("conv-1", "print('x')")
+
+    assert res.status == "error"
+    assert res.runtime_invalidated is False
+    assert "conv-1" in sandbox._handles
+
+
+def test_manager_cold_starts_after_daytona_sandbox_deleted(fake_sdk):
+    """End-to-end (SandboxManager + DaytonaSandbox): once the cloud sandbox is
+    deleted, the next run transparently creates a FRESH sandbox instead of reusing
+    the dead handle. This is the user-facing recovery contract Bug A breaks."""
+    from docsgpt.sandbox.daytona import DaytonaSandbox
+    from docsgpt.sandbox.manager import SandboxManager
+
+    backend = DaytonaSandbox(api_key="k")
+    mgr = SandboxManager(backend, max_ttl=600)
+    mgr.open("conv-1")
+    _, created = backend._client.created[0]
+    created.process.code_run.side_effect = RuntimeError("No such container: sbx-1")
+    backend._client.get = mock.Mock(side_effect=KeyError("sbx-1"))  # deleted => gone
+
+    res = mgr.exec("conv-1", "print('x')")
+
+    assert res.status == "error"
+    assert not mgr.has_session("conv-1")  # manager dropped the invalidated session
+
+    mgr.open("conv-1")  # recovery
+    assert backend._client.create.call_count == 2  # a NEW sandbox, not the tombstone
+
+
+# --- #46: bounded toolbox calls + gone-sandbox hygiene --------------------
+# Prod evidence (2026-08-19): the Daytona toolbox proxy can accept a request
+# for a just-created/woken sandbox and never answer (no container IP yet), and
+# the SDK's fs metadata calls default to NO client timeout — one hung
+# create_folder pinned a stream for ~16 min until auto-stop dropped the
+# connection. Every toolbox/control-plane call must carry request_timeout, and
+# an operation against a deleted-but-still-listed sandbox must invalidate the
+# handle instead of burning a failed round per call.
+
+
+def test_prime_passes_request_timeout(sandbox):
+    """The workspace prime (the exact call seen hanging in prod) is bounded."""
+    sandbox.open("conv-1")
+    _, created = sandbox._client.created[0]
+    assert created.fs.create_folder.call_args.kwargs.get("request_timeout") == 60.0
+
+
+def test_prime_retries_once_after_transport_error(sandbox):
+    """A hung/failed prime is retried once (bounded) instead of being dropped."""
+    from docsgpt.sandbox.daytona import DaytonaSandbox  # noqa: F401 - fixture import parity
+
+    client_cls = type(sandbox._client)
+    orig_create = client_cls._create
+
+    def _create(client_self, params=None, timeout=60):
+        sb = orig_create(client_self, params, timeout)
+        sb.fs.create_folder.side_effect = [RuntimeError("read timed out"), None]
+        return sb
+
+    with mock.patch.object(client_cls, "_create", _create):
+        sandbox._client.create = mock.Mock(side_effect=lambda p=None, timeout=60: _create(sandbox._client, p, timeout))
+        sandbox.open("conv-1")
+    _, created = sandbox._client.created[0]
+    assert created.fs.create_folder.call_count == 2
+
+
+def test_upload_parent_folder_passes_request_timeout(sandbox):
+    sandbox.open("conv-1")
+    _, created = sandbox._client.created[0]
+    created.fs.create_folder.reset_mock()
+    sandbox.put_file("conv-1", "out/data.csv", b"x")
+    assert created.fs.create_folder.call_args.kwargs.get("request_timeout") == 60.0
+
+
+def test_download_metadata_passes_request_timeout(sandbox):
+    sandbox.open("conv-1")
+    _, created = sandbox._client.created[0]
+    sandbox.get_file("conv-1", "a.txt")
+    assert created.fs.get_file_info.call_args.kwargs.get("request_timeout") == 60.0
+
+
+def test_list_files_walk_passes_request_timeout(sandbox):
+    sandbox.open("conv-1")
+    _, created = sandbox._client.created[0]
+    sandbox.list_files("conv-1")
+    assert created.fs.list_files.call_args.kwargs.get("request_timeout") == 60.0
+
+
+def test_remove_path_delete_passes_request_timeout(sandbox):
+    sandbox.open("conv-1")
+    _, created = sandbox._client.created[0]
+    sandbox.remove_path("conv-1", "artifacts/tok")
+    assert created.fs.delete_file.call_args.kwargs.get("request_timeout") == 60.0
+
+
+def test_ensure_started_get_passes_request_timeout(sandbox):
+    sandbox.open("conv-1")
+    handle = sandbox._handles["conv-1"]
+    sandbox._ensure_started(handle)
+    assert sandbox._client.get.call_args.kwargs.get("request_timeout") == 60.0
+
+
+def test_reattach_list_passes_request_timeout(fake_sdk):
+    from docsgpt.sandbox.daytona import DaytonaSandbox
+
+    box = DaytonaSandbox(api_key="dtn_test", language="python")
+    existing = _FakeSandbox("sbx-old", labels={"docsgpt_session_id": "conv-1"})
+    box._client.existing.append(existing)
+    box.open("conv-1")
+    assert box._client.list.call_args.kwargs.get("request_timeout") == 60.0
+
+
+def test_open_reattach_gone_falls_through_to_fresh_create(fake_sdk):
+    """A labelled-but-deleted sandbox (prod: 404 'it has been deleted') must not
+    win reattach: prime detects it is gone and open() creates a fresh one."""
+    from docsgpt.sandbox.daytona import DaytonaSandbox
+
+    box = DaytonaSandbox(api_key="dtn_test", language="python")
+    ghost = _FakeSandbox("sbx-ghost", labels={"docsgpt_session_id": "conv-1"})
+    ghost.fs.create_folder = mock.Mock(side_effect=RuntimeError("not found: sandbox sbx-ghost"))
+    box._client.existing.append(ghost)
+    box._client.get = mock.Mock(side_effect=KeyError("gone"))  # control plane: deleted
+
+    handle_id = box.open("conv-1")
+
+    assert handle_id == "sbx-1"  # the fresh create, not the ghost
+    assert box._client.create.call_count == 1
+    assert box._handles["conv-1"].sandbox_id == "sbx-1"
+
+
+def test_open_does_not_cache_a_fresh_sandbox_that_vanished_during_prime(fake_sdk):
+    """A just-created sandbox confirmed gone must not be handed back as live.
+
+    ``_prime`` returns False only after ``_sandbox_gone`` confirms the sandbox
+    is gone, and its contract is that the caller discards the handle. The
+    reattach path obeys that; the fresh-create path must too -- ``open()``
+    returns cached handles without revalidating them, so a dead id parked in
+    ``_handles`` is replayed by every later ``open()`` for that session.
+    """
+    from docsgpt.sandbox.base import SandboxGoneError
+    from docsgpt.sandbox.daytona import DaytonaSandbox
+
+    box = DaytonaSandbox(api_key="dtn_test", language="python")
+
+    def _create_doomed(params=None, timeout=60):
+        sandbox = _FakeSandbox(
+            sandbox_id="sbx-dead", labels=getattr(params, "labels", None) or {}
+        )
+        sandbox.fs.create_folder = mock.Mock(
+            side_effect=RuntimeError("not found (it has been deleted)")
+        )
+        box._client.created.append((params, sandbox))
+        return sandbox
+
+    box._client.create = mock.Mock(side_effect=_create_doomed)
+    box._client.get = mock.Mock(side_effect=KeyError("gone"))  # control plane: deleted
+
+    with pytest.raises(SandboxGoneError):
+        box.open("conv-1")
+
+    assert "conv-1" not in box._handles
+    # The in-flight slot is released, so the next open cold-starts rather than
+    # blocking on a create that already finished.
+    assert "conv-1" not in box._creating
+
+
+def test_open_keeps_a_live_sandbox_whose_prime_merely_failed(fake_sdk):
+    """A prime that fails on a still-live sandbox is degraded, not fatal.
+
+    ``exec`` prepends makedirs and ``put_file`` creates parent dirs, so the
+    workspace materializes on first use; failing the open here would reject a
+    perfectly usable sandbox.
+    """
+    from docsgpt.sandbox.daytona import DaytonaSandbox
+
+    box = DaytonaSandbox(api_key="dtn_test", language="python")
+
+    def _create_degraded(params=None, timeout=60):
+        sandbox = _FakeSandbox(
+            sandbox_id="sbx-live", labels=getattr(params, "labels", None) or {}
+        )
+        sandbox.fs.create_folder = mock.Mock(side_effect=RuntimeError("read timed out"))
+        box._client.created.append((params, sandbox))
+        return sandbox
+
+    box._client.create = mock.Mock(side_effect=_create_degraded)
+
+    # ``get`` resolves and reports "started", so _sandbox_gone stays False.
+    assert box.open("conv-1") == "sbx-live"
+    assert box._handles["conv-1"].sandbox_id == "sbx-live"
+
+
+def test_put_file_gone_sandbox_raises_sandbox_gone_and_forgets(sandbox):
+    from docsgpt.sandbox.base import SandboxGoneError
+
+    sandbox.open("conv-1")
+    _, created = sandbox._client.created[0]
+    created.fs.upload_file.side_effect = RuntimeError("not found (it has been deleted)")
+    sandbox._client.get = mock.Mock(side_effect=KeyError("gone"))
+    with pytest.raises(SandboxGoneError):
+        sandbox.put_file("conv-1", "data.csv", b"x")
+    assert "conv-1" not in sandbox._handles
+
+
+def test_get_file_gone_sandbox_raises_sandbox_gone_and_forgets(sandbox):
+    from docsgpt.sandbox.base import SandboxGoneError
+
+    sandbox.open("conv-1")
+    _, created = sandbox._client.created[0]
+    created.fs.get_file_info.side_effect = RuntimeError("not found (it has been deleted)")
+    sandbox._client.get = mock.Mock(side_effect=KeyError("gone"))
+    with pytest.raises(SandboxGoneError):
+        sandbox.get_file("conv-1", "a.txt")
+    assert "conv-1" not in sandbox._handles
+
+
+def test_list_files_gone_sandbox_raises_sandbox_gone_and_forgets(sandbox):
+    from docsgpt.sandbox.base import SandboxGoneError
+
+    sandbox.open("conv-1")
+    _, created = sandbox._client.created[0]
+    created.fs.list_files.side_effect = RuntimeError("not found (it has been deleted)")
+    sandbox._client.get = mock.Mock(side_effect=KeyError("gone"))
+    with pytest.raises(SandboxGoneError):
+        sandbox.list_files("conv-1")
+    assert "conv-1" not in sandbox._handles
+
+
+def test_put_file_alive_sandbox_keeps_plain_ioerror_and_handle(sandbox):
+    """A transport error on a LIVE sandbox stays a plain IOError; handle kept."""
+    from docsgpt.sandbox.base import SandboxGoneError
+
+    sandbox.open("conv-1")
+    _, created = sandbox._client.created[0]
+    created.fs.upload_file.side_effect = RuntimeError("transient")
+    with pytest.raises(IOError) as exc:
+        sandbox.put_file("conv-1", "data.csv", b"x")
+    assert not isinstance(exc.value, SandboxGoneError)
+    assert "conv-1" in sandbox._handles
+
+
+# --- Session status: created vs reattached -------------------------------
+
+
+def test_open_session_reports_a_fresh_create(sandbox):
+    opened = sandbox.open_session("conv-1")
+    assert opened.handle == "sbx-1"
+    assert opened.created is True
+
+
+def test_open_session_reports_a_cached_handle_as_reused(sandbox):
+    sandbox.open_session("conv-1")
+    again = sandbox.open_session("conv-1")
+    assert again.created is False
+    assert sandbox._client.create.call_count == 1
+
+
+def test_open_session_reports_a_reattached_sandbox_as_reused(sandbox):
+    """A live labelled sandbox (another process made it) keeps its files: reused, not new."""
+    prior = _FakeSandbox(sandbox_id="sbx-prior", labels={"docsgpt_session_id": "conv-1"}, state="stopped")
+    sandbox._client.existing = [prior]
+    opened = sandbox.open_session("conv-1")
+    assert opened.handle == "sbx-prior"
+    assert opened.created is False
+
+
+def test_open_session_reports_a_create_after_a_gone_reattach_as_new(fake_sdk):
+    from docsgpt.sandbox.daytona import DaytonaSandbox
+
+    box = DaytonaSandbox(api_key="dtn_test", language="python")
+    ghost = _FakeSandbox("sbx-ghost", labels={"docsgpt_session_id": "conv-1"})
+    ghost.fs.create_folder = mock.Mock(side_effect=RuntimeError("not found: sandbox sbx-ghost"))
+    box._client.existing.append(ghost)
+    box._client.get = mock.Mock(side_effect=KeyError("gone"))
+
+    opened = box.open_session("conv-1")
+
+    assert opened.handle == "sbx-1"
+    assert opened.created is True
+
+
+def test_open_returns_the_bare_sandbox_id(sandbox):
+    handle = sandbox.open("conv-1")
+    assert handle == "sbx-1"
+
+
+def test_manager_reports_reattach_through_open_session(fake_sdk):
+    from docsgpt.sandbox.daytona import DaytonaSandbox
+    from docsgpt.sandbox.manager import SandboxManager
+
+    box = DaytonaSandbox(api_key="dtn_test", language="python")
+    box._client.existing = [_FakeSandbox("sbx-prior", labels={"docsgpt_session_id": "conv-1"})]
+    mgr = SandboxManager(box, max_ttl=600)
+    assert mgr.open_session("conv-1").created is False
+
+
+# --- Long runs: timeouts, OOM kills and the auto-stop timer --------------
+
+
+class _ToolboxApiException(Exception):
+    """Shape of daytona_toolbox_api_client's ApiException, which code_run raises unwrapped."""
+
+    def __init__(self, status, body):
+        super().__init__(f"({status})\nReason: Request Timeout\nHTTP response body: {body}")
+        self.status = status
+        self.body = body
+        self.reason = "Request Timeout"
+
+
+# What Daytona answered when a code_run outlived its timeout (probed live, SDK 0.211.2).
+_DAYTONA_408_BODY = (
+    '{"statusCode":408,"message":"command execution timeout","source":"DAYTONA_DAEMON",'
+    '"code":"PROCESS_EXECUTION_TIMEOUT","path":"/process/code-run","method":"POST"}'
+)
+
+
+def test_exec_passes_the_requested_timeout_to_code_run(sandbox):
+    sandbox.open("conv-1")
+    _, created = sandbox._client.created[0]
+    sandbox.exec("conv-1", "render()", timeout=900)
+    assert created.process.code_run.call_args.kwargs["timeout"] == 900
+
+
+def test_a_code_run_timeout_is_reported_as_a_timeout_without_a_wake_retry(sandbox):
+    sandbox.open("conv-1")
+    _, created = sandbox._client.created[0]
+    created.process.code_run.side_effect = _ToolboxApiException(408, _DAYTONA_408_BODY)
+    res = sandbox.exec("conv-1", "while True: pass", timeout=30)
+    assert res.status == "error"
+    assert res.error_name == "TimeoutError" and res.error_value == "execution exceeded 30s"
+    assert res.runtime_invalidated is False
+    # A timeout is not a stopped sandbox: no refresh, no wake, no second run.
+    assert created.process.code_run.call_count == 1
+    sandbox._client.get.assert_not_called()
+
+
+def test_the_real_toolbox_exception_is_recognized_as_a_timeout():
+    from daytona_toolbox_api_client.exceptions import ApiException
+
+    from docsgpt.sandbox.daytona import _is_exec_timeout
+
+    exc = ApiException(status=408, reason="Request Timeout", body=_DAYTONA_408_BODY)
+    assert _is_exec_timeout(exc)
+    assert not _is_exec_timeout(ApiException(status=500, reason="boom", body="{}"))
+    assert not _is_exec_timeout(RuntimeError("read timed out"))
+    # The daemon's code alone is enough, whatever the status says.
+    assert _is_exec_timeout(_ToolboxApiException(504, _DAYTONA_408_BODY))
+
+
+def test_a_retry_that_times_out_is_reported_as_a_timeout(sandbox):
+    sandbox.open("conv-1")
+    _, created = sandbox._client.created[0]
+    created.state = "stopped"
+    created.process.code_run.side_effect = [
+        RuntimeError("sandbox is stopped"),
+        _ToolboxApiException(408, _DAYTONA_408_BODY),
+    ]
+    res = sandbox.exec("conv-1", "while True: pass", timeout=45)
+    assert res.error_name == "TimeoutError" and res.error_value == "execution exceeded 45s"
+
+
+@pytest.mark.parametrize("exit_code", [137, -9])
+def test_a_process_killed_by_sigkill_is_reported_as_out_of_memory(sandbox, exit_code):
+    """Probed live: a code_run that outgrew the sandbox's memory came back with exit code 137."""
+    sandbox.open("conv-1")
+    _, created = sandbox._client.created[0]
+    created.process.code_run.return_value = _FakeExecuteResponse(
+        exit_code=exit_code, artifacts=_FakeArtifacts(stdout="alloc\n")
+    )
+    res = sandbox.exec("conv-1", "b = bytearray(10**12)")
+    assert res.status == "error" and res.out_of_memory is True
+    assert res.stdout == "alloc\n"
+    assert "memory" in res.error_value
+
+
+def test_an_ordinary_failure_is_not_out_of_memory(sandbox):
+    sandbox.open("conv-1")
+    _, created = sandbox._client.created[0]
+    created.process.code_run.return_value = _FakeExecuteResponse(exit_code=1, artifacts=_FakeArtifacts(stdout="x"))
+    assert sandbox.exec("conv-1", "raise SystemExit(1)").out_of_memory is False
+
+
+def test_sdk_code_run_request_timeout_outlasts_the_exec_timeout():
+    """Pin the SDK: code_run's HTTP request timeout is the exec timeout plus a margin, never unbounded.
+
+    The prod 16-minute hang came from a toolbox call with no client timeout; a
+    long run must not reintroduce one.
+    """
+    from daytona._sync.process import Process
+
+    api = mock.Mock()
+    api.code_run.return_value = types.SimpleNamespace(
+        result="ok", artifacts=None, exit_code=0, additional_properties={}
+    )
+    process = Process("python", api_client=api, http_client=None)
+    process.code_run("print(1)", timeout=1000)
+    request_timeout = api.code_run.call_args.kwargs["_request_timeout"]
+    assert request_timeout is not None and 1000 < request_timeout <= 1030
+
+
+class _ActivitySandbox(_FakeSandbox):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.refreshes = []
+        self.refresh_activity = mock.Mock(side_effect=lambda request_timeout=None: self.refreshes.append(1))
+
+
+def _daytona(fake_sdk, **kwargs):
+    from docsgpt.sandbox.daytona import DaytonaSandbox
+
+    return DaytonaSandbox(api_key="dtn_test", language="python", **kwargs)
+
+
+def test_a_long_exec_keeps_the_sandbox_active(fake_sdk, monkeypatch):
+    """A run longer than half the auto-stop interval refreshes the sandbox's activity while it runs."""
+    import threading
+
+    from docsgpt.sandbox import daytona as daytona_module
+
+    sb = _daytona(fake_sdk, auto_stop_interval=15)
+    sandbox_obj = _ActivitySandbox()
+    sb._handles["conv-1"] = daytona_module._Handle(sandbox_obj, sandbox_obj.id, "/w")
+    monkeypatch.setattr(daytona_module, "_activity_interval", lambda auto_stop_minutes: 0.01)
+    release = threading.Event()
+
+    def _slow_run(code, timeout=None):
+        release.wait(0.3)
+        return _FakeExecuteResponse(exit_code=0, artifacts=_FakeArtifacts(stdout="done\n"))
+
+    sandbox_obj.process.code_run.side_effect = _slow_run
+    res = sb.exec("conv-1", "render()", timeout=1000)
+    assert res.ok
+    assert len(sandbox_obj.refreshes) >= 2
+    count = len(sandbox_obj.refreshes)
+    # The refresher stops with the run.
+    release.wait(0.1)
+    assert len(sandbox_obj.refreshes) == count
+    assert sandbox_obj.refresh_activity.call_args.kwargs["request_timeout"] > 0
+
+
+@pytest.mark.parametrize("auto_stop, timeout", [(15, 60), (15, 450), (0, 1000)])
+def test_a_short_exec_or_disabled_auto_stop_needs_no_refresh(fake_sdk, monkeypatch, auto_stop, timeout):
+    from docsgpt.sandbox import daytona as daytona_module
+
+    sb = _daytona(fake_sdk, auto_stop_interval=auto_stop)
+    sandbox_obj = _ActivitySandbox()
+    sb._handles["conv-1"] = daytona_module._Handle(sandbox_obj, sandbox_obj.id, "/w")
+    monkeypatch.setattr(daytona_module, "_activity_interval", lambda auto_stop_minutes: 0.001)
+
+    def _run(code, timeout=None):
+        import time
+
+        time.sleep(0.05)
+        return _FakeExecuteResponse(exit_code=0, artifacts=_FakeArtifacts(stdout=""))
+
+    sandbox_obj.process.code_run.side_effect = _run
+    assert sb.exec("conv-1", "x()", timeout=timeout).ok
+    assert sandbox_obj.refreshes == []
+
+
+def test_a_failing_activity_refresh_never_breaks_the_run(fake_sdk, monkeypatch):
+    from docsgpt.sandbox import daytona as daytona_module
+
+    sb = _daytona(fake_sdk, auto_stop_interval=15)
+    sandbox_obj = _ActivitySandbox()
+    sandbox_obj.refresh_activity.side_effect = RuntimeError("api down")
+    sb._handles["conv-1"] = daytona_module._Handle(sandbox_obj, sandbox_obj.id, "/w")
+    monkeypatch.setattr(daytona_module, "_activity_interval", lambda auto_stop_minutes: 0.005)
+
+    def _run(code, timeout=None):
+        import time
+
+        time.sleep(0.05)
+        return _FakeExecuteResponse(exit_code=0, artifacts=_FakeArtifacts(stdout="ok\n"))
+
+    sandbox_obj.process.code_run.side_effect = _run
+    assert sb.exec("conv-1", "x()", timeout=1000).stdout == "ok\n"
+
+
+def test_activity_interval_is_a_third_of_the_auto_stop_window():
+    from docsgpt.sandbox.daytona import _activity_interval
+
+    assert _activity_interval(15) == 300
+    assert _activity_interval(1) == 30  # never hammer the API
+
+
+# --- Expiry: release vs delete -------------------------------------------
+
+
+def test_release_handle_drops_the_handle_without_deleting(sandbox):
+    sandbox.open("conv-1")
+    _, created = sandbox._client.created[0]
+    sandbox.release_handle("conv-1", created.id)
+    assert "conv-1" not in sandbox._handles
+    sandbox._client.delete.assert_not_called()
+
+
+def test_release_handle_leaves_a_newer_handle_alone(sandbox):
+    sandbox.open("conv-1")
+    sandbox.release_handle("conv-1", "sbx-older")
+    assert "conv-1" in sandbox._handles
+
+
+def test_idle_seconds_reads_the_sandbox_activity(sandbox):
+    from datetime import datetime, timedelta, timezone
+
+    sandbox.open("conv-1")
+    _, created = sandbox._client.created[0]
+    created.last_activity_at = (datetime.now(timezone.utc) - timedelta(seconds=300)).isoformat()
+    assert 299 <= sandbox.idle_seconds(created.id) <= 310
+    # The API's own spelling: a ``Z`` suffix.
+    created.last_activity_at = (datetime.now(timezone.utc) - timedelta(seconds=60)).strftime(
+        "%Y-%m-%dT%H:%M:%S.%fZ"
+    )
+    assert 59 <= sandbox.idle_seconds(created.id) <= 70
+
+
+@pytest.mark.parametrize("stamp", [None, "", "not a date"])
+def test_idle_seconds_is_unknown_without_a_usable_stamp(sandbox, stamp):
+    sandbox.open("conv-1")
+    _, created = sandbox._client.created[0]
+    created.last_activity_at = stamp
+    assert sandbox.idle_seconds(created.id) is None
+
+
+def test_idle_seconds_is_unknown_for_a_gone_sandbox(sandbox):
+    assert sandbox.idle_seconds("sbx-missing") is None
+    sandbox.open("conv-1")
+    _, created = sandbox._client.created[0]
+    created.last_activity_at = "2020-01-01T00:00:00Z"
+    created.state = "destroyed"
+    assert sandbox.idle_seconds(created.id) is None
+
+
+def test_reaping_through_the_manager_keeps_a_recently_active_sandbox(sandbox, monkeypatch):
+    from datetime import datetime, timezone
+
+    from docsgpt.sandbox.manager import SandboxManager
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr("docsgpt.sandbox.manager.time.monotonic", lambda: clock["t"])
+    manager = SandboxManager(sandbox, max_ttl=1200)
+    manager.open_session("conv-1")
+    _, created = sandbox._client.created[0]
+    created.last_activity_at = datetime.now(timezone.utc).isoformat()  # another process just used it
+    clock["t"] = 1300.0
+    assert manager.reap_expired() == ["conv-1"]
+    sandbox._client.delete.assert_not_called()
+    assert "conv-1" not in sandbox._handles
+
+    created.last_activity_at = "2020-01-01T00:00:00Z"
+    manager.open_session("conv-1")  # nothing labelled in ``existing``: creates sbx-2
+    _, second = sandbox._client.created[1]
+    second.last_activity_at = "2020-01-01T00:00:00Z"
+    clock["t"] = 3000.0
+    manager.reap_expired()
+    sandbox._client.delete.assert_called_once_with(second)
+
+
+def test_start_detached_on_a_deleted_sandbox_raises_gone_and_the_next_open_is_fresh(sandbox, fake_sdk, monkeypatch):
+    # Prod 2026-10-06: create_session on a deleted sandbox timed out, then
+    # 404'd; the dead session stayed registered and failed the next call too.
+    import types as _types
+
+    from docsgpt.sandbox.base import SandboxGoneError
+    from docsgpt.sandbox.manager import SandboxManager
+
+    monkeypatch.setattr(sys.modules["daytona"], "SessionExecuteRequest", _types.SimpleNamespace, raising=False)
+    manager = SandboxManager(sandbox, max_ttl=1200)
+    assert manager.open_session("conv-1").created is True
+    _, created = sandbox._client.created[0]
+    created.process.create_session = mock.Mock(side_effect=RuntimeError("not found: sandbox has been deleted"))
+    sandbox._client.created.clear()  # client.get no longer resolves the id
+
+    with pytest.raises(SandboxGoneError):
+        manager.start_detached("conv-1", "print(1)", 30, "job1")
+    assert "conv-1" not in sandbox._handles
+    assert not manager.has_session("conv-1")
+
+    assert manager.open_session("conv-1").created is True
+    assert len(sandbox._client.created) == 1  # a fresh create, not the dead handle
+
+
+def test_start_detached_on_a_live_sandbox_keeps_the_plain_error(sandbox, monkeypatch):
+    import types as _types
+
+    monkeypatch.setattr(sys.modules["daytona"], "SessionExecuteRequest", _types.SimpleNamespace, raising=False)
+    sandbox.open("conv-1")
+    _, created = sandbox._client.created[0]
+    created.process.create_session = mock.Mock(side_effect=RuntimeError("502"))
+    with pytest.raises(RuntimeError, match="502"):
+        sandbox.start_detached("conv-1", "print(1)", 30, "job1")
+    assert "conv-1" in sandbox._handles

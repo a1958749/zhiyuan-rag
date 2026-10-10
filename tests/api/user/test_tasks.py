@@ -1,0 +1,1140 @@
+from contextlib import contextmanager
+from datetime import timedelta
+from unittest.mock import ANY, MagicMock, patch
+
+import pytest
+
+
+@contextmanager
+def _patch_decorator_db(conn):
+    """Route the decorator's own ``db_session`` / ``db_readonly`` at ``conn``."""
+
+    @contextmanager
+    def _yield():
+        yield conn
+
+    with patch(
+        "docsgpt.api.user.idempotency.db_session", _yield
+    ), patch(
+        "docsgpt.api.user.idempotency.db_readonly", _yield
+    ):
+        yield
+
+
+class TestIngestTask:
+    @pytest.mark.unit
+    @patch("docsgpt.api.user.tasks.ingest_worker")
+    def test_calls_ingest_worker(self, mock_worker):
+        from docsgpt.api.user.tasks import ingest
+
+        mock_worker.return_value = {"status": "ok"}
+
+        result = ingest("dir", ["pdf"], "job1", "user1", "/path", "file.pdf")
+
+        mock_worker.assert_called_once_with(
+            ANY, "dir", ["pdf"], "job1", "/path", "file.pdf", "user1",
+            file_name_map=None, config=None, idempotency_key=None, source_id=None,
+        )
+        assert result == {"status": "ok"}
+
+    @pytest.mark.unit
+    @patch("docsgpt.api.user.tasks.ingest_worker")
+    def test_passes_file_name_map(self, mock_worker):
+        from docsgpt.api.user.tasks import ingest
+
+        mock_worker.return_value = {"status": "ok"}
+        name_map = {"a.pdf": "b.pdf"}
+
+        ingest("dir", ["pdf"], "job1", "user1", "/path", "file.pdf",
+               file_name_map=name_map)
+
+        mock_worker.assert_called_once_with(
+            ANY, "dir", ["pdf"], "job1", "/path", "file.pdf", "user1",
+            file_name_map=name_map, config=None, idempotency_key=None,
+            source_id=None,
+        )
+
+
+    @pytest.mark.unit
+    @patch("docsgpt.api.user.tasks.ingest_worker")
+    def test_passes_the_files_to_copy(self, mock_worker):
+        from docsgpt.api.user.tasks import ingest
+
+        mock_worker.return_value = {"status": "ok"}
+        copies = [{"from": "inputs/u/attachments/h/a.pdf", "to": "/path/a.pdf"}]
+
+        ingest("dir", ["pdf"], "job1", "user1", "/path", "file.pdf", copy_files=copies)
+
+        assert mock_worker.call_args.kwargs["copy_files"] == copies
+
+
+class TestIngestRemoteTask:
+    @pytest.mark.unit
+    @patch("docsgpt.api.user.tasks.remote_worker")
+    def test_calls_remote_worker(self, mock_worker):
+        from docsgpt.api.user.tasks import ingest_remote
+
+        mock_worker.return_value = {"status": "ok"}
+
+        result = ingest_remote({"url": "http://x"}, "job1", "user1", "web")
+
+        mock_worker.assert_called_once_with(
+            ANY, {"url": "http://x"}, "job1", "user1", "web",
+            sync_frequency="never",
+            config=None, idempotency_key=None, source_id=None, connection_id=None,
+        )
+        assert result == {"status": "ok"}
+
+
+class TestReingestSourceTask:
+    @pytest.mark.unit
+    @patch("docsgpt.worker.reingest_source_worker")
+    def test_calls_reingest_worker(self, mock_worker):
+        from docsgpt.api.user.tasks import reingest_source_task
+
+        mock_worker.return_value = {"status": "ok"}
+
+        result = reingest_source_task("source123", "user1")
+
+        mock_worker.assert_called_once_with(ANY, "source123", "user1")
+        assert result == {"status": "ok"}
+
+
+class TestConvertSourceToWikiTask:
+    @pytest.mark.unit
+    @patch("docsgpt.worker.convert_source_to_wiki_worker")
+    def test_calls_convert_worker(self, mock_worker):
+        from docsgpt.api.user.tasks import convert_source_to_wiki
+
+        mock_worker.return_value = {"status": "converted"}
+
+        result = convert_source_to_wiki("source123", "user1")
+
+        mock_worker.assert_called_once_with(ANY, "source123", "user1")
+        assert result == {"status": "converted"}
+
+
+class TestExtractGraphTask:
+    @pytest.mark.unit
+    @patch("docsgpt.worker.extract_graph_worker")
+    def test_calls_extract_graph_worker(self, mock_worker):
+        from docsgpt.api.user.tasks import extract_graph
+
+        mock_worker.return_value = {"nodes": 2, "edges": 1}
+
+        result = extract_graph("source123", "user1")
+
+        mock_worker.assert_called_once_with(ANY, "source123", "user1")
+        assert result == {"nodes": 2, "edges": 1}
+
+    @pytest.mark.unit
+    def test_repeat_with_same_key_short_circuits(self, pg_conn):
+        from docsgpt.api.user import tasks
+
+        calls: list[str] = []
+
+        def _fake_worker(self, source_id, user):
+            calls.append(source_id)
+            return {"nodes": 1, "edges": 0}
+
+        with _patch_decorator_db(pg_conn), patch(
+            "docsgpt.worker.extract_graph_worker", _fake_worker
+        ):
+            first = tasks.extract_graph(
+                "src-g", "user1", idempotency_key="extract-graph:src-g",
+            )
+            second = tasks.extract_graph(
+                "src-g", "user1", idempotency_key="extract-graph:src-g",
+            )
+
+        assert first == second
+        assert len(calls) == 1
+
+
+class TestScheduleSyncsTask:
+    @pytest.mark.unit
+    @patch("docsgpt.api.user.tasks.sync_worker")
+    def test_calls_sync_worker(self, mock_worker):
+        from docsgpt.api.user.tasks import schedule_syncs
+
+        mock_worker.return_value = {"status": "ok"}
+
+        result = schedule_syncs("daily")
+
+        mock_worker.assert_called_once_with(ANY, "daily")
+        assert result == {"status": "ok"}
+
+
+class TestSyncSourceTask:
+    @pytest.mark.unit
+    @patch("docsgpt.api.user.tasks.sync")
+    def test_calls_sync(self, mock_sync):
+        from docsgpt.api.user.tasks import sync_source
+
+        mock_sync.return_value = {"status": "ok"}
+
+        result = sync_source(
+            {"data": 1}, "job1", "user1", "web", "daily", "classic", "doc1"
+        )
+
+        mock_sync.assert_called_once_with(
+            ANY, {"data": 1}, "job1", "user1", "web", "daily", "classic", "doc1",
+            connection_id=None,
+        )
+        assert result == {"status": "ok"}
+
+    @pytest.mark.unit
+    @patch("docsgpt.api.user.tasks.sync")
+    def test_passes_the_sources_connection(self, mock_sync):
+        from docsgpt.api.user.tasks import sync_source
+
+        sync_source({"data": 1}, "job1", "user1", "s3", "daily", "classic", "doc1", connection_id="c-1")
+
+        assert mock_sync.call_args.kwargs["connection_id"] == "c-1"
+
+
+class TestStoreAttachmentTask:
+    @pytest.mark.unit
+    @patch("docsgpt.api.user.tasks.attachment_worker")
+    def test_calls_attachment_worker(self, mock_worker):
+        from docsgpt.api.user.tasks import store_attachment
+
+        mock_worker.return_value = {"status": "ok"}
+
+        result = store_attachment({"file": "info"}, "user1")
+
+        mock_worker.assert_called_once_with(ANY, {"file": "info"}, "user1")
+        assert result == {"status": "ok"}
+
+    @pytest.mark.unit
+    def test_data_errors_are_not_autoretried(self):
+        # A DataError is deterministic (poison payload) — retrying it five
+        # times just multiplies log noise for the same terminal failure.
+        from sqlalchemy.exc import DataError
+
+        from docsgpt.api.user.tasks import store_attachment
+
+        assert DataError in getattr(store_attachment, "dont_autoretry_for", ())
+
+
+class TestProcessAgentWebhookTask:
+    @pytest.mark.unit
+    @patch("docsgpt.api.user.tasks.agent_webhook_worker")
+    def test_calls_agent_webhook_worker(self, mock_worker):
+        from docsgpt.api.user.tasks import process_agent_webhook
+
+        mock_worker.return_value = {"status": "ok"}
+
+        result = process_agent_webhook("agent123", {"event": "test"})
+
+        mock_worker.assert_called_once_with(ANY, "agent123", {"event": "test"})
+        assert result == {"status": "ok"}
+
+    @pytest.mark.unit
+    def test_time_limits_follow_webhook_run_timeout(self):
+        from docsgpt.api.user.tasks import process_agent_webhook
+        from docsgpt.core.settings import settings
+
+        assert process_agent_webhook.soft_time_limit == max(30, settings.WEBHOOK_RUN_TIMEOUT)
+        assert process_agent_webhook.time_limit == process_agent_webhook.soft_time_limit + 60
+
+    @pytest.mark.unit
+    def test_run_is_never_retried(self):
+        """A webhook run has side effects, so a failure must not re-run the agent."""
+        from docsgpt.api.user.tasks import process_agent_webhook
+
+        assert process_agent_webhook.acks_late is True
+        assert not getattr(process_agent_webhook, "autoretry_for", None)
+        assert process_agent_webhook.max_retries == 0
+
+
+class TestIngestConnectorTask:
+    @pytest.mark.unit
+    @patch("docsgpt.worker.ingest_connector")
+    def test_calls_ingest_connector_defaults(self, mock_worker):
+        from docsgpt.api.user.tasks import ingest_connector_task
+
+        mock_worker.return_value = {"status": "ok"}
+
+        result = ingest_connector_task("job1", "user1", "gdrive")
+
+        mock_worker.assert_called_once_with(
+            ANY,
+            "job1",
+            "user1",
+            "gdrive",
+            session_token=None,
+            connection_id=None,
+            file_ids=None,
+            folder_ids=None,
+            recursive=True,
+            retriever="classic",
+            operation_mode="upload",
+            doc_id=None,
+            sync_frequency="never",
+            config=None,
+            idempotency_key=None,
+            source_id=None,
+        )
+        assert result == {"status": "ok"}
+
+    @pytest.mark.unit
+    @patch("docsgpt.worker.ingest_connector")
+    def test_calls_ingest_connector_custom(self, mock_worker):
+        from docsgpt.api.user.tasks import ingest_connector_task
+
+        mock_worker.return_value = {"status": "ok"}
+
+        result = ingest_connector_task(
+            "job1",
+            "user1",
+            "sharepoint",
+            session_token="tok",
+            connection_id=None,
+            file_ids=["f1"],
+            folder_ids=["d1"],
+            recursive=False,
+            retriever="duckdb",
+            operation_mode="sync",
+            doc_id="doc1",
+            sync_frequency="daily",
+        )
+
+        mock_worker.assert_called_once_with(
+            ANY,
+            "job1",
+            "user1",
+            "sharepoint",
+            session_token="tok",
+            connection_id=None,
+            file_ids=["f1"],
+            folder_ids=["d1"],
+            recursive=False,
+            retriever="duckdb",
+            operation_mode="sync",
+            doc_id="doc1",
+            sync_frequency="daily",
+            config=None,
+            idempotency_key=None,
+            source_id=None,
+        )
+        assert result == {"status": "ok"}
+
+
+class TestSetupPeriodicTasks:
+    @pytest.mark.unit
+    def test_every_entry_has_a_stable_name(self):
+        """Unnamed entries get keyed by the task path, which redbeat cannot update in place when it changes."""
+        from docsgpt.api.user.tasks import setup_periodic_tasks
+
+        sender = MagicMock()
+        setup_periodic_tasks(sender)
+
+        names = [call.kwargs.get("name") for call in sender.add_periodic_task.call_args_list]
+        assert all(names), names
+        assert len(set(names)) == len(names), names
+        assert names[:3] == ["schedule-syncs-daily", "schedule-syncs-weekly", "schedule-syncs-monthly"]
+
+    @pytest.mark.unit
+    def test_registers_periodic_tasks(self):
+        from docsgpt.api.user.tasks import setup_periodic_tasks
+
+        sender = MagicMock()
+
+        setup_periodic_tasks(sender)
+
+        assert sender.add_periodic_task.call_count == 18
+
+        calls = sender.add_periodic_task.call_args_list
+
+        # daily
+        assert calls[0][0][0] == timedelta(days=1)
+        # weekly
+        assert calls[1][0][0] == timedelta(weeks=1)
+        # monthly
+        assert calls[2][0][0] == timedelta(days=30)
+        # pending_tool_state TTL cleanup (60s)
+        assert calls[3][0][0] == timedelta(seconds=60)
+        assert calls[3][1].get("name") == "cleanup-pending-tool-state"
+        # idempotency dedup TTL cleanup (1h)
+        assert calls[4][0][0] == timedelta(hours=1)
+        assert calls[4][1].get("name") == "cleanup-idempotency-dedup"
+        # reconciliation sweep (30s)
+        assert calls[5][0][0] == timedelta(seconds=30)
+        assert calls[5][1].get("name") == "reconciliation"
+        # version-check (every 7h)
+        assert calls[6][0][0] == timedelta(hours=7)
+        # message_events retention sweep (24h)
+        assert calls[7][0][0] == timedelta(hours=24)
+        assert calls[7][1].get("name") == "cleanup-message-events"
+        # guardrail_events retention sweep (24h)
+        assert calls[8][0][0] == timedelta(hours=24)
+        assert calls[8][1].get("name") == "cleanup-guardrail-events"
+        # request_traces retention sweep (24h)
+        assert calls[9][0][0] == timedelta(hours=24)
+        assert calls[9][1].get("name") == "cleanup-traces"
+        # orphan memories sweep (24h)
+        assert calls[10][0][0] == timedelta(hours=24)
+        assert calls[10][1].get("name") == "cleanup-orphan-memories"
+        # scheduler dispatcher
+        assert calls[11][1].get("name") == "dispatch-scheduled-runs"
+        # schedule runs cleanup (24h)
+        assert calls[12][0][0] == timedelta(hours=24)
+        assert calls[12][1].get("name") == "cleanup-schedule-runs"
+        # sandbox session reaper (60s)
+        assert calls[13][0][0] == timedelta(seconds=60)
+        assert calls[13][1].get("name") == "reap-sandbox-sessions"
+        # stale workflow-run reaper (5m)
+        assert calls[14][0][0] == timedelta(seconds=300)
+        assert calls[14][1].get("name") == "reap-stale-workflow-runs"
+        # background jobs: lost leases and deadlines (60s), retention (24h)
+        assert calls[15][0][0] == timedelta(seconds=60)
+        assert calls[15][1].get("name") == "sweep-background-jobs"
+        assert calls[16][0][0] == timedelta(hours=24)
+        assert calls[16][1].get("name") == "cleanup-background-jobs"
+
+
+class TestMcpOauthTask:
+    @pytest.mark.unit
+    @patch("docsgpt.api.user.tasks.mcp_oauth")
+    def test_calls_mcp_oauth(self, mock_worker):
+        from docsgpt.api.user.tasks import mcp_oauth_task
+
+        mock_worker.return_value = {"url": "http://auth"}
+
+        result = mcp_oauth_task({"server": "mcp"}, "user1")
+
+        mock_worker.assert_called_once_with(ANY, {"server": "mcp"}, "user1")
+        assert result == {"url": "http://auth"}
+
+
+class TestParseDocumentTask:
+    """parse_document runs on the parsing queue under a bounded time limit."""
+
+    @pytest.mark.unit
+    @patch("docsgpt.api.user.tasks.parse_document_worker")
+    def test_calls_parse_document_worker(self, mock_worker):
+        from docsgpt.api.user.tasks import parse_document
+
+        mock_worker.return_value = {"status": "ok", "content": "hi"}
+
+        result = parse_document(
+            "art-1", {"conversation_id": "c1"}, "user1", {"output": "markdown"},
+        )
+
+        mock_worker.assert_called_once_with(
+            ANY, "art-1", {"conversation_id": "c1"}, "user1",
+            {"output": "markdown"},
+        )
+        assert result == {"status": "ok", "content": "hi"}
+
+    @pytest.mark.unit
+    @patch("docsgpt.api.user.tasks.parse_document_worker")
+    def test_soft_time_limit_returns_clean_error(self, mock_worker):
+        from celery.exceptions import SoftTimeLimitExceeded
+
+        from docsgpt.api.user.tasks import parse_document
+
+        mock_worker.side_effect = SoftTimeLimitExceeded("parse")
+
+        # The task must swallow the soft-limit signal and return the worker's
+        # clean error shape so the parsing-worker slot frees instead of crashing.
+        result = parse_document("art-1", {"conversation_id": "c1"}, "user1")
+
+        assert result["status"] == "error"
+        assert "timed out" in result["error"]
+
+    @pytest.mark.unit
+    def test_time_limits_derived_from_document_parse_timeout(self):
+        from docsgpt.api.user.tasks import parse_document
+        from docsgpt.core.settings import settings
+
+        assert parse_document.soft_time_limit == settings.DOCUMENT_PARSE_TIMEOUT
+        assert parse_document.time_limit == settings.DOCUMENT_PARSE_TIMEOUT + 30
+        # Hard limit must exceed the soft limit so the handler can unwind first.
+        assert parse_document.time_limit > parse_document.soft_time_limit
+
+
+class TestDurableTaskRetryPolicy:
+    """The long-running tasks share a uniform retry policy."""
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "task_name",
+        [
+            "ingest",
+            "ingest_remote",
+            "reingest_source_task",
+            "store_attachment",
+            "ingest_connector_task",
+            "reembed_wiki_page",
+            "convert_source_to_wiki",
+            "extract_graph",
+        ],
+    )
+    def test_task_has_retry_config(self, task_name):
+        import docsgpt.api.user.tasks as tasks_module
+
+        task = getattr(tasks_module, task_name)
+        assert task.acks_late is True
+        assert Exception in task.autoretry_for
+        assert task.retry_backoff == 60
+        assert task.max_retries == 3
+        # ``retry_kwargs`` is deliberately unset: celery mutates that dict in
+        # place on every retry, so sharing one across the decorators would
+        # race. See the DURABLE_TASK comment in docsgpt/api/user/tasks.py.
+        assert not getattr(task, "retry_kwargs", None)
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "task_name",
+        [
+            "schedule_syncs",
+            "sync_source",
+            "mcp_oauth_task",
+            "cleanup_pending_tool_state",
+            "reconciliation_task",
+            "version_check_task",
+            "cleanup_orphan_memories",
+        ],
+    )
+    def test_short_periodic_tasks_have_no_retry_config(self, task_name):
+        import docsgpt.api.user.tasks as tasks_module
+
+        task = getattr(tasks_module, task_name)
+        assert not getattr(task, "autoretry_for", None)
+
+
+class TestProcessAgentWebhookIdempotency:
+    """Wrapper short-circuits a second call with the same key on the durable webhook task."""
+
+    @pytest.mark.unit
+    def test_repeat_with_same_key_short_circuits(self, pg_conn):
+        from docsgpt.api.user.tasks import process_agent_webhook
+
+        worker_calls = []
+
+        def _fake_worker(self, agent_id, payload):
+            worker_calls.append((agent_id, payload))
+            return {"status": "success", "result": {"answer": "ok"}}
+
+        with _patch_decorator_db(pg_conn), patch(
+            "docsgpt.api.user.tasks.agent_webhook_worker",
+            side_effect=_fake_worker,
+        ):
+            first = process_agent_webhook(
+                "agent", {"event": "x"}, idempotency_key="dur-k1",
+            )
+            second = process_agent_webhook(
+                "agent", {"event": "x"}, idempotency_key="dur-k1",
+            )
+
+        assert first == {"status": "success", "result": {"answer": "ok"}}
+        assert second == first
+        assert len(worker_calls) == 1
+
+
+class TestCleanupPendingToolState:
+    """Janitor reverts stale 'resuming' rows and deletes TTL-expired rows."""
+
+    @pytest.mark.unit
+    def test_reverts_stale_and_deletes_expired(self, pg_conn):
+        from sqlalchemy import text as _text
+
+        from docsgpt.api.user.tasks import cleanup_pending_tool_state
+        from docsgpt.storage.db.repositories.conversations import (
+            ConversationsRepository,
+        )
+        from docsgpt.storage.db.repositories.pending_tool_state import (
+            PendingToolStateRepository,
+        )
+
+        repo = PendingToolStateRepository(pg_conn)
+
+        def _sample() -> dict:
+            return {
+                "messages": [],
+                "pending_tool_calls": [],
+                "tools_dict": {},
+                "tool_schemas": [],
+                "agent_config": {},
+            }
+
+        # Pending and fresh — should be left alone.
+        c1 = ConversationsRepository(pg_conn).create("u", "fresh-pending")
+        repo.save_state(c1["id"], "u", **_sample())
+
+        # Pending but already expired — should be deleted.
+        c2 = ConversationsRepository(pg_conn).create("u", "expired-pending")
+        expired_state = _sample()
+        expired_state["agent_config"] = {
+            "reserved_message_id": "22222222-2222-2222-2222-222222222222"
+        }
+        repo.save_state(c2["id"], "u", **expired_state, ttl_seconds=0)
+
+        # Resuming within grace — should stay 'resuming'.
+        c3 = ConversationsRepository(pg_conn).create("u", "fresh-resuming")
+        repo.save_state(c3["id"], "u", **_sample())
+        repo.mark_resuming(c3["id"], "u")
+
+        # Resuming past grace — should revert to 'pending'.
+        c4 = ConversationsRepository(pg_conn).create("u", "stale-resuming")
+        repo.save_state(c4["id"], "u", **_sample())
+        repo.mark_resuming(c4["id"], "u")
+        pg_conn.execute(
+            _text(
+                "UPDATE pending_tool_state "
+                "SET resumed_at = clock_timestamp() "
+                "             - make_interval(secs => 660) "
+                "WHERE conversation_id = CAST(:conv_id AS uuid)"
+            ),
+            {"conv_id": c4["id"]},
+        )
+
+        from contextlib import contextmanager
+
+        @contextmanager
+        def _fake_begin():
+            yield pg_conn
+
+        fake_engine = MagicMock()
+        fake_engine.begin = _fake_begin
+
+        with patch(
+            "docsgpt.storage.db.engine.get_engine",
+            return_value=fake_engine,
+        ), patch(
+            "docsgpt.api.answer.services.continuation_service.retire_paused_message",
+        ) as retire_expired:
+            result = cleanup_pending_tool_state.run()
+
+        assert result["reverted"] == 1
+        assert result["deleted"] == 1
+        retire_expired.assert_called_once()
+        retired_row = retire_expired.call_args.args[1]
+        assert retired_row["agent_config"]["reserved_message_id"] == (
+            "22222222-2222-2222-2222-222222222222"
+        )
+        assert retire_expired.call_args.args[2] == "expired"
+
+        # Final state assertions.
+        assert repo.load_state(c1["id"], "u")["status"] == "pending"
+        assert repo.load_state(c2["id"], "u") is None
+        assert repo.load_state(c3["id"], "u") is None
+        assert repo.load_state_any(c3["id"], "u")["status"] == "resuming"
+        c4_row = repo.load_state(c4["id"], "u")
+        assert c4_row["status"] == "pending"
+        assert c4_row["resumed_at"] is None
+
+    @pytest.mark.unit
+    def test_an_expired_pause_keeps_its_calls_and_says_it_expired(self, pg_conn):
+        """The turn that waited out its approval is finalized with what it did, not failed."""
+        from contextlib import contextmanager
+
+        from sqlalchemy import text as _text
+
+        from docsgpt.api.user.tasks import cleanup_pending_tool_state
+        from tests.api.answer.services.test_abandoned_pause_pg import USER, _paused_turn
+
+        turn = _paused_turn(pg_conn)
+        pg_conn.execute(
+            _text(
+                "UPDATE pending_tool_state SET expires_at = clock_timestamp() - interval '1 second' "
+                "WHERE conversation_id = CAST(:c AS uuid)"
+            ),
+            {"c": turn["conversation_id"]},
+        )
+
+        @contextmanager
+        def _fake_begin():
+            yield pg_conn
+
+        fake_engine = MagicMock()
+        fake_engine.begin = _fake_begin
+        published = []
+        with patch("docsgpt.storage.db.engine.get_engine", return_value=fake_engine), patch(
+            "docsgpt.events.publisher.publish_user_event",
+            side_effect=lambda *a, **kw: published.append((a, kw)),
+        ), patch("docsgpt.monitors.secret_refs.exposed_values", return_value={}):
+            result = cleanup_pending_tool_state.run()
+
+        assert result["deleted"] == 1
+        row = pg_conn.execute(
+            _text("SELECT status, tool_calls FROM conversation_messages WHERE id = CAST(:id AS uuid)"),
+            {"id": turn["message_id"]},
+        ).fetchone()
+        assert row.status == "complete"
+        assert [c["call_id"] for c in row.tool_calls] == ["call-1", "call-2", "call-3", "call-4", "call-5"]
+        assert row.tool_calls[-1]["not_run"] == "expired"
+        ((user, kind, payload), _) = published[0]
+        assert (user, kind) == (USER, "tool.approval.cleared")
+        assert payload == {
+            "conversation_id": turn["conversation_id"],
+            "message_id": turn["message_id"],
+            "reason": "expired",
+        }
+
+    @pytest.mark.unit
+    def test_a_failed_retire_still_clears_the_approval(self, pg_conn):
+        from contextlib import contextmanager
+
+        from docsgpt.api.user.tasks import cleanup_pending_tool_state
+        from docsgpt.storage.db.repositories.conversations import ConversationsRepository
+        from docsgpt.storage.db.repositories.pending_tool_state import PendingToolStateRepository
+
+        conv = ConversationsRepository(pg_conn).create("u-x", "expired")
+        PendingToolStateRepository(pg_conn).save_state(
+            conv["id"], "u-x", messages=[], pending_tool_calls=[], tools_dict={}, tool_schemas=[],
+            agent_config={"reserved_message_id": "33333333-3333-3333-3333-333333333333"}, ttl_seconds=0,
+        )
+
+        @contextmanager
+        def _fake_begin():
+            yield pg_conn
+
+        fake_engine = MagicMock()
+        fake_engine.begin = _fake_begin
+        with patch("docsgpt.storage.db.engine.get_engine", return_value=fake_engine), patch(
+            "docsgpt.api.answer.services.continuation_service.retire_paused_message",
+            side_effect=RuntimeError("db blip"),
+        ), patch("docsgpt.events.publisher.publish_user_event") as publish:
+            result = cleanup_pending_tool_state.run()
+
+        assert result["deleted"] == 1
+        publish.assert_called_once()
+        assert publish.call_args.args[2]["reason"] == "expired"
+
+    @pytest.mark.unit
+    def test_skips_when_postgres_uri_missing(self, monkeypatch):
+        from docsgpt.api.user.tasks import cleanup_pending_tool_state
+        from docsgpt.core.settings import settings
+
+        monkeypatch.setattr(settings, "POSTGRES_URI", None, raising=False)
+
+        result = cleanup_pending_tool_state.run()
+        assert result == {
+            "deleted": 0,
+            "reverted": 0,
+            "skipped": "POSTGRES_URI not set",
+        }
+
+
+class TestCleanupMessageEventsTask:
+    """Retention janitor delegates to MessageEventsRepository.cleanup_older_than."""
+
+    @pytest.mark.unit
+    def test_skips_when_postgres_uri_missing(self, monkeypatch):
+        from docsgpt.api.user.tasks import cleanup_message_events
+        from docsgpt.core.settings import settings
+
+        monkeypatch.setattr(settings, "POSTGRES_URI", None, raising=False)
+
+        result = cleanup_message_events.run()
+        assert result == {"deleted": 0, "skipped": "POSTGRES_URI not set"}
+
+    @pytest.mark.unit
+    def test_deletes_rows_past_retention_window(self, pg_conn, monkeypatch):
+        import uuid
+
+        from sqlalchemy import text as _text
+
+        from docsgpt.api.user.tasks import cleanup_message_events
+        from docsgpt.core.settings import settings
+        from docsgpt.storage.db.repositories.message_events import (
+            MessageEventsRepository,
+        )
+
+        # Seed parent rows so the FK on message_events holds.
+        user_id = f"user-{uuid.uuid4().hex[:8]}"
+        conv_id = uuid.uuid4()
+        msg_id = uuid.uuid4()
+        pg_conn.execute(
+            _text("INSERT INTO users (user_id) VALUES (:u)"),
+            {"u": user_id},
+        )
+        pg_conn.execute(
+            _text(
+                "INSERT INTO conversations (id, user_id, name) "
+                "VALUES (:id, :u, 'test')"
+            ),
+            {"id": conv_id, "u": user_id},
+        )
+        pg_conn.execute(
+            _text(
+                "INSERT INTO conversation_messages (id, conversation_id, "
+                "user_id, position) VALUES (:id, :c, :u, 0)"
+            ),
+            {"id": msg_id, "c": conv_id, "u": user_id},
+        )
+
+        repo = MessageEventsRepository(pg_conn)
+        repo.record(str(msg_id), 0, "answer", {"chunk": "stale"})
+        repo.record(str(msg_id), 1, "answer", {"chunk": "fresh"})
+        # Backdate seq=0 past the default 14-day retention so the
+        # janitor catches it; seq=1 stays at "now" and must survive.
+        pg_conn.execute(
+            _text(
+                "UPDATE message_events SET created_at = now() - interval '20 days' "
+                "WHERE message_id = CAST(:id AS uuid) AND sequence_no = 0"
+            ),
+            {"id": str(msg_id)},
+        )
+
+        monkeypatch.setattr(
+            settings, "POSTGRES_URI", "postgresql://stub", raising=False
+        )
+
+        @contextmanager
+        def _fake_begin():
+            yield pg_conn
+
+        fake_engine = MagicMock()
+        fake_engine.begin = _fake_begin
+
+        with patch(
+            "docsgpt.storage.db.engine.get_engine",
+            return_value=fake_engine,
+        ):
+            result = cleanup_message_events.run()
+
+        assert result == {
+            "deleted": 1,
+            # Supersede tombstones ride the same retention beat.
+            "superseded_deleted": 0,
+            "ttl_days": settings.MESSAGE_EVENTS_RETENTION_DAYS,
+        }
+        # Only the fresh row survives.
+        rows = repo.read_after(str(msg_id))
+        assert [r["sequence_no"] for r in rows] == [1]
+
+
+class TestCleanupTracesTask:
+    """Retention janitor for ``request_traces``."""
+
+    @pytest.mark.unit
+    def test_skips_when_postgres_uri_missing(self, monkeypatch):
+        from docsgpt.api.user.tasks import cleanup_traces
+        from docsgpt.core.settings import settings
+
+        monkeypatch.setattr(settings, "POSTGRES_URI", None, raising=False)
+
+        assert cleanup_traces.run() == {"deleted": 0, "skipped": "POSTGRES_URI not set"}
+
+    @pytest.mark.unit
+    def test_deletes_traces_past_retention_window(self, pg_conn, monkeypatch):
+        import time
+        import uuid
+
+        from sqlalchemy import text as _text
+
+        from docsgpt.api.user.tasks import cleanup_traces
+        from docsgpt.core.settings import settings
+        from docsgpt.storage.db.repositories.request_traces import (
+            RequestTracesRepository,
+        )
+
+        repo = RequestTracesRepository(pg_conn)
+        for request_id in ("stale", "fresh"):
+            repo.insert(
+                {
+                    "id": str(uuid.uuid4()),
+                    "request_id": request_id,
+                    "user_id": "u1",
+                    "source": "stream",
+                    "status": "ok",
+                    "started_at_ns": time.time_ns(),
+                }
+            )
+        pg_conn.execute(
+            _text(
+                "UPDATE request_traces SET created_at = now() - interval '45 days' "
+                "WHERE request_id = 'stale'"
+            )
+        )
+        monkeypatch.setattr(settings, "POSTGRES_URI", "postgresql://stub", raising=False)
+        monkeypatch.setattr(settings, "TRACES_RETENTION_DAYS", 30)
+
+        @contextmanager
+        def _fake_begin():
+            yield pg_conn
+
+        fake_engine = MagicMock()
+        fake_engine.begin = _fake_begin
+
+        with patch("docsgpt.storage.db.engine.get_engine", return_value=fake_engine):
+            result = cleanup_traces.run()
+
+        assert result == {"deleted": 1, "ttl_days": 30}
+        remaining = pg_conn.execute(_text("SELECT request_id FROM request_traces")).scalars().all()
+        assert remaining == ["fresh"]
+
+
+class TestCleanupOrphanMemoriesTask:
+    """Sweeps orphan memories from the FK-to-trigger orphan window."""
+
+    @pytest.mark.unit
+    def test_skips_when_postgres_uri_missing(self, monkeypatch):
+        from docsgpt.api.user.tasks import cleanup_orphan_memories
+        from docsgpt.core.settings import settings
+
+        monkeypatch.setattr(settings, "POSTGRES_URI", None, raising=False)
+
+        result = cleanup_orphan_memories.run()
+        assert result == {"deleted": 0, "skipped": "POSTGRES_URI not set"}
+
+    @pytest.mark.unit
+    def test_deletes_orphan_keeps_synthetic_and_live(
+        self, pg_conn, monkeypatch
+    ):
+        import uuid
+
+        from sqlalchemy import text as _text
+
+        from docsgpt.agents.default_tools import default_tool_id
+        from docsgpt.api.user.tasks import cleanup_orphan_memories
+        from docsgpt.core.settings import settings
+        from docsgpt.storage.db.repositories.memories import (
+            MemoriesRepository,
+        )
+
+        repo = MemoriesRepository(pg_conn)
+        synthetic_id = default_tool_id("memory")
+        live_id = str(
+            pg_conn.execute(
+                _text(
+                    "INSERT INTO user_tools (user_id, name) "
+                    "VALUES ('u-task-mem', 'memory') RETURNING id"
+                )
+            ).scalar()
+        )
+        orphan_id = str(uuid.uuid4())
+        repo.upsert("u-task-mem", synthetic_id, "/syn.txt", "keep")
+        repo.upsert("u-task-mem", live_id, "/live.txt", "keep")
+        repo.upsert("u-task-mem", orphan_id, "/orphan.txt", "drop")
+
+        monkeypatch.setattr(
+            settings, "POSTGRES_URI", "postgresql://stub", raising=False
+        )
+
+        @contextmanager
+        def _fake_begin():
+            yield pg_conn
+
+        fake_engine = MagicMock()
+        fake_engine.begin = _fake_begin
+
+        with patch(
+            "docsgpt.storage.db.engine.get_engine",
+            return_value=fake_engine,
+        ):
+            result = cleanup_orphan_memories.run()
+
+        assert result == {"deleted": 1}
+        assert repo.get_by_path("u-task-mem", synthetic_id, "/syn.txt")
+        assert repo.get_by_path("u-task-mem", live_id, "/live.txt")
+        assert repo.get_by_path("u-task-mem", orphan_id, "/orphan.txt") is None
+
+
+class TestIngestIdempotency:
+    """Same short-circuit applies to the ingest task path."""
+
+    @pytest.mark.unit
+    def test_repeat_with_same_key_short_circuits(self, pg_conn):
+        from docsgpt.api.user.tasks import ingest
+
+        worker_calls = []
+
+        def _fake_worker(self, directory, formats, job_name, file_path,
+                         filename, user, file_name_map=None, config=None,
+                         idempotency_key=None, source_id=None):
+            worker_calls.append(filename)
+            return {"status": "ok", "directory": directory}
+
+        with _patch_decorator_db(pg_conn), patch(
+            "docsgpt.api.user.tasks.ingest_worker",
+            side_effect=_fake_worker,
+        ):
+            first = ingest(
+                "dir", ["pdf"], "job1", "user1", "/path", "file.pdf",
+                idempotency_key="dur-ing-1",
+            )
+            second = ingest(
+                "dir", ["pdf"], "job1", "user1", "/path", "file.pdf",
+                idempotency_key="dur-ing-1",
+            )
+
+        assert first == second
+        assert first == {"status": "ok", "directory": "dir"}
+        assert len(worker_calls) == 1
+
+
+class TestIngestPoisonEvent:
+    """The poison hook publishes a terminal source.ingest.failed so the
+    upload toast resolves instead of hanging on "training".
+    """
+
+    @pytest.mark.unit
+    def test_publishes_failed_event(self):
+        from docsgpt.api.user.tasks import _emit_ingest_poison_event
+
+        published = []
+
+        def _fake_publish(user, event_type, payload, *, scope=None):
+            published.append((user, event_type, payload, scope))
+
+        with patch(
+            "docsgpt.events.publisher.publish_user_event",
+            side_effect=_fake_publish,
+        ):
+            _emit_ingest_poison_event(
+                "ingest",
+                {"user": "u1", "source_id": "src-9", "filename": "doc.pdf"},
+            )
+
+        assert len(published) == 1
+        user, event_type, payload, scope = published[0]
+        assert user == "u1"
+        assert event_type == "source.ingest.failed"
+        assert payload["source_id"] == "src-9"
+        assert payload["filename"] == "doc.pdf"
+        assert payload["operation"] == "upload"
+        assert scope == {"kind": "source", "id": "src-9"}
+
+    @pytest.mark.unit
+    def test_skips_when_source_id_missing(self):
+        from docsgpt.api.user.tasks import _emit_ingest_poison_event
+
+        with patch(
+            "docsgpt.events.publisher.publish_user_event",
+        ) as mock_publish:
+            _emit_ingest_poison_event("ingest", {"user": "u1"})
+
+        mock_publish.assert_not_called()
+
+    @pytest.mark.unit
+    def test_reingest_uses_reingest_operation(self):
+        from docsgpt.api.user.tasks import _emit_ingest_poison_event
+
+        published = []
+        with patch(
+            "docsgpt.events.publisher.publish_user_event",
+            side_effect=lambda *a, **k: published.append((a, k)),
+        ):
+            _emit_ingest_poison_event(
+                "reingest_source_task",
+                {"user": "u1", "source_id": "src-r"},
+            )
+
+        assert published[0][0][2]["operation"] == "reingest"
+
+
+@pytest.mark.unit
+def test_bare_worker_consumes_app_and_parsing_queues():
+    """task_queues declares every queue, so a worker started without -Q serves
+    both app tasks and document parsing — a -Q-less dev worker must never
+    silently strand attachment uploads or parse_document tasks."""
+    import docsgpt.celeryconfig as celeryconfig
+    from docsgpt.core.settings import settings
+
+    names = {queue.name for queue in celeryconfig.task_queues}
+    assert "docsgpt" in names
+    assert settings.DOCUMENT_PARSE_QUEUE in names
+
+
+class TestParseTimeoutForSize:
+    """The awaited parse window is floored at the base timeout, scales with size, and is capped."""
+
+    @pytest.mark.unit
+    def test_unknown_size_uses_the_base_timeout(self):
+        from docsgpt.api.user.tasks import parse_timeout_for_size
+        from docsgpt.core.settings import settings
+
+        base = float(settings.DOCUMENT_PARSE_TIMEOUT)
+        assert parse_timeout_for_size(None) == base
+        assert parse_timeout_for_size(0) == base
+        # A negative/garbage size can never shrink the window below the floor.
+        assert parse_timeout_for_size(-1) == base
+        assert parse_timeout_for_size("nope") == base
+
+    @pytest.mark.unit
+    def test_window_grows_with_the_document_size(self, monkeypatch):
+        from docsgpt.api.user import tasks
+        from docsgpt.core.settings import settings
+
+        monkeypatch.setattr(settings, "DOCUMENT_PARSE_TIMEOUT", 120, raising=False)
+        monkeypatch.setattr(settings, "DOCUMENT_PARSE_TIMEOUT_PER_MB", 60, raising=False)
+        monkeypatch.setattr(settings, "DOCUMENT_PARSE_TIMEOUT_MAX", 900, raising=False)
+
+        assert tasks.parse_timeout_for_size(1024 * 1024) == 180.0
+        assert tasks.parse_timeout_for_size(5 * 1024 * 1024) == 420.0
+        # Fractional sizes scale proportionally, never rounded down to the floor.
+        assert tasks.parse_timeout_for_size(512 * 1024) == 150.0
+
+    @pytest.mark.unit
+    def test_window_is_capped(self, monkeypatch):
+        from docsgpt.api.user import tasks
+        from docsgpt.core.settings import settings
+
+        monkeypatch.setattr(settings, "DOCUMENT_PARSE_TIMEOUT", 120, raising=False)
+        monkeypatch.setattr(settings, "DOCUMENT_PARSE_TIMEOUT_PER_MB", 60, raising=False)
+        monkeypatch.setattr(settings, "DOCUMENT_PARSE_TIMEOUT_MAX", 900, raising=False)
+
+        # A huge document cannot pin a parsing-worker slot indefinitely.
+        assert tasks.parse_timeout_for_size(500 * 1024 * 1024) == 900.0
+
+    @pytest.mark.unit
+    def test_scaling_disabled_by_zero_per_mb(self, monkeypatch):
+        from docsgpt.api.user import tasks
+        from docsgpt.core.settings import settings
+
+        monkeypatch.setattr(settings, "DOCUMENT_PARSE_TIMEOUT", 120, raising=False)
+        monkeypatch.setattr(settings, "DOCUMENT_PARSE_TIMEOUT_PER_MB", 0, raising=False)
+
+        assert tasks.parse_timeout_for_size(50 * 1024 * 1024) == 120.0
+
+    @pytest.mark.unit
+    def test_task_time_limits_track_the_awaited_window(self):
+        from docsgpt.api.user.tasks import parse_document, parse_task_time_limits
+
+        limits = parse_task_time_limits(420.0)
+        assert limits == {"soft_time_limit": 420, "time_limit": 450}
+        # Same grace as the import-time binding, so per-call limits stay comparable.
+        grace = parse_document.time_limit - parse_document.soft_time_limit
+        assert limits["time_limit"] - limits["soft_time_limit"] == grace
+        # Never zero/negative, whatever the caller computed.
+        assert parse_task_time_limits(0)["soft_time_limit"] == 1
+
+
+class TestReconciliationTaskShape:
+    """The beat's error fallback must report the same counters as a good tick."""
+
+    @pytest.mark.unit
+    def test_error_fallback_matches_the_real_summary_keys(self):
+        from docsgpt.api.user import reconciliation
+        from docsgpt.api.user.tasks import reconciliation_task
+
+        with patch.object(
+            reconciliation, "run_reconciliation", side_effect=RuntimeError("db down")
+        ):
+            result = reconciliation_task.run()
+
+        assert result["error"] is True
+        # Hand-writing the fallback drifted immediately: it invented
+        # ``attachments_stalled`` (no sweep produces it) and dropped
+        # ``idempotency_pending_failed``, so a failed tick reported counters
+        # that could never appear and hid one that can.
+        counters = {k: v for k, v in result.items() if k != "error"}
+        assert counters == reconciliation.zero_summary()
+        assert all(v == 0 for v in counters.values())
+
+    @pytest.mark.unit
+    def test_skipped_tick_reports_the_same_counters(self, monkeypatch):
+        from docsgpt.api.user import reconciliation
+
+        monkeypatch.setattr(reconciliation.settings, "POSTGRES_URI", "", raising=False)
+        result = reconciliation.run_reconciliation()
+
+        assert result["skipped"] == "POSTGRES_URI not set"
+        assert {k: v for k, v in result.items() if k != "skipped"} == (
+            reconciliation.zero_summary()
+        )

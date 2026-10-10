@@ -1,0 +1,56 @@
+{
+  "candidate_runtime_sha256": "381ada9e48c2adad51f9507ede47b4a5b67727c4d843e8d63c41772bc6e4e8bc",
+  "complete": true,
+  "core_suite": {
+    "exit_code": 0,
+    "passed": 811,
+    "session": 72026,
+    "warnings": 4
+  },
+  "decision_runtime_sha256": "bccdd13448f8d3a74bad0b7da3219fcc8feb0c3f63be53701e803ac280b6127f",
+  "declared_metric_tolerance": {
+    "abs_tol": 1e-12,
+    "rel_tol": 1e-12
+  },
+  "historical_48_context_rows_and_methods_and_pairs_unchanged": true,
+  "historical_native_rank_matches": 12,
+  "human_ratings": 0,
+  "independent_review": {
+    "p1_p2_remaining": 0,
+    "related_tests_passed": 124
+  },
+  "input_sha256": {
+    "devsupport\\reports\\dev-decision-context-cross-python-reaudit-v1\\summary.json": "3b5f58e4543d753e79cf6eb4c1633b7bd904b6795e5f32a5f269831d94b4038e",
+    "devsupport\\reports\\dev-decision-context-v2\\summary.json": "2e494b0aec6c3b82332a71f5aada1a26dfa776c9e571ec6a03f1781ec8d762c6",
+    "devsupport\\reports\\native-modern-runner-dev-context-preflight-v1\\summary.json": "4e814fe0c25e0c5674e5207ceab7366c348402405911ece634cddc5d7434177d",
+    "devsupport\\reports\\native-modern-runner-dev-preflight-v1\\U.jsonl": "20d34058b3560015997f4024214884b636a54da78949d3cbf55ab25e74ad3c90",
+    "devsupport\\reports\\native-u\\dev.jsonl": "ef4ac029e5b36b016c8ca73abc4dfa11173de4fa29f30077520f2aa13ffefda5",
+    "devsupport\\reports\\public-native-modern-dev-preflight-v1\\derivation.json": "6f934ee7fc2c58d44a87d4fc25dc553d8cb210338a495f174937fca587bcd084",
+    "devsupport\\reports\\public-native-modern-dev-preflight-v1\\records.jsonl": "07179e606589d441e91239481b0cd2922bbb767e366e0a4e15e686eab1d54ee0"
+  },
+  "native_errors": 0,
+  "native_queries": 12,
+  "observed_at_utc": "2026-10-10T01:19:20.733320+00:00",
+  "original_record_digests_valid": 12,
+  "paid_calls_in_verification": 0,
+  "public_trace_and_rank_exact": 12,
+  "returned_candidates": [
+    45,
+    50,
+    50,
+    38,
+    50,
+    50,
+    43,
+    50,
+    38,
+    50,
+    50,
+    41
+  ],
+  "roundoff_metric_differences": 8,
+  "roundoff_rows": 3,
+  "scope": "DEV-only native compatibility and offline context recomputation; not an independent quality cohort",
+  "test_scoring": false,
+  "verification_script_sha256": "c61cbd9365a19dd871a0f9b005c4bed3ea36b66523f3b7d5ef0156a1a6fdbd25"
+}

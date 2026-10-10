@@ -1,0 +1,683 @@
+from unittest.mock import MagicMock, Mock, patch
+
+import pytest
+
+
+def _make_store(
+    source_id="test-source",
+    embeddings_key="key",
+    connection_string="postgresql://user:pass@localhost/db",
+):
+    """Helper to create a PGVectorStore with all external deps mocked."""
+    with patch(
+        "docsgpt.vectorstore.base.BaseVectorStore._get_embeddings"
+    ) as mock_get_emb, patch(
+        "docsgpt.vectorstore.pgvector.settings"
+    ) as mock_settings, patch.dict(
+        "sys.modules",
+        {
+            "psycopg": MagicMock(),
+            "pgvector": MagicMock(),
+            "pgvector.psycopg": MagicMock(),
+        },
+    ):
+        mock_emb = Mock()
+        mock_emb.embed_query = Mock(return_value=[0.1, 0.2, 0.3])
+        mock_emb.embed_documents = Mock(return_value=[[0.1, 0.2, 0.3]])
+        mock_emb.dimension = 768
+        mock_get_emb.return_value = mock_emb
+        mock_settings.EMBEDDINGS_NAME = "test_model"
+        mock_settings.PGVECTOR_CONNECTION_STRING = connection_string
+
+        from docsgpt.vectorstore.pgvector import PGVectorStore
+
+        store = PGVectorStore(
+            source_id=source_id,
+            embeddings_key=embeddings_key,
+            connection_string=connection_string,
+        )
+        # Boot owns the schema, so these unit stores start already ensured;
+        # the write-path safety net has its own tests.
+        store._schema_ensured = True
+        # Legacy direct-connection mode: pooling would build a real
+        # psycopg_pool against the fake DSN. The pooled path has its own tests.
+        store._pool_max_size = 0
+        # Provide a mock connection
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_conn.cursor.return_value = mock_cursor
+        mock_conn.closed = False
+        store._connection = mock_conn
+
+        return store, mock_conn, mock_cursor, mock_emb
+
+
+@pytest.mark.unit
+class TestPGVectorStoreInit:
+    def test_source_id_cleaned(self):
+        store, _, _, _ = _make_store(source_id="docsgpt/indexes/abc123/")
+        assert store._source_id == "abc123"
+
+    def test_missing_connection_string_raises(self):
+        with patch(
+            "docsgpt.vectorstore.base.BaseVectorStore._get_embeddings"
+        ) as mock_get_emb, patch(
+            "docsgpt.vectorstore.pgvector.settings"
+        ) as mock_settings, patch.dict(
+            "sys.modules",
+            {
+                "psycopg": MagicMock(),
+                "pgvector": MagicMock(),
+                "pgvector.psycopg": MagicMock(),
+            },
+        ):
+            mock_get_emb.return_value = Mock(dimension=768)
+            mock_settings.EMBEDDINGS_NAME = "test_model"
+            mock_settings.PGVECTOR_CONNECTION_STRING = None
+            mock_settings.POSTGRES_URI = None
+
+            from docsgpt.vectorstore.pgvector import PGVectorStore
+
+            with pytest.raises(ValueError, match="connection string is required"):
+                PGVectorStore(
+                    source_id="test", embeddings_key="key", connection_string=None
+                )
+
+
+@pytest.mark.unit
+class TestPGVectorStoreSearch:
+    def test_search_returns_documents(self):
+        store, mock_conn, mock_cursor, mock_emb = _make_store()
+        mock_cursor.fetchall.return_value = [
+            ("hello world", {"source": "test.txt"}, 0.1),
+            ("foo bar", {"source": "test2.txt"}, 0.2),
+        ]
+
+        results = store.search("query", k=2)
+
+        mock_emb.embed_query.assert_called_once_with("query")
+        assert len(results) == 2
+        assert results[0].page_content == "hello world"
+        assert results[0].metadata == {"source": "test.txt"}
+
+    def test_search_returns_empty_on_error(self):
+        store, mock_conn, mock_cursor, _ = _make_store()
+        mock_cursor.execute.side_effect = Exception("connection lost")
+
+        results = store.search("query")
+        assert results == []
+
+    def test_search_handles_null_metadata(self):
+        store, _, mock_cursor, _ = _make_store()
+        mock_cursor.fetchall.return_value = [("text", None, 0.5)]
+
+        results = store.search("query")
+        assert len(results) == 1
+        assert results[0].metadata == {}
+
+    def test_score_threshold_filters_by_distance(self):
+        # similarity = 1 - distance; threshold 0.85 → keep distance <= 0.15.
+        store, _, mock_cursor, _ = _make_store()
+        mock_cursor.fetchall.return_value = [
+            ("close", {}, 0.10),   # sim 0.90 → kept
+            ("far", {}, 0.40),     # sim 0.60 → dropped
+        ]
+        results = store.search("query", k=5, score_threshold=0.85)
+        assert [r.page_content for r in results] == ["close"]
+
+    def test_no_score_threshold_keeps_all(self):
+        store, _, mock_cursor, _ = _make_store()
+        mock_cursor.fetchall.return_value = [
+            ("a", {}, 0.10),
+            ("b", {}, 0.90),
+        ]
+        results = store.search("query", k=5)
+        assert len(results) == 2
+
+
+@pytest.mark.unit
+class TestPGVectorStoreKeywordSearch:
+    def test_keyword_search_returns_documents(self):
+        store, _, mock_cursor, mock_emb = _make_store(source_id="src1")
+        mock_cursor.fetchall.return_value = [
+            ("hello world", {"source": "a.txt"}, 0.9),
+            ("foo bar", {"source": "b.txt"}, 0.3),
+        ]
+
+        results = store.keyword_search("hello", k=5)
+
+        # Keyword search must not embed the query.
+        mock_emb.embed_query.assert_not_called()
+        assert len(results) == 2
+        assert results[0].page_content == "hello world"
+        assert results[0].metadata == {"source": "a.txt"}
+
+    def test_keyword_search_is_parameterized(self):
+        store, _, mock_cursor, _ = _make_store(source_id="src1")
+        mock_cursor.fetchall.return_value = []
+
+        store.keyword_search("DROP TABLE documents; --", k=7)
+
+        sql, params = mock_cursor.execute.call_args[0]
+        # The raw question must never be interpolated into the SQL text.
+        assert "DROP TABLE documents" not in sql
+        assert "websearch_to_tsquery('english', %s)" in sql
+        # Question is bound twice (rank + WHERE), then source_id and k.
+        assert params == ("DROP TABLE documents; --", "src1", "DROP TABLE documents; --", 7)
+
+    def test_keyword_search_handles_null_metadata(self):
+        store, _, mock_cursor, _ = _make_store()
+        mock_cursor.fetchall.return_value = [("text", None, 0.5)]
+
+        results = store.keyword_search("query")
+        assert len(results) == 1
+        assert results[0].metadata == {}
+
+    def test_keyword_search_returns_empty_on_error(self):
+        store, _, mock_cursor, _ = _make_store()
+        mock_cursor.execute.side_effect = Exception("fts failed")
+
+        assert store.keyword_search("query") == []
+
+    def test_ensure_table_exists_creates_fts_index(self):
+        store, mock_conn, mock_cursor, _ = _make_store()
+        store._ensure_table_exists()
+
+        executed = " ".join(
+            str(call.args[0]) for call in mock_cursor.execute.call_args_list
+        )
+        assert "documents_text_fts_idx" in executed
+        assert "gin(to_tsvector('english'" in executed
+
+
+@pytest.mark.unit
+class TestPGVectorStoreAddTexts:
+    def test_add_texts_inserts_and_returns_ids(self):
+        store, mock_conn, mock_cursor, mock_emb = _make_store()
+        mock_emb.embed_documents.return_value = [[0.1, 0.2], [0.3, 0.4]]
+        mock_cursor.fetchone.side_effect = [(1,), (2,)]
+
+        ids = store.add_texts(["text1", "text2"], [{"a": 1}, {"b": 2}])
+
+        assert ids == ["1", "2"]
+        assert mock_cursor.execute.call_count == 2
+        mock_conn.commit.assert_called_once()
+
+    def test_add_texts_empty_returns_empty(self):
+        store, _, _, _ = _make_store()
+        assert store.add_texts([]) == []
+
+    def test_add_texts_default_metadatas(self):
+        store, mock_conn, mock_cursor, mock_emb = _make_store()
+        mock_emb.embed_documents.return_value = [[0.1, 0.2]]
+        mock_cursor.fetchone.return_value = (1,)
+
+        ids = store.add_texts(["text1"])
+        assert ids == ["1"]
+
+    def test_add_texts_rolls_back_on_error(self):
+        store, mock_conn, mock_cursor, mock_emb = _make_store()
+        mock_emb.embed_documents.return_value = [[0.1]]
+        mock_cursor.execute.side_effect = Exception("insert failed")
+
+        with pytest.raises(Exception, match="insert failed"):
+            store.add_texts(["text1"])
+
+        mock_conn.rollback.assert_called_once()
+
+
+@pytest.mark.unit
+class TestPGVectorStoreDeleteIndex:
+    def test_delete_index_deletes_by_source_id(self):
+        store, mock_conn, mock_cursor, _ = _make_store(source_id="src123")
+
+        store.delete_index()
+
+        mock_cursor.execute.assert_called_once()
+        sql = mock_cursor.execute.call_args[0][0]
+        assert "DELETE FROM" in sql
+        assert mock_cursor.execute.call_args[0][1] == ("src123",)
+        mock_conn.commit.assert_called_once()
+
+    def test_delete_index_rolls_back_on_error(self):
+        store, mock_conn, mock_cursor, _ = _make_store()
+        mock_cursor.execute.side_effect = Exception("fail")
+
+        with pytest.raises(Exception):
+            store.delete_index()
+
+        mock_conn.rollback.assert_called_once()
+
+
+@pytest.mark.unit
+class TestPGVectorStoreSaveLocal:
+    def test_save_local_is_noop(self):
+        store, _, _, _ = _make_store()
+        assert store.save_local() is None
+
+
+@pytest.mark.unit
+class TestPGVectorStoreGetChunks:
+    def test_get_chunks(self):
+        store, _, mock_cursor, _ = _make_store()
+        mock_cursor.fetchall.return_value = [
+            (1, "text1", {"key": "val"}),
+            (2, "text2", None),
+        ]
+
+        chunks = store.get_chunks()
+        assert len(chunks) == 2
+        assert chunks[0] == {"doc_id": "1", "text": "text1", "metadata": {"key": "val"}}
+        assert chunks[1] == {"doc_id": "2", "text": "text2", "metadata": {}}
+
+    def test_get_chunks_returns_empty_on_error(self):
+        store, _, mock_cursor, _ = _make_store()
+        mock_cursor.execute.side_effect = Exception("fail")
+
+        assert store.get_chunks() == []
+
+
+@pytest.mark.unit
+class TestPGVectorStoreAddChunk:
+    def test_add_chunk(self):
+        store, mock_conn, mock_cursor, mock_emb = _make_store(source_id="src1")
+        mock_emb.embed_documents.return_value = [[0.1, 0.2]]
+        mock_cursor.fetchone.return_value = (42,)
+
+        chunk_id = store.add_chunk("hello", metadata={"key": "val"})
+
+        assert chunk_id == "42"
+        mock_conn.commit.assert_called_once()
+
+    def test_add_chunk_raises_on_empty_embedding(self):
+        store, _, _, mock_emb = _make_store()
+        mock_emb.embed_documents.return_value = []
+
+        with pytest.raises(ValueError, match="Could not generate embedding"):
+            store.add_chunk("text")
+
+    def test_add_chunk_includes_source_id_in_metadata(self):
+        store, mock_conn, mock_cursor, mock_emb = _make_store(source_id="src1")
+        mock_emb.embed_documents.return_value = [[0.1, 0.2]]
+        mock_cursor.fetchone.return_value = (1,)
+
+        store.add_chunk("hello", metadata={"key": "val"})
+
+        # Verify source_id is passed as a parameter to the INSERT
+        insert_call = mock_cursor.execute.call_args
+        params = insert_call[0][1]
+        # source_id is the 4th param in the insert
+        assert params[3] == "src1"
+
+
+@pytest.mark.unit
+class TestPGVectorStoreDeleteChunk:
+    def test_delete_chunk_success(self):
+        store, mock_conn, mock_cursor, _ = _make_store()
+        mock_cursor.rowcount = 1
+
+        result = store.delete_chunk("42")
+        assert result is True
+        mock_conn.commit.assert_called_once()
+
+    def test_delete_chunk_not_found(self):
+        store, mock_conn, mock_cursor, _ = _make_store()
+        mock_cursor.rowcount = 0
+
+        result = store.delete_chunk("999")
+        assert result is False
+
+    def test_delete_chunk_returns_false_on_error(self):
+        store, _, mock_cursor, _ = _make_store()
+        mock_cursor.execute.side_effect = Exception("fail")
+
+        result = store.delete_chunk("42")
+        assert result is False
+
+
+@pytest.mark.unit
+class TestPGVectorStoreDeleteChunksBySourcePath:
+    def test_targeted_delete_is_parameterized(self):
+        store, mock_conn, mock_cursor, _ = _make_store(source_id="src1")
+        mock_cursor.rowcount = 3
+
+        deleted = store.delete_chunks_by_source_path("/docs/page.md")
+
+        assert deleted == 3
+        sql, params = mock_cursor.execute.call_args[0]
+        # Single targeted DELETE; the path is a bound param, never interpolated.
+        assert "/docs/page.md" not in sql
+        assert "DELETE FROM" in sql
+        assert "metadata->>'source' = %s" in sql
+        assert "source_id = %s" in sql
+        assert params == ("src1", "/docs/page.md")
+        mock_conn.commit.assert_called_once()
+
+    def test_returns_zero_when_no_match(self):
+        store, mock_conn, mock_cursor, _ = _make_store(source_id="src1")
+        mock_cursor.rowcount = 0
+
+        assert store.delete_chunks_by_source_path("/missing.md") == 0
+        mock_conn.commit.assert_called_once()
+
+    def test_rolls_back_and_raises_on_error(self):
+        store, mock_conn, mock_cursor, _ = _make_store()
+        mock_cursor.execute.side_effect = Exception("delete failed")
+
+        with pytest.raises(Exception, match="delete failed"):
+            store.delete_chunks_by_source_path("/x.md")
+
+        mock_conn.rollback.assert_called_once()
+
+
+@pytest.mark.unit
+class TestPGVectorStoreConnection:
+    def test_get_connection_creates_new_when_closed(self):
+        store, mock_conn, _, _ = _make_store()
+        mock_conn.closed = True
+
+        mock_psycopg = MagicMock()
+        new_conn = MagicMock()
+        mock_psycopg.connect.return_value = new_conn
+        store._psycopg = mock_psycopg
+
+        conn = store._get_connection()
+        mock_psycopg.connect.assert_called_once()
+        assert conn is new_conn
+
+    def test_get_connection_reuses_open(self):
+        store, mock_conn, _, _ = _make_store()
+        mock_conn.closed = False
+
+        conn = store._get_connection()
+        assert conn is mock_conn
+
+    def test_ensure_table_exists(self):
+        store, mock_conn, mock_cursor, _ = _make_store()
+        # Call _ensure_table_exists directly
+        store._ensure_table_exists()
+
+        # Should execute CREATE EXTENSION, CREATE TABLE, and CREATE INDEX statements
+        assert mock_cursor.execute.call_count >= 3
+        mock_conn.commit.assert_called()
+
+    def test_del_closes_connection(self):
+        store, mock_conn, _, _ = _make_store()
+        mock_conn.closed = False
+
+        store.__del__()
+        mock_conn.close.assert_called_once()
+
+
+@pytest.mark.unit
+class TestPGVectorSearchWithScores:
+    def test_reports_cosine_similarity(self):
+        store, _, mock_cursor, _ = _make_store()
+        mock_cursor.fetchall.return_value = [
+            ("close", {"source": "a.txt"}, 0.10),
+            ("far", {"source": "b.txt"}, 0.40),
+        ]
+
+        results = store.search_with_scores("query", k=2)
+
+        assert store.score_kind == "cosine_similarity"
+        assert [doc.page_content for doc, _ in results] == ["close", "far"]
+        # similarity = 1 - cosine distance, the quantity score_threshold uses.
+        assert results[0][1] == pytest.approx(0.90)
+        assert results[1][1] == pytest.approx(0.60)
+
+    def test_honours_score_threshold(self):
+        store, _, mock_cursor, _ = _make_store()
+        mock_cursor.fetchall.return_value = [
+            ("close", {}, 0.10),  # sim 0.90 → kept
+            ("far", {}, 0.40),  # sim 0.60 → dropped
+        ]
+
+        results = store.search_with_scores("query", k=5, score_threshold=0.85)
+
+        assert [doc.page_content for doc, _ in results] == ["close"]
+
+    def test_returns_empty_on_error(self):
+        store, _, mock_cursor, _ = _make_store()
+        mock_cursor.execute.side_effect = Exception("connection lost")
+
+        assert store.search_with_scores("query") == []
+
+
+@pytest.mark.unit
+class TestPGVectorPrecomputedQueryVector:
+    """A caller that already embedded the query must not pay for it again.
+
+    Multi-source retrieval embeds the query once and hands the same vector to
+    every source's store; without this the query is embedded once per source.
+    """
+
+    def test_search_with_scores_skips_embedding(self):
+        store, _, mock_cursor, mock_emb = _make_store()
+        mock_cursor.fetchall.return_value = [("hello world", {}, 0.1)]
+
+        results = store.search_with_scores("query", k=2, query_vector=[0.9, 0.8, 0.7])
+
+        mock_emb.embed_query.assert_not_called()
+        assert [doc.page_content for doc, _ in results] == ["hello world"]
+
+    def test_search_skips_embedding(self):
+        store, _, mock_cursor, mock_emb = _make_store()
+        mock_cursor.fetchall.return_value = [("hello world", {}, 0.1)]
+
+        results = store.search("query", k=2, query_vector=[0.9, 0.8, 0.7])
+
+        mock_emb.embed_query.assert_not_called()
+        assert [doc.page_content for doc in results] == ["hello world"]
+
+    def test_supplied_vector_is_what_the_query_binds(self):
+        store, _, mock_cursor, _ = _make_store(source_id="src1")
+        mock_cursor.fetchall.return_value = [("a", {}, 0.1)]
+
+        store.search_with_scores("query", k=1, query_vector=[0.9, 0.8, 0.7])
+
+        _sql, params = mock_cursor.execute.call_args_list[0].args
+        assert params == ([0.9, 0.8, 0.7], "src1", [0.9, 0.8, 0.7], 1)
+
+    def test_none_vector_still_embeds(self):
+        store, _, mock_cursor, mock_emb = _make_store()
+        mock_cursor.fetchall.return_value = []
+
+        store.search_with_scores("query", k=2, query_vector=None)
+
+        mock_emb.embed_query.assert_called_once_with("query")
+
+
+@pytest.mark.unit
+class TestPGVectorStoreUpdateChunk:
+    def test_updates_the_row_in_place(self):
+        store, mock_conn, mock_cursor, mock_emb = _make_store(source_id="src1")
+        mock_emb.embed_documents.return_value = [[0.4, 0.5]]
+        mock_cursor.rowcount = 1
+
+        with patch("docsgpt.vectorstore.pgvector.Jsonb", side_effect=lambda v: ("jsonb", v)):
+            returned = store.update_chunk("42", "new text", {"key": "val"})
+
+        assert returned == "42"
+        sql, params = mock_cursor.execute.call_args[0]
+        assert sql.strip().upper().startswith("UPDATE")
+        assert "WHERE id = %s AND source_id = %s" in sql
+        assert "INSERT" not in sql.upper() and "DELETE" not in sql.upper()
+        assert params == (
+            "new text",
+            [0.4, 0.5],
+            ("jsonb", {"key": "val", "source_id": "src1"}),
+            42,
+            "src1",
+        )
+        mock_emb.embed_documents.assert_called_once_with(["new text"])
+        mock_conn.commit.assert_called_once()
+
+    def test_does_not_mutate_the_callers_metadata(self):
+        store, _, mock_cursor, mock_emb = _make_store(source_id="src1")
+        mock_emb.embed_documents.return_value = [[0.4]]
+        mock_cursor.rowcount = 1
+        metadata = {"key": "val"}
+
+        store.update_chunk("42", "new text", metadata)
+
+        assert metadata == {"key": "val"}
+
+    def test_embedding_failure_writes_nothing(self):
+        store, mock_conn, mock_cursor, mock_emb = _make_store()
+        mock_emb.embed_documents.side_effect = RuntimeError("embed down")
+
+        with pytest.raises(RuntimeError):
+            store.update_chunk("42", "new text", {})
+
+        mock_cursor.execute.assert_not_called()
+        mock_conn.commit.assert_not_called()
+
+    def test_empty_embedding_raises_before_writing(self):
+        store, _, mock_cursor, mock_emb = _make_store()
+        mock_emb.embed_documents.return_value = []
+
+        with pytest.raises(ValueError, match="Could not generate embedding"):
+            store.update_chunk("42", "new text", {})
+        mock_cursor.execute.assert_not_called()
+
+    def test_missing_row_raises_and_rolls_back(self):
+        store, mock_conn, mock_cursor, mock_emb = _make_store()
+        mock_emb.embed_documents.return_value = [[0.4]]
+        mock_cursor.rowcount = 0
+
+        with pytest.raises(KeyError):
+            store.update_chunk("999", "new text", {})
+
+        mock_conn.commit.assert_not_called()
+        mock_conn.rollback.assert_called_once()
+
+    def test_db_error_rolls_back_and_raises(self):
+        store, mock_conn, mock_cursor, mock_emb = _make_store()
+        mock_emb.embed_documents.return_value = [[0.4]]
+        mock_cursor.execute.side_effect = RuntimeError("db down")
+
+        with pytest.raises(RuntimeError):
+            store.update_chunk("42", "new text", {})
+        mock_conn.rollback.assert_called_once()
+
+
+@pytest.mark.unit
+def test_get_chunks_orders_by_id():
+    """An UPDATE writes a new tuple, so an unordered scan could move the row."""
+    store, _, mock_cursor, _ = _make_store()
+    mock_cursor.fetchall.return_value = []
+
+    store.get_chunks()
+
+    sql = " ".join(mock_cursor.execute.call_args[0][0].split())
+    assert sql.endswith("WHERE source_id = %s ORDER BY id;")
+
+
+@pytest.mark.unit
+class TestPGVectorStoreGetChunkByKey:
+    def test_one_query_by_source_and_md5_of_the_text(self):
+        store, _, mock_cursor, _ = _make_store(source_id="src1")
+        mock_cursor.fetchone.return_value = (42, "the text", {"title": "t"})
+
+        found = store.get_chunk_by_key("a" * 32)
+
+        assert found == {"doc_id": "42", "text": "the text", "metadata": {"title": "t"}}
+        sql, params = mock_cursor.execute.call_args[0]
+        sql = " ".join(sql.split())
+        assert "WHERE source_id = %s AND md5(text) = %s ORDER BY id LIMIT 1" in sql
+        assert params == ("src1", "a" * 32)
+
+    def test_no_row_is_none(self):
+        store, _, mock_cursor, _ = _make_store()
+        mock_cursor.fetchone.return_value = None
+        assert store.get_chunk_by_key("a" * 32) is None
+        assert mock_cursor.execute.call_count == 1
+
+    def test_a_key_miss_searches_the_excerpt(self):
+        store, _, mock_cursor, _ = _make_store(source_id="src1")
+        mock_cursor.fetchone.side_effect = [None, (7, "Late pickup fees", {})]
+
+        found = store.get_chunk_by_key("a" * 32, excerpt="  Late Pickup ")
+
+        assert found["doc_id"] == "7"
+        sql, params = mock_cursor.execute.call_args[0]
+        sql = " ".join(sql.split())
+        assert "WHERE source_id = %s AND strpos(lower(text), %s) > 0 ORDER BY id LIMIT 1" in sql
+        assert params == ("src1", "late pickup")
+
+    def test_null_metadata_reads_as_empty(self):
+        store, _, mock_cursor, _ = _make_store()
+        mock_cursor.fetchone.return_value = (1, "t", None)
+        assert store.get_chunk_by_key("a" * 32)["metadata"] == {}
+
+    def test_a_query_error_propagates(self):
+        # Unlike ``get_chunks`` the lookup must not read a failure as "gone":
+        # the route answers that with the excerpt-only fallback.
+        store, mock_conn, mock_cursor, _ = _make_store()
+        mock_cursor.execute.side_effect = RuntimeError("down")
+        with pytest.raises(RuntimeError):
+            store.get_chunk_by_key("a" * 32)
+        mock_conn.rollback.assert_called_once()
+
+
+@pytest.fixture
+def _remote_embeddings_settings(monkeypatch):
+    """A remote, authenticated embeddings endpoint and a fresh embeddings cache."""
+    from docsgpt.core.settings import settings
+    from docsgpt.vectorstore.base import EmbeddingsSingleton
+
+    monkeypatch.setattr(settings, "EMBEDDINGS_BASE_URL", "http://embed:8080")
+    monkeypatch.setattr(settings, "EMBEDDINGS_KEY", "sk-real")
+    monkeypatch.setattr(settings, "EMBEDDINGS_NAME", "remote-model")
+    monkeypatch.setattr(settings, "PGVECTOR_CONNECTION_STRING", "postgresql://u:p@localhost/db")
+    monkeypatch.setattr(EmbeddingsSingleton, "_instances", {})
+    return settings
+
+
+@pytest.mark.unit
+class TestStoreEmbeddingsKey:
+    """A store built without a key must embed with the configured one.
+
+    The stores used to default to the placeholder ``"embeddings"``; the first
+    such store in a process cached a remote client sending ``Bearer
+    embeddings``, and every later retrieval on that process got a 401.
+    """
+
+    def test_default_key_resolves_settings_key(self, _remote_embeddings_settings):
+        from docsgpt.vectorstore.pgvector import PGVectorStore
+
+        store = PGVectorStore(source_id="src")
+
+        assert store._embedding.headers["Authorization"] == "Bearer sk-real"
+
+    def test_delete_path_store_does_not_poison_retrieval(self, _remote_embeddings_settings):
+        from docsgpt.vectorstore.vector_creator import VectorCreator
+
+        settings = _remote_embeddings_settings
+        # ``delete_source`` builds its store with no key, only to drop the index.
+        VectorCreator.create_vectorstore("pgvector", source_id="deleted")
+        # ``ClassicRAG`` builds its stores with the configured key.
+        retrieval = VectorCreator.create_vectorstore(
+            "pgvector", "other", settings.EMBEDDINGS_KEY
+        )
+
+        assert retrieval._embedding.headers["Authorization"] == "Bearer sk-real"
+
+    @pytest.mark.parametrize(
+        "module, cls",
+        [
+            ("docsgpt.vectorstore.pgvector", "PGVectorStore"),
+            ("docsgpt.vectorstore.mongodb", "MongoDBVectorStore"),
+            ("docsgpt.vectorstore.milvus", "MilvusStore"),
+            ("docsgpt.vectorstore.qdrant", "QdrantStore"),
+        ],
+    )
+    def test_default_embeddings_key_is_none(self, module, cls):
+        import importlib
+        import inspect
+
+        store_cls = getattr(importlib.import_module(module), cls)
+        default = inspect.signature(store_cls.__init__).parameters["embeddings_key"].default
+
+        assert default is None

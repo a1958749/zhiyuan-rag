@@ -1,0 +1,323 @@
+"""Tests for docsgpt/api/answer/routes/answer.py"""
+
+import json
+import uuid
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+# Static IDs
+_CONV_ID = "507f1f77bcf86cd799439011"
+_AGENT_ID = "507f1f77bcf86cd799439012"
+
+
+@pytest.fixture
+def mock_stream_processor():
+    """Create a mock StreamProcessor."""
+    with patch(
+        "docsgpt.api.answer.routes.answer.StreamProcessor"
+    ) as MockProcessor:
+        processor = MagicMock()
+        processor.decoded_token = {"sub": "test_user"}
+        processor.conversation_id = _CONV_ID
+        processor.agent_config = {}
+        processor.agent_id = _AGENT_ID
+        processor.is_shared_usage = False
+        processor.shared_token = None
+        processor.model_id = "gpt-4"
+        processor.build_agent.return_value = MagicMock()
+        MockProcessor.return_value = processor
+        yield processor
+
+
+@pytest.fixture
+def answer_client(mock_mongo_db, flask_app):
+    """Create a test client with the answer route registered."""
+    from flask_restx import Api
+
+    from docsgpt.api.answer.routes.answer import answer_ns
+
+    api = Api(flask_app)
+    api.add_namespace(answer_ns)
+    flask_app.config["TESTING"] = True
+    return flask_app.test_client()
+
+
+@pytest.mark.unit
+class TestAnswerResourcePost:
+    def test_missing_question_returns_400(self, answer_client, mock_stream_processor):
+        resp = answer_client.post(
+            "/api/answer",
+            data=json.dumps({}),
+            content_type="application/json",
+        )
+        assert resp.status_code == 400
+
+    def test_successful_answer(self, answer_client, mock_stream_processor):
+        conv_id = str(uuid.uuid4())
+        with patch.object(
+            mock_stream_processor.build_agent.return_value,
+            "gen",
+            return_value=iter([]),
+        ):
+            with patch(
+                "docsgpt.api.answer.routes.answer.AnswerResource.validate_request",
+                return_value=None,
+            ), patch(
+                "docsgpt.api.answer.routes.answer.AnswerResource.check_usage",
+                return_value=None,
+            ), patch(
+                "docsgpt.api.answer.routes.answer.AnswerResource.complete_stream",
+                return_value=iter(
+                    [
+                        f'data: {json.dumps({"type": "answer", "answer": "Hello"})}\n\n',
+                        f'data: {json.dumps({"type": "id", "id": conv_id})}\n\n',
+                        f'data: {json.dumps({"type": "end"})}\n\n',
+                    ]
+                ),
+            ), patch(
+                "docsgpt.api.answer.routes.answer.AnswerResource.process_response_stream",
+                return_value={"conversation_id": conv_id, "answer": "Hello", "sources": [], "tool_calls": [], "thought": "", "error": None},
+            ):
+                resp = answer_client.post(
+                    "/api/answer",
+                    data=json.dumps({"question": "What is Python?"}),
+                    content_type="application/json",
+                )
+                assert resp.status_code == 200
+                data = resp.get_json()
+                assert data["answer"] == "Hello"
+                assert data["conversation_id"] == conv_id
+
+    def test_unauthorized_returns_401(self, answer_client, mock_stream_processor):
+        mock_stream_processor.decoded_token = None
+        with patch(
+            "docsgpt.api.answer.routes.answer.AnswerResource.validate_request",
+            return_value=None,
+        ):
+            resp = answer_client.post(
+                "/api/answer",
+                data=json.dumps({"question": "test"}),
+                content_type="application/json",
+            )
+            assert resp.status_code == 401
+            assert resp.get_json()["error"] == "Unauthorized"
+
+    def test_usage_exceeded_returns_error(self, answer_client, mock_stream_processor):
+
+        with patch(
+            "docsgpt.api.answer.routes.answer.AnswerResource.validate_request",
+            return_value=None,
+        ), patch(
+            "docsgpt.api.answer.routes.answer.AnswerResource.check_usage",
+        ) as mock_check:
+            with flask_app_context(answer_client):
+                mock_check.return_value = ({"error": "Usage limit exceeded"}, 429)
+
+                resp = answer_client.post(
+                    "/api/answer",
+                    data=json.dumps({"question": "test"}),
+                    content_type="application/json",
+                )
+                assert resp.status_code == 429
+
+    def test_stream_error_returns_400(self, answer_client, mock_stream_processor):
+        with patch(
+            "docsgpt.api.answer.routes.answer.AnswerResource.validate_request",
+            return_value=None,
+        ), patch(
+            "docsgpt.api.answer.routes.answer.AnswerResource.check_usage",
+            return_value=None,
+        ), patch(
+            "docsgpt.api.answer.routes.answer.AnswerResource.complete_stream",
+            return_value=iter([]),
+        ), patch(
+            "docsgpt.api.answer.routes.answer.AnswerResource.process_response_stream",
+            return_value={"conversation_id": None, "answer": None, "sources": None, "tool_calls": None, "thought": None, "error": "Stream error"},
+        ):
+            resp = answer_client.post(
+                "/api/answer",
+                data=json.dumps({"question": "test"}),
+                content_type="application/json",
+            )
+            assert resp.status_code == 400
+            assert resp.get_json()["error"] == "Stream error"
+
+    def test_resume_already_in_progress_returns_409(
+        self, answer_client, mock_stream_processor,
+    ):
+        """A raced resume is a conflict the caller can retry, not a 500.
+
+        ``ResumeInProgressError`` subclasses ``ValueError`` but reaches this
+        route through ``resume_from_tool_actions``, where the bare
+        ``except Exception`` reported it as an opaque 500 with a full
+        traceback on the ERROR channel. ``/stream`` and
+        ``/v1/chat/completions`` both answer 409 for the identical condition.
+        """
+        from docsgpt.api.answer.services.continuation_service import (
+            ResumeInProgressError,
+        )
+
+        mock_stream_processor.resume_from_tool_actions.side_effect = (
+            ResumeInProgressError("Resume already in progress for this conversation.")
+        )
+
+        with patch(
+            "docsgpt.api.answer.routes.answer.AnswerResource.validate_request",
+            return_value=None,
+        ):
+            resp = answer_client.post(
+                "/api/answer",
+                data=json.dumps({
+                    "question": "",
+                    "conversation_id": _CONV_ID,
+                    "tool_actions": [{"call_id": "call_1", "decision": "approved"}],
+                }),
+                content_type="application/json",
+            )
+
+        assert resp.status_code == 409
+        body = resp.get_json()
+        assert body["code"] == "resume_in_progress"
+        assert "Resume already in progress" in body["error"]
+        # The generic handler's opaque text would tell the caller nothing
+        # about retryability.
+        assert body["error"] != "An error occurred processing your request"
+
+    def test_exception_returns_500(self, answer_client, mock_stream_processor):
+        with patch(
+            "docsgpt.api.answer.routes.answer.AnswerResource.validate_request",
+            return_value=None,
+        ), patch(
+            "docsgpt.api.answer.routes.answer.AnswerResource.check_usage",
+            return_value=None,
+        ), patch(
+            "docsgpt.api.answer.routes.answer.AnswerResource.complete_stream",
+            side_effect=RuntimeError("unexpected"),
+        ):
+            resp = answer_client.post(
+                "/api/answer",
+                data=json.dumps({"question": "test"}),
+                content_type="application/json",
+            )
+            assert resp.status_code == 500
+            assert "error" in resp.get_json()
+
+    def test_structured_info_merged_into_result(
+        self, answer_client, mock_stream_processor
+    ):
+        conv_id = str(uuid.uuid4())
+        with patch(
+            "docsgpt.api.answer.routes.answer.AnswerResource.validate_request",
+            return_value=None,
+        ), patch(
+            "docsgpt.api.answer.routes.answer.AnswerResource.check_usage",
+            return_value=None,
+        ), patch(
+            "docsgpt.api.answer.routes.answer.AnswerResource.complete_stream",
+            return_value=iter([]),
+        ), patch(
+            "docsgpt.api.answer.routes.answer.AnswerResource.process_response_stream",
+            return_value={"conversation_id": conv_id, "answer": '{"key": "val"}', "sources": [], "tool_calls": [], "thought": "", "error": None, "extra": {"structured": True, "schema": {"type": "object"}}},
+        ):
+            resp = answer_client.post(
+                "/api/answer",
+                data=json.dumps({"question": "test"}),
+                content_type="application/json",
+            )
+            assert resp.status_code == 200
+            data = resp.get_json()
+            assert data["structured"] is True
+            assert data["schema"] == {"type": "object"}
+
+    def test_result_contains_all_expected_fields(
+        self, answer_client, mock_stream_processor
+    ):
+        conv_id = str(uuid.uuid4())
+        with patch(
+            "docsgpt.api.answer.routes.answer.AnswerResource.validate_request",
+            return_value=None,
+        ), patch(
+            "docsgpt.api.answer.routes.answer.AnswerResource.check_usage",
+            return_value=None,
+        ), patch(
+            "docsgpt.api.answer.routes.answer.AnswerResource.complete_stream",
+            return_value=iter([]),
+        ), patch(
+            "docsgpt.api.answer.routes.answer.AnswerResource.process_response_stream",
+            return_value={"conversation_id": conv_id, "answer": "answer text", "sources": [{"title": "src"}], "tool_calls": [{"tool": "t"}], "thought": "thinking...", "error": None},
+        ):
+            resp = answer_client.post(
+                "/api/answer",
+                data=json.dumps({"question": "test"}),
+                content_type="application/json",
+            )
+            data = resp.get_json()
+            assert data["conversation_id"] == conv_id
+            assert data["answer"] == "answer text"
+            assert data["sources"] == [{"title": "src"}]
+            assert data["tool_calls"] == [{"tool": "t"}]
+            assert data["thought"] == "thinking..."
+
+
+def flask_app_context(client):
+    """Helper to get app context from test client."""
+    return client.application.app_context()
+
+
+@pytest.mark.unit
+class TestAnswerContextOverflow:
+    """``/api/answer`` reports a too-big turn as the curated error with its code."""
+
+    def test_pre_stream_overflow_is_a_400_with_the_code(self, answer_client, mock_stream_processor):
+        from docsgpt.agents.context_overflow import ContextOverflowError
+
+        mock_stream_processor.build_agent.side_effect = ContextOverflowError(
+            "raw internal text", needed_tokens=9_000, available_tokens=8_000, stage="pre_compression"
+        )
+        with patch(
+            "docsgpt.api.answer.routes.answer.AnswerResource.validate_request",
+            return_value=None,
+        ):
+            resp = answer_client.post(
+                "/api/answer",
+                data=json.dumps({"question": "test"}),
+                content_type="application/json",
+            )
+
+        assert resp.status_code == 400
+        body = resp.get_json()
+        assert body["code"] == "context_length_exceeded"
+        assert body["params"] == {"needed_tokens": 9_000, "available_tokens": 8_000}
+        assert "9,000" in body["error"]
+
+    def test_a_curated_stream_error_keeps_its_code(self, answer_client, mock_stream_processor):
+        with patch(
+            "docsgpt.api.answer.routes.answer.AnswerResource.validate_request",
+            return_value=None,
+        ), patch(
+            "docsgpt.api.answer.routes.answer.AnswerResource.check_usage",
+            return_value=None,
+        ), patch(
+            "docsgpt.api.answer.routes.answer.AnswerResource.complete_stream",
+            return_value=iter([]),
+        ), patch(
+            "docsgpt.api.answer.routes.answer.AnswerResource.process_response_stream",
+            return_value={
+                "conversation_id": None, "answer": None, "sources": None, "tool_calls": None,
+                "thought": None, "error": "Too big", "error_code": "context_length_exceeded",
+                "error_params": {"needed_tokens": 2, "available_tokens": 1},
+            },
+        ):
+            resp = answer_client.post(
+                "/api/answer",
+                data=json.dumps({"question": "test"}),
+                content_type="application/json",
+            )
+
+        assert resp.status_code == 400
+        assert resp.get_json() == {
+            "error": "Too big",
+            "code": "context_length_exceeded",
+            "params": {"needed_tokens": 2, "available_tokens": 1},
+        }

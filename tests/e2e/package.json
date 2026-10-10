@@ -1,0 +1,26 @@
+{
+  "name": "docsgpt-e2e",
+  "private": true,
+  "type": "module",
+  "description": "End-to-end test suite for DocsGPT. Isolated from the frontend/ workspace so Playwright deps never touch the app bundle.",
+  "scripts": {
+    "e2e": "../../scripts/e2e/up.sh && playwright test; rc=$?; ../../scripts/e2e/down.sh; exit $rc",
+    "e2e:up": "../../scripts/e2e/up.sh",
+    "e2e:down": "../../scripts/e2e/down.sh",
+    "e2e:ui": "playwright test --ui",
+    "e2e:install": "playwright install chromium",
+    "e2e:report": "playwright show-report"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.63.0",
+    "@types/jsonwebtoken": "^9.0.10",
+    "@types/node": "^22.20.2",
+    "@types/pg": "^8.23.1",
+    "jsonwebtoken": "^9.0.3",
+    "pg": "^8.23.0",
+    "typescript": "^7.0.2"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

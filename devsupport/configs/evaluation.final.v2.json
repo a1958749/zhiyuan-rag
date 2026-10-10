@@ -1,0 +1,109 @@
+{
+  "assessment_protocol": {
+    "decision_label_protocol": "explicit_coverage",
+    "generation_methods": [
+      "B0",
+      "H1",
+      "H0"
+    ],
+    "human_ratings": 0,
+    "output_tokens": 8192
+  },
+  "budget_start": "devsupport/reports/budget-current-gateway.json",
+  "contextual_index": "devsupport/indexes/contextual",
+  "controls": "devsupport/evaluation/control-cases.json",
+  "corpus": "devsupport/data/corpus.parquet",
+  "dev_ids": [
+    "76184540",
+    "76404464",
+    "76447153",
+    "76482024",
+    "76482987",
+    "76574260",
+    "76621589",
+    "77018045",
+    "77082429",
+    "77124499",
+    "77231728",
+    "77365175"
+  ],
+  "final_method_aliases": {
+    "Full": "H0",
+    "FullMinusHybridBranch": "B0"
+  },
+  "generation_max_tokens": 2048,
+  "gpu_url": "http://127.0.0.1:8093",
+  "index": "devsupport/indexes/raw",
+  "native_u_index": "indexes/devsupport-native-u",
+  "profiles": {
+    "B0": {
+      "adaptive": "never",
+      "gate_enabled": false,
+      "retrieval": "B0"
+    },
+    "B1": {
+      "adaptive": "never",
+      "gate_enabled": false,
+      "retrieval": "B1"
+    },
+    "C": {
+      "adaptive": "never",
+      "gate_enabled": false,
+      "retrieval": "C"
+    },
+    "G": {
+      "adaptive": "never",
+      "gate_enabled": true,
+      "retrieval": "H0"
+    },
+    "H0": {
+      "adaptive": "never",
+      "gate_enabled": false,
+      "retrieval": "H0"
+    },
+    "H1": {
+      "adaptive": "never",
+      "gate_enabled": false,
+      "retrieval": "H1"
+    },
+    "Q": {
+      "adaptive": "selective",
+      "gate_enabled": false,
+      "retrieval": "H0"
+    },
+    "QAlways": {
+      "adaptive": "always",
+      "gate_enabled": false,
+      "retrieval": "H0"
+    },
+    "QG": {
+      "adaptive": "selective",
+      "gate_enabled": true,
+      "retrieval": "H0"
+    },
+    "R1": {
+      "adaptive": "never",
+      "gate_enabled": false,
+      "reranker": "R1",
+      "retrieval": "H1"
+    },
+    "R2": {
+      "adaptive": "never",
+      "gate_enabled": false,
+      "reranker": "R2",
+      "retrieval": "H1"
+    },
+    "U": {
+      "adaptive": "never",
+      "gate_enabled": false,
+      "retrieval": "U"
+    }
+  },
+  "provider": "devsupport/configs/provider.json",
+  "queries": "devsupport/data/queries.parquet",
+  "seeds": [
+    20261008
+  ],
+  "selection_source": "devsupport/reports/final-dev-selection-v1.json",
+  "split": "devsupport/reports/split.json"
+}

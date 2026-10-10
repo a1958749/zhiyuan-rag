@@ -1,0 +1,313 @@
+import { type ReactNode, useEffect, useRef, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { useDispatch, useSelector } from 'react-redux';
+
+import userService from '../api/services/userService';
+import { LoadingState } from '@/components/ui/loading-state';
+import { Alert, AlertDescription } from '../components/ui/alert';
+import { Button } from '../components/ui/button';
+import { Modal, ModalActions } from '../components/ui/modal';
+import { Progress } from '../components/ui/progress';
+import { ActiveState, Doc } from '../models/misc';
+import { selectToken } from '../preferences/preferenceSlice';
+import type { AppDispatch, RootState } from '../store';
+import { formatCount } from '../utils/dateTimeUtils';
+
+import { clearGraphBuild, selectGraphBuilds } from './graphBuildSlice';
+import {
+  GraphRAGSummary,
+  estimateGraphTokens,
+  pollTaskOnce,
+  startGraphRAG,
+} from './graphragEnableUtils';
+
+const POLL_INTERVAL_MS = 2000;
+// Fallback poll backstop. SSE (graphBuildSlice) is the primary driver; the poll
+// only covers SSE-off deployments. Bounded so a dead/stuck backend can't spin
+// forever (consecutive transient errors), with a hard attempt cap on top.
+const MAX_POLL_ATTEMPTS = 150;
+const MAX_CONSECUTIVE_ERRORS = 5;
+
+const ZERO_SUMMARY: GraphRAGSummary = {
+  nodes: 0,
+  edges: 0,
+  chunksProcessed: 0,
+  skippedOverCap: 0,
+  failedChunks: 0,
+};
+
+type Phase = 'confirm' | 'building' | 'summary' | 'error';
+
+interface EnableGraphRAGModalProps {
+  modalState: ActiveState;
+  setModalState: (state: ActiveState) => void;
+  document: Doc | null;
+  onEnabled: () => void;
+}
+
+export default function EnableGraphRAGModal({
+  modalState,
+  setModalState,
+  document,
+  onEnabled,
+}: EnableGraphRAGModalProps) {
+  const { t } = useTranslation();
+  const token = useSelector(selectToken);
+  const dispatch = useDispatch<AppDispatch>();
+
+  const sourceId = document?.id;
+  const build = useSelector((state: RootState) =>
+    sourceId ? selectGraphBuilds(state)[sourceId] : undefined,
+  );
+
+  const estimate = estimateGraphTokens(
+    Number(document?.tokens) || 0,
+    document?.config?.chunking?.max_tokens,
+  );
+
+  const [phase, setPhase] = useState<Phase>('confirm');
+  const [error, setError] = useState<string | null>(null);
+  const [summary, setSummary] = useState<GraphRAGSummary | null>(null);
+  const pollTimer = useRef<number | null>(null);
+  const isActiveRef = useRef(true);
+  // Guards against the SSE path and the poll fallback both resolving.
+  const resolvedRef = useRef(false);
+
+  const clearPoll = () => {
+    if (pollTimer.current !== null) {
+      window.clearTimeout(pollTimer.current);
+      pollTimer.current = null;
+    }
+  };
+
+  const stopPolling = () => {
+    isActiveRef.current = false;
+    clearPoll();
+  };
+
+  useEffect(() => {
+    if (modalState === 'ACTIVE') {
+      isActiveRef.current = true;
+      resolvedRef.current = false;
+      setPhase('confirm');
+      setError(null);
+      setSummary(null);
+    }
+    return stopPolling;
+  }, [modalState, document]);
+
+  const closeModal = () => {
+    stopPolling();
+    setModalState('INACTIVE');
+  };
+
+  const succeed = (result: GraphRAGSummary) => {
+    if (resolvedRef.current) return;
+    resolvedRef.current = true;
+    clearPoll();
+    setSummary(result);
+    setPhase('summary');
+  };
+
+  const fail = (message?: string) => {
+    if (resolvedRef.current) return;
+    resolvedRef.current = true;
+    clearPoll();
+    setError(message ?? t('settings.sources.graphrag.enable.errors.generic'));
+    setPhase('error');
+  };
+
+  // Primary resolution path: the build's terminal SSE event lands in the slice.
+  useEffect(() => {
+    if (phase !== 'building' || !build) return;
+    if (build.status === 'completed') succeed(build.summary ?? ZERO_SUMMARY);
+    else if (build.status === 'failed') fail(build.error);
+  }, [build, phase]);
+
+  // Fallback poll: bounded so it can't loop forever on a dead/stuck backend.
+  const poll = (taskId: string, attempt: number, consecutiveErrors: number) => {
+    if (attempt > MAX_POLL_ATTEMPTS) return; // SSE may still resolve
+    pollTaskOnce(userService, taskId, token)
+      .then((result) => {
+        if (!isActiveRef.current || resolvedRef.current) return;
+        if (result.status === 'done') {
+          succeed(result.summary);
+          return;
+        }
+        if (result.status === 'failed') {
+          fail(result.message);
+          return;
+        }
+        if (result.status === 'error') {
+          if (consecutiveErrors + 1 >= MAX_CONSECUTIVE_ERRORS) {
+            fail();
+            return;
+          }
+          pollTimer.current = window.setTimeout(
+            () => poll(taskId, attempt + 1, consecutiveErrors + 1),
+            POLL_INTERVAL_MS,
+          );
+          return;
+        }
+        // pending — reset the error streak and keep polling.
+        pollTimer.current = window.setTimeout(
+          () => poll(taskId, attempt + 1, 0),
+          POLL_INTERVAL_MS,
+        );
+      })
+      .catch(() => {
+        if (!isActiveRef.current || resolvedRef.current) return;
+        fail();
+      });
+  };
+
+  const handleEnable = async () => {
+    if (!sourceId) return;
+    resolvedRef.current = false;
+    // Reset any prior build record so this build's progress events flow.
+    dispatch(clearGraphBuild(sourceId));
+    setPhase('building');
+    setError(null);
+    setSummary(null);
+    const start = await startGraphRAG(userService, sourceId, token);
+    if (!isActiveRef.current) return;
+    if (start.status === 'enabled') {
+      onEnabled();
+      succeed(ZERO_SUMMARY);
+      return;
+    }
+    if (start.status === 'task') {
+      onEnabled();
+      poll(start.taskId, 0, 0);
+      return;
+    }
+    if (start.status === 'forbidden') {
+      fail(t('settings.sources.graphrag.enable.errors.forbidden'));
+      return;
+    }
+    if (start.status === 'conflict') {
+      fail(
+        start.message ?? t('settings.sources.graphrag.enable.errors.conflict'),
+      );
+      return;
+    }
+    fail(start.message);
+  };
+
+  const progressPct =
+    build && build.status === 'building' && build.total > 0
+      ? Math.min(100, Math.round((build.current / build.total) * 100))
+      : null;
+
+  let footer: ReactNode = null;
+  if (phase === 'confirm') {
+    footer = (
+      <ModalActions
+        cancelLabel={t('cancel')}
+        onCancel={closeModal}
+        submitLabel={t('settings.sources.graphrag.enable.confirm')}
+        onSubmit={handleEnable}
+      />
+    );
+  } else if (phase === 'summary' && summary) {
+    footer = (
+      <Button type="button" onClick={closeModal} size="lg" shape="pill">
+        {t('settings.sources.graphrag.enable.done')}
+      </Button>
+    );
+  } else if (phase === 'error') {
+    footer = (
+      <Button
+        type="button"
+        variant="ghost"
+        onClick={closeModal}
+        size="lg"
+        shape="pill"
+      >
+        {t('cancel')}
+      </Button>
+    );
+  }
+
+  return (
+    <Modal
+      open={modalState === 'ACTIVE'}
+      onOpenChange={(o) => !o && closeModal()}
+      title={t('settings.sources.graphrag.enable.title')}
+      description={
+        phase === 'confirm'
+          ? document?.name
+            ? t('settings.sources.graphrag.enable.intro', {
+                name: document.name,
+              })
+            : t('settings.sources.graphrag.enable.introGeneric')
+          : undefined
+      }
+      footer={footer}
+      mobileVariant="dialog"
+      isPerformingTask={phase === 'building'}
+    >
+      <div className="flex flex-col gap-5">
+        {phase === 'confirm' && (
+          <>
+            <ul className="text-muted-foreground list-disc space-y-1.5 pl-5 text-sm">
+              <li>{t('settings.sources.graphrag.enable.costExtraction')}</li>
+              <li>{t('settings.sources.graphrag.enable.costCost')}</li>
+            </ul>
+            <Alert variant="info" role="note">
+              <AlertDescription>
+                {t('settings.sources.graphrag.enable.estimate', {
+                  lo: formatCount(estimate.lo),
+                  hi: formatCount(estimate.hi),
+                })}
+              </AlertDescription>
+            </Alert>
+          </>
+        )}
+
+        {phase === 'building' &&
+          (progressPct === null ? (
+            <LoadingState
+              fill="block"
+              label={t('settings.sources.graphrag.enable.inProgress')}
+            />
+          ) : (
+            // The bar sits under the caption, so the block's py-10 moves to
+            // this wrapper and the ring only centres itself.
+            <div className="flex flex-col items-center gap-3 py-10">
+              <LoadingState
+                label={t('settings.sources.graphrag.enable.inProgressPct', {
+                  pct: progressPct,
+                })}
+              />
+              <Progress size="sm" value={progressPct} className="w-48" />
+            </div>
+          ))}
+
+        {phase === 'summary' && summary && (
+          <Alert variant="success">
+            <AlertDescription>
+              {[
+                t('settings.sources.graphrag.enable.summaryNodes', {
+                  count: summary.nodes,
+                }),
+                t('settings.sources.graphrag.enable.summaryEdges', {
+                  count: summary.edges,
+                }),
+                t('settings.sources.graphrag.enable.summaryChunks', {
+                  count: summary.chunksProcessed,
+                }),
+              ].join(' · ')}
+            </AlertDescription>
+          </Alert>
+        )}
+
+        {phase === 'error' && (
+          <Alert variant="destructive">
+            <AlertDescription>{error}</AlertDescription>
+          </Alert>
+        )}
+      </div>
+    </Modal>
+  );
+}

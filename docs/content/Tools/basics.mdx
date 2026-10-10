@@ -1,0 +1,156 @@
+---
+title: Tools Basics
+description: Understand what DocsGPT Tools are, how they work, and explore the built-in tools available to extend DocsGPT's functionality.
+lastUpdated: 2026-10-04
+---
+
+import { Callout } from 'nextra/components';
+import Image from 'next/image';
+import { ToolCards } from '../../components/ToolCards';
+
+# Tools Basics
+
+DocsGPT Tools are powerful extensions that significantly enhance the capabilities of your DocsGPT application. 
+They allow DocsGPT to move beyond its core function of retrieving information from your documents and enable it to perform actions, 
+interact with external data sources, and integrate with other services. You can find and configure available tools within 
+the "Tools" section of the DocsGPT application settings in the user interface.
+
+## What are Tools?
+
+-   **Purpose:** The primary purpose of Tools is to bridge the gap between understanding a user's request (natural language processing by the LLM) and executing a tangible action. This could involve fetching live data from the web, sending notifications, running code snippets, querying databases, or interacting with third-party APIs.
+
+-   **LLM as an Orchestrator:** The Large Language Model (LLM) at the heart of DocsGPT is designed to act as an intelligent orchestrator. Based on your query and the declared capabilities of the available tools (defined in their metadata), the LLM decides if a tool is needed, which tool to use, and what parameters to pass to it.
+
+-   **Action-Oriented Interactions:** Tools enable more dynamic and action-oriented interactions. For example:
+    * *"What's the latest news on renewable energy?"* - This might trigger a web search tool to fetch current articles.
+    * *"Fetch the order status for customer ID 12345 from our database."* - This could use a database tool.
+    * *"Summarize the content of this webpage and send the summary to the #general channel on Telegram."* - This might involve a web scraping tool followed by a Telegram notification tool.
+
+## Overview of Built-in Tools
+
+DocsGPT includes a suite of pre-built tools designed to expand its capabilities out-of-the-box. Below is an overview of the currently available tools. 
+
+<ToolCards
+  items={[
+    {
+      title: 'API Tool',
+      link: '/Tools/api-tool',
+      description: 'A highly flexible tool that allows DocsGPT to interact with virtually any API without needing to write custom Python code.'
+    },
+    {
+      title: 'Brave Search',
+      link: 'https://github.com/arc53/DocsGPT/blob/main/docsgpt/agents/tools/brave.py',
+      description: 'Enables DocsGPT to perform real-time web and image searches using the Brave Search API. Requires an API key.'
+    },
+    {
+      title: 'DuckDuckGo Search',
+      link: 'https://github.com/arc53/DocsGPT/blob/main/docsgpt/agents/tools/duckduckgo.py',
+      description: 'Performs web and image searches using DuckDuckGo. No API key required.'
+    },
+    {
+      title: 'CryptoPrice',
+      link: 'https://github.com/arc53/DocsGPT/blob/main/docsgpt/agents/tools/cryptoprice.py',
+      description: 'Fetches the current price of specified cryptocurrencies using the CryptoCompare public API.'
+    },
+    {
+      title: 'Ntfy',
+      link: 'https://github.com/arc53/DocsGPT/blob/main/docsgpt/agents/tools/ntfy.py',
+      description: 'Allows DocsGPT to send push notifications to ntfy topics on a specified server, ideal for alerts and updates.'
+    },
+    {
+      title: 'Telegram Bot',
+      link: 'https://github.com/arc53/DocsGPT/blob/main/docsgpt/agents/tools/telegram.py',
+      description: 'Allows DocsGPT to send messages or images to Telegram chats via a Telegram Bot. Requires a bot token; an optional default chat ID sends every message to one chat.'
+    },
+    {
+      title: 'PostgreSQL Database',
+      link: 'https://github.com/arc53/DocsGPT/blob/main/docsgpt/agents/tools/postgres.py',
+      description: 'Connects to a PostgreSQL database to execute SQL queries and retrieve schema information.'
+    },
+    {
+      title: 'Read Webpage (browser)',
+      link: 'https://github.com/arc53/DocsGPT/blob/main/docsgpt/agents/tools/read_webpage.py',
+      description: 'Fetches the HTML content of a URL and converts it to Markdown for the agent to read.'
+    },
+    {
+      title: 'Remote Device',
+      link: '/Tools/remote-device',
+      description: 'Runs shell commands on a paired remote machine through the docsgpt-cli host. See the Remote Device guide.'
+    },
+    {
+      title: 'MCP Tool',
+      link: '/Tools/mcp-tools',
+      description: 'Connects to remote Model Context Protocol (MCP) servers to access their dynamic tools and resources.'
+    },
+    {
+      title: 'Memory',
+      link: 'https://github.com/arc53/DocsGPT/blob/main/docsgpt/agents/tools/memory.py',
+      description: 'Stores and retrieves information across conversations through a per-user memory file directory.'
+    },
+    {
+      title: 'Notepad',
+      link: 'https://github.com/arc53/DocsGPT/blob/main/docsgpt/agents/tools/notes.py',
+      description: 'A single editable note. Supports viewing, overwriting, string replacement, inserting lines and deleting the note.'
+    },
+    {
+      title: 'Todo List',
+      link: 'https://github.com/arc53/DocsGPT/blob/main/docsgpt/agents/tools/todo_list.py',
+      description: 'Manages todo items — creating, viewing, updating, and deleting todos.'
+    },
+    {
+      title: 'Code Executor',
+      link: '/Tools/artifacts-and-code-execution',
+      description: 'Runs Python in a sandboxed session and saves the files it writes as downloadable artifacts. Needs a code execution sandbox.'
+    },
+    {
+      title: 'Artifact',
+      link: '/Tools/artifacts-and-code-execution',
+      description: 'Creates and edits slide decks, Word documents, spreadsheets, PDFs and HTML pages as versioned artifacts. Needs a code execution sandbox.'
+    }
+  ]}
+/>
+
+Code Executor and Artifact run code in a sandbox that you set up first; see [Code Execution Sandbox](/Deploying/Sandbox).
+
+Some built-in tools aren't in the catalog because DocsGPT attaches them itself:
+
+- **Scheduler** lets the assistant schedule a task to run later. It is one of the default chat tools below, and you can also enable it per agent in the agent's tool picker. Scheduled and webhook runs never get it.
+- **Read Document** parses an uploaded or produced file into text or structured data. It is offered only in workflow nodes; see [Artifacts and Code Execution](/Tools/artifacts-and-code-execution#read-document).
+- **Wiki** reads and edits a wiki source. It is attached automatically to a chat or agent that uses a wiki source you can edit; see [Wiki Sources](/Sources/Wiki-sources).
+
+## Default Chat Tools
+
+In a regular chat (no custom agent), DocsGPT can enable a small set of tools automatically so the assistant is useful out of the box. These are the **default chat tools**, controlled by the `DEFAULT_CHAT_TOOLS` setting:
+
+```env
+DEFAULT_CHAT_TOOLS=["memory","read_webpage","scheduler"]
+```
+
+- Default tools are config-free and run with synthetic, deterministic tool IDs (no manual setup needed).
+- Each user can opt out of individual default tools from their settings; the disabled list is stored per user.
+- Some default tools are excluded from **headless runs** (scheduled tasks and webhook triggers). For example, `scheduler` is skipped in those runs to prevent a scheduled task from chaining new schedules on every fire.
+
+To change the defaults for the whole instance, set `DEFAULT_CHAT_TOOLS` to a JSON list of tool names, as above. Comma-separated names (`memory,read_webpage`) are accepted too. To turn the default tools off, set `DEFAULT_CHAT_TOOLS=none` (or `[]`); an empty value keeps the shipped defaults. See the [Settings Reference](/Deploying/Settings-Reference#default_chat_tools) for the full entry.
+
+## Using Tools in DocsGPT (User Perspective)
+
+Interacting with tools in DocsGPT is designed to be intuitive:
+
+1.  **Natural Language Interaction:** As a user, you typically interact with DocsGPT using natural language queries or commands. The LLM within DocsGPT analyzes your input to determine if a specific task can or should be handled by one of the available and configured tools.
+
+2.  **Configuration in UI:**
+    * Tools are generally managed and configured within the DocsGPT application's settings, found under a "Tools" section in the GUI.
+    * Tools for external services (Brave Search, Telegram, ntfy, PostgreSQL, MCP servers, GitHub, and preset MCP services for Notion, Linear, Jira & Confluence, Sentry, Stripe and Resend) are set up from **Settings > Connectors**. You connect the service once; its credentials stay encrypted on the server and never reach the browser, and the tools it provides are grouped under that connection. Each action is marked **Read** or **Write** and can be set to **Always allow**, **Needs approval** or **Off**. See [Connectors](/Sources/Connectors).
+    * When a tool's connection is missing or expired, the chat shows a **Connect** prompt and continues once you connect.
+
+3.  **Prompt Engineering for Tools:** While the LLM aims to intelligently use tools, for more complex or reliable agent-like behaviors, you might need to customize the system prompts. Modifying the prompt can guide the LLM on when and how to prioritize or chain tools to achieve specific outcomes, especially if you're building an agent designed to perform a certain sequence of actions every time. For more on this, see [Prompts](/Agents/prompts).
+
+## Advancing with Tools
+
+Understanding the basics of DocsGPT Tools opens up many possibilities:
+
+* **Leverage the API Tool:** For quick integrations with numerous external services, explore the [API Tool Detailed Guide](/Tools/api-tool).
+* **Develop Custom Tools:** If you have specific needs not covered by built-in tools or the generic API tool, you can develop your own. See [Developing Custom Tools](/Tools/creating-a-tool).
+* **Build AI Agents:** Tools are the fundamental building blocks for creating sophisticated AI agents within DocsGPT. See [Agents Basics](/Agents/basics) for how to combine them in an agent.
+
+By harnessing the power of Tools, you can transform DocsGPT into a more versatile and proactive assistant tailored to your unique workflows.

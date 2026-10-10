@@ -1,0 +1,79 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Frontend (npm)",
+      "type": "node-terminal",
+      "request": "launch",
+      "command": "npm run dev",
+      "cwd": "${workspaceFolder}/frontend"
+    },
+    {
+      "name": "API (uvicorn)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "uvicorn",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}"
+      },
+      "args": [
+        "docsgpt.asgi:asgi_app",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "7091"
+      ],
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "name": "Celery worker",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "celery",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}"
+      },
+      "args": [
+        "-A",
+        "docsgpt.app.celery",
+        "worker",
+        "-l",
+        "INFO",
+        "-B",
+        "--pool=solo"
+      ],
+      "windows": {
+        "args": [
+          "-A",
+          "docsgpt.app.celery",
+          "worker",
+          "-l",
+          "INFO",
+          "--pool=solo"
+        ]
+      },
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "name": "Dev services (Postgres + Redis)",
+      "type": "node-terminal",
+      "request": "launch",
+      "command": "docker compose -f deployment/docker-compose-dev.yaml up",
+      "cwd": "${workspaceFolder}"
+    }
+  ],
+  "compounds": [
+    {
+      "name": "DocsGPT: Full Stack",
+      "configurations": [
+        "Frontend (npm)",
+        "API (uvicorn)",
+        "Celery worker"
+      ],
+      "presentation": {
+        "group": "DocsGPT",
+        "order": 1
+      }
+    }
+  ]
+}

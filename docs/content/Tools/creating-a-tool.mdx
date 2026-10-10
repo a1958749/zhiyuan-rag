@@ -1,0 +1,219 @@
+---
+title: Creating a Custom Tool
+description: Learn how to create custom Python tools to extend DocsGPT's functionality and integrate with various services or perform specific actions.
+lastUpdated: 2026-09-30
+---
+
+import { Callout } from 'nextra/components';
+import { Steps } from 'nextra/components';
+
+# Creating a Custom Tool
+
+This guide provides developers with a comprehensive, step-by-step approach to creating their own custom tools for DocsGPT. By developing custom tools, you can significantly extend DocsGPT's capabilities, enabling it to interact with new data sources, services, and perform specialized actions tailored to your unique needs.
+
+## Introduction to Custom Tool Development
+
+### Why Create Custom Tools?
+
+While DocsGPT offers a range of built-in tools and a versatile API Tool, there are many scenarios where a custom Python tool is the best solution:
+
+* **Integrating with Proprietary Systems:** Connect to internal APIs, databases, or services that are not publicly accessible or require complex authentication. The API Tool and MCP servers refuse private and loopback addresses ([Outbound network access](/Deploying/Security#outbound-network-access)); code in a custom tool is not bound by that check.
+* **Adding Domain-Specific Functionalities:** Implement logic specific to your industry or use case that isn't covered by general-purpose tools.
+* **Automating Unique Workflows:** Create tools that orchestrate multiple steps or interact with systems in a way unique to your operational needs.
+* **Connecting to Any System with an Accessible Interface:** If you can interact with a system programmatically using Python (e.g., through libraries, SDKs, or direct HTTP requests), you can likely build a DocsGPT tool for it.
+* **Complex Logic or Data Transformation:** When API interactions require intricate logic before sending a request or after receiving a response, or when data needs significant transformation that is difficult for an LLM to handle directly.
+
+### Prerequisites
+
+Before you begin, ensure you have:
+
+* A solid understanding of Python programming.
+* Familiarity with the DocsGPT project structure, particularly the `docsgpt/agents/tools/` directory where custom tools reside.
+* Basic knowledge of how APIs work, as many tools involve interacting with external or internal APIs.
+* Your DocsGPT development environment set up. If not, please refer to the [Setting Up a Development Environment](/Deploying/Development-Environment) guide.
+
+## The Anatomy of a DocsGPT Tool
+
+Custom tools in DocsGPT are Python classes that inherit from a base `Tool` class and implement specific methods to define their behavior, capabilities, and configuration needs.
+
+The **foundation** for all custom tools is the abstract base class, located in `docsgpt/agents/tools/base.py`. Your custom tool class **must** inherit from this class.
+
+### Class docstring (required)
+
+Give the class a docstring. Its first line is the name shown in the Add Tool catalog, and the rest is the description shown under it:
+
+```python
+class BraveSearchTool(Tool):
+    """
+    Brave Search
+    A tool for performing web and image searches using the Brave Search API.
+    Requires an API key for authentication.
+    """
+```
+
+A tool without a docstring is listed under its key (the module filename) with no description.
+
+### Essential Methods to Implement
+
+Your custom tool class needs to implement the following methods:
+
+1. **`__init__(self, config: dict)`**
+    
+    - **Purpose:** The constructor for your tool. It's called when DocsGPT initializes the tool.
+    - **Usage:** Store the tool-specific values passed in the `config` dictionary, such as API keys, base URLs or connection strings. They come from the tool instance a user adds in the UI (see [Configuration & Secrets Management](#configuration--secrets-management)), not from environment variables or config files.
+    - **Accept an empty dict.** DocsGPT builds every tool with `config={}` to read its catalog entry and action metadata, so read values with `config.get(...)` and don't raise when a key is missing. A constructor that requires a key breaks tool loading.
+    - **Example** (`brave.py`)**:**
+        ``` python
+        class BraveSearchTool(Tool):
+            def __init__(self, config):
+                self.config = config
+                self.token = config.get("token", "") # API Key for Brave Search
+                self.base_url = "https://api.search.brave.com/res/v1"
+        ```
+
+2. **`execute_action(self, action_name: str, **kwargs) -> dict`**
+    
+    - **Purpose:** This is the workhorse of your tool. The LLM, acting as an agent, calls this method when it decides to use one of the actions your tool provides.
+    - **Parameters:**
+        - `action_name` (str): A string specifying which of the tool's actions to run (e.g., "brave_web_search").
+        - `**kwargs` (dict): A dictionary containing the parameters for that specific action. These parameters are defined in the tool's metadata (`get_actions_metadata()`) and are extracted or inferred by the LLM from the user's query.
+    - **Return Value:** A dictionary containing the result of the action. It's good practice to include keys like:
+        - `status_code` (int): An HTTP-like status code (e.g., 200 for success, 500 for error).
+        - `message` (str): A human-readable message describing the outcome.
+        - `data` (any): The actual data payload returned by the action (if applicable).
+        - `error` (str): An error message if the action failed.
+    - **Example (`read_webpage.py`):**
+        
+        ``` python
+        def execute_action(self, action_name: str, **kwargs) -> str:
+            if action_name != "read_webpage":
+                return f"Error: Unknown action '{action_name}'. This tool only supports 'read_webpage'."
+        
+            url = kwargs.get("url")
+            if not url:
+                return "Error: URL parameter is missing."
+            # ... (logic to fetch and parse webpage) ...
+            try:
+                # ...
+                return markdown_content 
+            except Exception as e:
+                return f"Error processing URL {url}: {e}"
+        ```
+        
+        A more structured return:
+        
+        ``` python
+        # ... inside execute_action
+        try:
+            # ... logic ...
+            return {"status_code": 200, "message": "Webpage read successfully", "data": markdown_content}
+        except Exception as e:
+            return {"status_code": 500, "message": f"Error processing URL {url}", "error": str(e)}
+        ```
+        
+3. **`get_actions_metadata(self) -> list`**
+    
+    - **Purpose:** This method is **critical** for the LLM to understand what your tool can do, when to use it, and what parameters it needs. It effectively advertises your tool's capabilities.
+    - **Return Value:** A list of dictionaries. Each dictionary describes one distinct action the tool can perform and must follow a specific JSON schema structure.
+        - `name` (str): A unique and descriptive name for the action (e.g., `mytool_get_user_details`). It's a common convention to prefix with the tool name to avoid collisions.
+        - `description` (str): A clear, concise, and unambiguous description of what the action does. **Write this for the LLM.** The LLM uses this description to decide if this action is appropriate for a given user query.
+        - `parameters` (dict): A JSON Schema object defining the parameters that the action expects. This schema tells the LLM what arguments are needed, their types, and which are required.
+            - `type`: Should always be `"object"`.
+            - `properties`: A dictionary where each key is a parameter name, and the value is an object defining its `type` (e.g., "string", "integer", "boolean") and `description`.
+            - `required`: A list of strings, where each string is the name of a parameter that is mandatory for the action.
+    - **Example (`postgres.py` - partial):**
+        
+        ``` python
+        def get_actions_metadata(self):
+            return [
+                {
+                    "name": "postgres_execute_sql",
+                    "description": "Execute an SQL query against the PostgreSQL database...",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "sql_query": {
+                                "type": "string",
+                                "description": "The SQL query to execute.",
+                            },
+                        },
+                        "required": ["sql_query"],
+                        "additionalProperties": False, # Good practice to prevent unexpected params
+                    },
+                },
+                # ... other actions like postgres_get_schema
+            ]
+        ```
+        
+4. **`get_config_requirements(self) -> dict`**
+    
+    - **Purpose:** Defines the configuration parameters that your tool needs to function (e.g., API keys, specific base URLs, connection strings, default settings). The DocsGPT UI renders the tool's configuration form from it, and the API validates submitted values against it. Return `{}` if the tool needs no configuration.
+    - **Return Value:** A dictionary where keys are the configuration item names (which will be keys in the `config` dict passed to `__init__`) and values are dictionaries describing each field:
+        - `type` (str): `"string"` or `"number"`. A number field renders a numeric input and must be a positive number.
+        - `label` (str): The form label, also used in validation messages. Defaults to the key.
+        - `description` (str): A human-readable description of what this configuration item is for.
+        - `required` (bool, optional): The form and the API refuse to save the tool without a value.
+        - `secret` (bool, optional): The value is sensitive (an API key, a password). The form masks it, and it is stored encrypted and never sent back to the browser. Defaults to `False`.
+        - `order` (int, optional): Sort position in the form. Fields without one go last.
+        - `enum` (list of str, optional): Renders a select with these choices, and the API rejects any other value.
+        - `default` (optional): The value used when the user leaves the field empty.
+        - `depends_on` (dict, optional): Show and validate this field only when other fields hold the given values, for example `{"auth_type": "api_key"}`.
+    - **Example (`brave.py`):**
+        
+        ``` python
+        def get_config_requirements(self):
+            return {
+                "token": {  # This 'token' will be a key in the config dict for __init__
+                    "type": "string",
+                    "label": "API Key",
+                    "description": "Brave Search API key for authentication",
+                    "required": True,
+                    "secret": True,
+                    "order": 1,
+                },
+            }
+        ```
+
+        `mcp_tool.py` shows `enum`, `default` and `depends_on` together (an authentication type select that reveals the matching credential fields).
+
+## Tool Registration and Discovery
+
+DocsGPT's ToolManager (located in docsgpt/agents/tools/tool_manager.py) automatically discovers and loads tools.
+
+As long as your custom tool:
+
+1. Is placed in a Python file within the `docsgpt/agents/tools/` directory (and the filename is not `base.py` or starts with `__`).
+2. Correctly inherits from the `Tool` base class.
+3. Implements all the abstract methods (`execute_action`, `get_actions_metadata`, `get_config_requirements`).
+
+The `ToolManager` loads it when DocsGPT starts, so restart the API and the Celery worker after adding or changing a tool. A few more rules decide how it is registered:
+
+- **The module filename is the tool's key.** A tool in `docsgpt/agents/tools/weather.py` is stored as `weather` in each user's tool rows, and renaming the file orphans the tools users already added. Put one `Tool` subclass in each module.
+- **`internal = True` hides a tool from the catalog.** Set it as a class attribute for a tool that DocsGPT attaches itself rather than one users add (the built-in Scheduler, Read Document and Wiki tools do this).
+- **Tools that need the calling user's id are listed by name.** `ToolManager` passes `user_id` as a second constructor argument only to the modules named in the two sets in `tool_manager.py` (`load_tool` and `execute_action`), such as `memory`, `notes` and `todo_list`. If your tool stores data per user, add its module name to both sets and accept `def __init__(self, config, user_id=None)`.
+- **Mark read-only actions.** Each action is treated as a read or a write. The approval and permission checks use this, and so does the rule that refuses a write on the owner's stored credentials when the caller is an agent API key, a widget or a public link. Set `"access": "read"` or `"access": "write"` on an action's metadata to decide it. Without it, an action is a read only when its name contains a read verb (`get`, `list`, `search`, `query`, `find`, `read`, `fetch`, `lookup`, `describe`, `retrieve`) and no write verb, and otherwise a write.
+
+## Configuration & Secrets Management
+
+- **Configuration Source:** The `config` dictionary comes from the tool instance a user adds in the DocsGPT UI, which is stored as that user's tool row. Its keys are the names you define in `get_config_requirements()`. Nothing reads tool configuration from environment variables or config files, and each user who adds the tool supplies their own values. At run time DocsGPT also adds keys of its own (such as `tool_id`), so ignore keys you don't use.
+- **Secrets:** Never hardcode secrets (like API keys or passwords) directly into your tool's Python code. Define them as configuration fields with `"secret": True`. DocsGPT encrypts those values with a key bound to the tool's owner, keeps them out of API responses, and decrypts them into `config` only when the tool runs.
+
+## Best Practices for Tool Development
+
+- **Atomicity:** Design tool actions to be as atomic (single, well-defined purpose) as possible. This makes them easier for the LLM to understand and combine.
+- **Clarity in Metadata:** Ensure action names and descriptions in `get_actions_metadata()` are extremely clear, specific, and unambiguous. This is the primary way the LLM understands your tool.
+- **Robust Error Handling:** Implement comprehensive error handling within your `execute_action` logic (and the private methods it calls). Return informative error messages in the result dictionary so the LLM or user can understand what went wrong.
+- **Security:**
+    - Be mindful of the security implications of your tool, especially if it interacts with sensitive systems or can execute arbitrary code/queries.
+    - Validate and sanitize any inputs, especially if they are used to construct database queries or shell commands, to prevent injection attacks.
+- **Performance:** Consider the performance implications of your tool's actions. If an action is slow, it will impact the user experience. Optimize where possible.
+
+## (Optional) Contributing Your Tool
+
+If you develop a custom tool that you believe could be valuable to the broader DocsGPT community and is general-purpose:
+
+1. Ensure it's well-documented (both in code and with clear metadata).
+2. Make sure it adheres to the best practices outlined above.
+3. Consider opening a Pull Request to the [DocsGPT GitHub repository](https://github.com/arc53/DocsGPT) with your new tool, including any necessary documentation updates.
+
+By following this guide, you can create powerful custom tools that extend DocsGPT's capabilities to your specific operational environment.

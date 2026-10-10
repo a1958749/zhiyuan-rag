@@ -1,0 +1,326 @@
+"""Smoke tests for docsgpt/asgi.py.
+
+The goal isn't to re-test Flask or FastMCP internals — it's to catch
+regressions in the wiring: mounts resolve, CORS headers emit, lifespan
+runs (without it, the /mcp session manager raises "Task group is not
+initialized"), routing to ``/`` vs ``/mcp`` doesn't cross paths.
+
+Uses ``starlette.testclient.TestClient`` because it boots the ASGI app
+end-to-end and handles the lifespan protocol automatically — ``httpx``
+alone does not run lifespan events, which would mask the exact kind of
+misconfiguration this test suite exists to catch.
+"""
+
+import pytest
+
+
+@pytest.mark.unit
+def test_asgi_app_imports():
+    from docsgpt.asgi import asgi_app
+
+    assert asgi_app is not None
+
+
+@pytest.mark.unit
+def test_flask_route_served_through_starlette_mount():
+    """GET /api/health should reach the Flask app via a2wsgi and return 200."""
+    from starlette.testclient import TestClient
+
+    from docsgpt.asgi import asgi_app
+
+    with TestClient(asgi_app) as client:
+        r = client.get("/api/health")
+    assert r.status_code == 200
+    assert r.json() == {"status": "ok"}
+
+
+@pytest.mark.unit
+def test_mcp_endpoint_mounted_and_lifespan_runs():
+    """/mcp must be reachable AND the FastMCP session manager must start.
+
+    Without ``lifespan=mcp_app.lifespan`` on the outer Starlette app,
+    every /mcp request raises ``RuntimeError: Task group is not
+    initialized``. Hitting the endpoint under a real lifespan-aware
+    client catches that.
+    """
+    from starlette.testclient import TestClient
+
+    from docsgpt.asgi import asgi_app
+
+    with TestClient(asgi_app) as client:
+        # Minimal MCP initialize request. Doesn't need to succeed — we
+        # just need a non-404, non-500-with-RuntimeError response to
+        # confirm the mount + lifespan are both wired.
+        r = client.post(
+            "/mcp/",
+            headers={
+                "Origin": "http://example.com",
+                "Content-Type": "application/json",
+                "Accept": "application/json, text/event-stream",
+            },
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {},
+                    "clientInfo": {"name": "pytest", "version": "0"},
+                },
+            },
+        )
+    assert r.status_code != 404, f"/mcp mount unreachable: {r.status_code}"
+    # A successful initialize returns 200 with a Mcp-Session-Id header.
+    assert r.status_code == 200
+    assert "mcp-session-id" in {k.lower() for k in r.headers.keys()}
+    assert r.headers.get("access-control-expose-headers") == "Mcp-Session-Id"
+
+
+@pytest.mark.unit
+def test_cors_headers_on_flask_route():
+    """CORS middleware should emit allow-origin on actual (non-preflight) requests.
+
+    ``allow_origins=["*"]`` → header value is literal ``*`` (not an echo).
+    """
+    from starlette.testclient import TestClient
+
+    from docsgpt.asgi import asgi_app
+
+    with TestClient(asgi_app) as client:
+        r = client.get("/api/health", headers={"Origin": "http://example.com"})
+    assert r.status_code == 200
+    assert r.headers.get("access-control-allow-origin") == "*"
+
+
+@pytest.mark.unit
+def test_cors_preflight_on_flask_route():
+    """OPTIONS preflight on a Flask route should be handled by Starlette CORSMiddleware."""
+    from starlette.testclient import TestClient
+
+    from docsgpt.asgi import asgi_app
+
+    with TestClient(asgi_app) as client:
+        r = client.options(
+            "/api/health",
+            headers={
+                "Origin": "http://example.com",
+                "Access-Control-Request-Method": "GET",
+                "Access-Control-Request-Headers": "Content-Type",
+            },
+        )
+    assert r.status_code in (200, 204)
+    assert r.headers.get("access-control-allow-origin") == "*"
+    assert "GET" in r.headers.get("access-control-allow-methods", "")
+
+
+@pytest.mark.unit
+def test_cors_preflight_allows_patch():
+    """PATCH must be in Access-Control-Allow-Methods. The frontend's
+    apiClient.patch() (used to edit BYOM custom models via PATCH
+    /api/user/models/<id>) is otherwise blocked at preflight by browsers."""
+    from starlette.testclient import TestClient
+
+    from docsgpt.asgi import asgi_app
+
+    with TestClient(asgi_app) as client:
+        r = client.options(
+            "/api/health",
+            headers={
+                "Origin": "http://example.com",
+                "Access-Control-Request-Method": "PATCH",
+                "Access-Control-Request-Headers": "Content-Type, Authorization",
+            },
+        )
+    assert r.status_code in (200, 204)
+    assert "PATCH" in r.headers.get("access-control-allow-methods", "")
+
+
+@pytest.mark.unit
+def test_cors_preflight_on_mcp_route():
+    """Browser clients hitting /mcp should be allowed to send session headers."""
+    from starlette.testclient import TestClient
+
+    from docsgpt.asgi import asgi_app
+
+    with TestClient(asgi_app) as client:
+        r = client.options(
+            "/mcp/",
+            headers={
+                "Origin": "http://example.com",
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": (
+                    "Authorization, Content-Type, Mcp-Session-Id"
+                ),
+            },
+        )
+    assert r.status_code in (200, 204)
+    assert r.headers.get("access-control-allow-origin") == "*"
+    assert "Mcp-Session-Id" in r.headers.get("access-control-allow-headers", "")
+
+
+@pytest.mark.unit
+def test_wsgi_threadpool_sized_from_settings():
+    """The Flask thread pool is the app's request-capacity ceiling —
+    it must be operator-tunable (prod incident 2026-07-05→07: 32 slots
+    exhausted by SSE holders starved all other requests)."""
+    from docsgpt import asgi
+    from docsgpt.core.settings import settings
+
+    assert asgi._WSGI_THREADPOOL == int(settings.WSGI_THREADPOOL_WORKERS)
+    assert asgi._WSGI_THREADPOOL >= 64
+
+
+_UUID = "67d65e8f-e7fb-4df1-9e6e-99ea6c830206"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "path, endpoint_name",
+    [
+        ("/api/events", "stream_events"),
+        ("/api/devices/sessions/st_abc/events", "device_session_events"),
+        (f"/api/artifacts/{_UUID}/download", "download_artifact"),
+        (f"/api/messages/{_UUID}/events", "stream_message_events"),
+    ],
+)
+def test_long_lived_routes_served_on_event_loop_not_flask(path, endpoint_name):
+    """Held-open GETs must resolve to a Starlette route ahead of the Flask
+    mount; otherwise each one pins a WSGI threadpool slot."""
+    from starlette.routing import Match
+
+    from docsgpt.asgi import asgi_app
+
+    scope = {
+        "type": "http",
+        "method": "GET",
+        "path": path,
+        "root_path": "",
+        "headers": [],
+        "query_string": b"",
+    }
+    for route in asgi_app.routes:
+        match, _ = route.matches(scope)
+        if match is Match.FULL:
+            endpoint = getattr(route, "endpoint", None)
+            assert endpoint is not None, f"{path} fell through to {route!r}"
+            assert endpoint.__name__ == endpoint_name
+            return
+    pytest.fail(f"no route matched {path}")
+
+
+@pytest.mark.unit
+def test_flask_no_longer_registers_moved_routes():
+    from docsgpt.app import app as flask_app
+
+    rules = {rule.rule for rule in flask_app.url_map.iter_rules()}
+    assert "/api/events" not in rules
+    assert "/api/devices/sessions/<session_id>/events" not in rules
+    assert "/api/artifacts/<artifact_id>/download" not in rules
+    # Their siblings stay on Flask.
+    assert "/api/devices/poll" in rules
+    assert "/api/artifacts/<artifact_id>" in rules
+
+
+@pytest.mark.unit
+def test_event_stream_served_through_full_asgi_stack(monkeypatch):
+    """Auth, CORS and the SSE route work together in the real app."""
+    from unittest.mock import AsyncMock
+
+    from starlette.testclient import TestClient
+
+    from docsgpt.asgi import asgi_app
+    from docsgpt.core.settings import settings
+
+    monkeypatch.setattr(settings, "AUTH_TYPE", None)
+    monkeypatch.setattr(
+        "docsgpt.api.events.routes.get_async_redis_instance", AsyncMock(return_value=None)
+    )
+    monkeypatch.setattr(
+        "docsgpt.streaming.async_broadcast_channel.get_async_redis_instance",
+        AsyncMock(return_value=None),
+    )
+    with TestClient(asgi_app) as client:
+        r = client.get("/api/events", headers={"Origin": "http://example.com"})
+    assert r.status_code == 200
+    assert r.headers["x-sse-transport"] == "async"
+    assert r.headers.get("access-control-allow-origin") == "*"
+    assert r.text.startswith(": connected")
+
+
+@pytest.mark.unit
+def test_artifact_download_served_through_full_asgi_stack():
+    from starlette.testclient import TestClient
+
+    from docsgpt.asgi import asgi_app
+
+    with TestClient(asgi_app) as client:
+        r = client.get("/api/artifacts/not-a-uuid/download")
+    assert r.status_code == 404
+    assert r.json() == {"success": False, "message": "Artifact not found"}
+
+
+_MCP_INITIALIZE = {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "initialize",
+    "params": {
+        "protocolVersion": "2025-03-26",
+        "capabilities": {},
+        "clientInfo": {"name": "pytest", "version": "0"},
+    },
+}
+_MCP_HEADERS = {
+    "Content-Type": "application/json",
+    "Accept": "application/json, text/event-stream",
+}
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("path", ["/mcp", "/mcp/"])
+def test_mcp_initialize_answers_with_and_without_trailing_slash(path):
+    """Clients configured with ``/mcp`` must reach FastMCP directly: a redirect
+    to ``/mcp/`` would turn their POST into a GET in many HTTP clients."""
+    from starlette.testclient import TestClient
+
+    from docsgpt.asgi import asgi_app
+
+    with TestClient(asgi_app) as client:
+        r = client.post(path, headers=_MCP_HEADERS, json=_MCP_INITIALIZE, follow_redirects=False)
+    assert r.status_code == 200, f"{path} -> {r.status_code}"
+    assert "mcp-session-id" in {k.lower() for k in r.headers.keys()}
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("method", ["GET", "POST", "DELETE"])
+def test_bare_mcp_path_not_shadowed_by_ui_catch_all(method):
+    """``/mcp`` must resolve to the MCP server, never the Flask/web-UI mount."""
+    from starlette.routing import Match
+
+    from docsgpt.asgi import _backend, asgi_app
+
+    scope = {
+        "type": "http",
+        "method": method,
+        "path": "/mcp",
+        "root_path": "",
+        "headers": [],
+        "query_string": b"",
+    }
+    for route in asgi_app.routes:
+        match, _ = route.matches(scope)
+        if match is Match.FULL:
+            assert getattr(route, "app", None) is not _backend, f"{method} /mcp fell through to the UI mount"
+            return
+    pytest.fail("no route matched /mcp")
+
+
+@pytest.mark.unit
+def test_get_bare_mcp_is_not_the_web_ui():
+    from starlette.testclient import TestClient
+
+    from docsgpt.asgi import asgi_app
+
+    with TestClient(asgi_app) as client:
+        r = client.get("/mcp", headers={"Accept": "text/html"}, follow_redirects=False)
+    assert "text/html" not in r.headers.get("content-type", "")
+    assert r.status_code not in (301, 302, 307, 308)

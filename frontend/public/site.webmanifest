@@ -1,0 +1,30 @@
+{
+  "name": "知源 · 个人 RAG 知识助手",
+  "short_name": "知源",
+  "description": "支持自定义知识库、文档检索与引用问答的个人 RAG 知识助手。",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "theme_color": "#fbfbfb",
+  "background_color": "#fbfbfb",
+  "icons": [
+    {
+      "src": "/web-app-manifest-192x192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "maskable"
+    },
+    {
+      "src": "/web-app-manifest-512x512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    },
+    {
+      "src": "/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}

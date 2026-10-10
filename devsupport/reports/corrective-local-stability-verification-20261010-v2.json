@@ -1,0 +1,60 @@
+{
+  "input_sha256": {
+    "F:\\DevSupportCopilot\\devsupport\\reports\\test-local-v1\\B0.jsonl": "ae6ef5a26de0d947acafb7f09b06178255a9356227faa3b02f99e32796ddfa3e",
+    "F:\\DevSupportCopilot\\devsupport\\reports\\test-local-v1\\B1.jsonl": "e147adca650b321f13cdd17a00c1cd2fcf58de62b7db05321eca61cbf2109e7b",
+    "F:\\DevSupportCopilot\\devsupport\\reports\\test-local-v1\\C.jsonl": "bc8176043a453328ef3a3dbc17f0bea81b10a6873ebec3889c6f3dac6f53af14",
+    "F:\\DevSupportCopilot\\devsupport\\reports\\test-local-v1\\H0.jsonl": "e3d61a8333d0f7f23d3606ecce5d42dd1e56d8952821b730e539e839197f9a31",
+    "F:\\DevSupportCopilot\\devsupport\\reports\\test-local-v1\\H1.jsonl": "09314e1bc24b2628847b027de96e346c32a42ae7d669cff7355b99797e156907",
+    "F:\\DevSupportCopilot\\devsupport\\reports\\test-local-v2\\B0.jsonl": "47322c399f548455821217427590de7738888fe38fb870380febf959316430f7",
+    "F:\\DevSupportCopilot\\devsupport\\reports\\test-local-v2\\B1.jsonl": "5cc8c36885c36ab3b774f8850ef3bb21d76dee0a36527207cc86086ab96c379f",
+    "F:\\DevSupportCopilot\\devsupport\\reports\\test-local-v2\\C.jsonl": "48bbf10f4078c156ead482532ecf1dd8fc34a72067546be96fddab861f7bcc49",
+    "F:\\DevSupportCopilot\\devsupport\\reports\\test-local-v2\\H0.jsonl": "6b7280175e56c5621e30bcf04598413904e81ca8e535b601dd3a0e4a129f30e6",
+    "F:\\DevSupportCopilot\\devsupport\\reports\\test-local-v2\\H1.jsonl": "cf1a091ff43914d19fc24e5a807f69382b78f69a377706c57b448108dfd37687"
+  },
+  "methods": {
+    "B0": {
+      "corrective_errors": 0,
+      "metrics_prepack_identical": 150,
+      "ordered_query_ids_identical": true,
+      "original_errors": 0,
+      "questions": 150,
+      "ranked_ids_identical": 150
+    },
+    "B1": {
+      "corrective_errors": 0,
+      "metrics_prepack_identical": 150,
+      "ordered_query_ids_identical": true,
+      "original_errors": 0,
+      "questions": 150,
+      "ranked_ids_identical": 150
+    },
+    "C": {
+      "corrective_errors": 0,
+      "metrics_prepack_identical": 150,
+      "ordered_query_ids_identical": true,
+      "original_errors": 0,
+      "questions": 150,
+      "ranked_ids_identical": 150
+    },
+    "H0": {
+      "corrective_errors": 0,
+      "metrics_prepack_identical": 150,
+      "ordered_query_ids_identical": true,
+      "original_errors": 0,
+      "questions": 150,
+      "ranked_ids_identical": 150
+    },
+    "H1": {
+      "corrective_errors": 0,
+      "metrics_prepack_identical": 150,
+      "ordered_query_ids_identical": true,
+      "original_errors": 0,
+      "questions": 150,
+      "ranked_ids_identical": 150
+    }
+  },
+  "observed_at_utc": "2026-10-10T07:26:36.744650+00:00",
+  "paid_calls": 0,
+  "schema": "devsupport.corrective-local-stability.v2",
+  "scope": "Repeat of same retained 150 questions after parser-only correction; not independent replication, model selection or answer-quality evidence"
+}

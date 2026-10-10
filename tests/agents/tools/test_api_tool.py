@@ -1,0 +1,530 @@
+"""Comprehensive tests for docsgpt/agents/tools/api_tool.py
+
+Covers: APITool initialization, all HTTP methods, path param substitution,
+SSRF validation, error handling, response parsing, body serialization.
+"""
+
+import json
+from unittest.mock import MagicMock, patch
+
+import pytest
+import requests
+
+from docsgpt.agents.tools.api_tool import APITool, DEFAULT_TIMEOUT
+
+
+@pytest.fixture
+def get_tool():
+    return APITool(
+        config={
+            "url": "https://api.example.com/data",
+            "method": "GET",
+            "headers": {"Accept": "application/json"},
+            "query_params": {},
+        }
+    )
+
+
+@pytest.fixture
+def post_tool():
+    return APITool(
+        config={
+            "url": "https://api.example.com/items",
+            "method": "POST",
+            "headers": {},
+            "query_params": {},
+        }
+    )
+
+
+# =====================================================================
+# Initialization
+# =====================================================================
+
+
+@pytest.mark.unit
+class TestAPIToolInit:
+
+    def test_default_values(self):
+        tool = APITool(config={})
+        assert tool.url == ""
+        assert tool.method == "GET"
+        assert tool.headers == {}
+        assert tool.query_params == {}
+        assert tool.body_content_type == "application/json"
+        assert tool.body_encoding_rules == {}
+
+    def test_custom_config(self):
+        tool = APITool(config={
+            "url": "https://api.test.com",
+            "method": "POST",
+            "headers": {"X-Key": "val"},
+            "query_params": {"page": "1"},
+            "body_content_type": "application/xml",
+            "body_encoding_rules": {"field": {"style": "form"}},
+        })
+        assert tool.url == "https://api.test.com"
+        assert tool.method == "POST"
+        assert tool.headers == {"X-Key": "val"}
+        assert tool.query_params == {"page": "1"}
+        assert tool.body_content_type == "application/xml"
+
+    def test_default_timeout_constant(self):
+        assert DEFAULT_TIMEOUT == 90
+
+
+# =====================================================================
+# HTTP Methods
+# =====================================================================
+
+
+@pytest.mark.unit
+class TestMakeApiCall:
+
+    @patch("docsgpt.agents.tools.api_tool.pinned_request")
+    def test_successful_get(self, mock_pinned, get_tool):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.headers = {"Content-Type": "application/json"}
+        mock_resp.json.return_value = {"result": "ok"}
+        mock_resp.content = b'{"result":"ok"}'
+        mock_pinned.return_value = mock_resp
+
+        result = get_tool.execute_action("any_action")
+
+        assert result["status_code"] == 200
+        assert result["data"] == {"result": "ok"}
+        assert result["message"] == "API call successful."
+        assert mock_pinned.call_args[0][0] == "GET"
+
+    @patch("docsgpt.agents.tools.api_tool.pinned_request")
+    def test_successful_post(self, mock_pinned, post_tool):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 201
+        mock_resp.headers = {"Content-Type": "application/json"}
+        mock_resp.json.return_value = {"id": 1}
+        mock_resp.content = b'{"id":1}'
+        mock_pinned.return_value = mock_resp
+
+        result = post_tool.execute_action("create", name="test")
+        assert result["status_code"] == 201
+        assert mock_pinned.call_args[0][0] == "POST"
+
+    @patch("docsgpt.agents.tools.api_tool.pinned_request")
+    def test_put_method(self, mock_pinned):
+        tool = APITool(config={"url": "https://example.com/item/1", "method": "PUT"})
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.headers = {"Content-Type": "application/json"}
+        mock_resp.json.return_value = {}
+        mock_resp.content = b'{}'
+        mock_pinned.return_value = mock_resp
+
+        result = tool.execute_action("update", name="new")
+        assert result["status_code"] == 200
+        assert mock_pinned.call_args[0][0] == "PUT"
+
+    @patch("docsgpt.agents.tools.api_tool.pinned_request")
+    def test_delete_method(self, mock_pinned):
+        tool = APITool(config={"url": "https://example.com/item/1", "method": "DELETE"})
+        mock_resp = MagicMock()
+        mock_resp.status_code = 204
+        mock_resp.headers = {"Content-Type": "text/plain"}
+        mock_resp.content = b''
+        mock_pinned.return_value = mock_resp
+
+        result = tool.execute_action("delete")
+        assert result["status_code"] == 204
+        assert mock_pinned.call_args[0][0] == "DELETE"
+
+    @patch("docsgpt.agents.tools.api_tool.pinned_request")
+    def test_patch_method(self, mock_pinned):
+        tool = APITool(config={"url": "https://example.com/item/1", "method": "PATCH"})
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.headers = {"Content-Type": "application/json"}
+        mock_resp.json.return_value = {"patched": True}
+        mock_resp.content = b'{"patched":true}'
+        mock_pinned.return_value = mock_resp
+
+        result = tool.execute_action("patch", field="val")
+        assert result["status_code"] == 200
+        assert mock_pinned.call_args[0][0] == "PATCH"
+
+    @patch("docsgpt.agents.tools.api_tool.pinned_request")
+    def test_head_method(self, mock_pinned):
+        tool = APITool(config={"url": "https://example.com", "method": "HEAD"})
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.headers = {"Content-Type": "text/html"}
+        mock_resp.content = b''
+        mock_pinned.return_value = mock_resp
+
+        result = tool.execute_action("check")
+        assert result["status_code"] == 200
+        assert mock_pinned.call_args[0][0] == "HEAD"
+
+    @patch("docsgpt.agents.tools.api_tool.pinned_request")
+    def test_options_method(self, mock_pinned):
+        tool = APITool(config={"url": "https://example.com", "method": "OPTIONS"})
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.headers = {"Content-Type": "text/plain"}
+        mock_resp.content = b''
+        mock_pinned.return_value = mock_resp
+
+        result = tool.execute_action("options")
+        assert result["status_code"] == 200
+        assert mock_pinned.call_args[0][0] == "OPTIONS"
+
+    def test_unsupported_method(self):
+        tool = APITool(config={"url": "https://example.com", "method": "CUSTOM"})
+        result = tool.execute_action("any")
+        assert result["status_code"] is None
+        assert "Unsupported" in result["message"]
+
+
+# =====================================================================
+# SSRF Validation
+# =====================================================================
+
+
+@pytest.mark.unit
+class TestSSRFValidation:
+
+    @patch("docsgpt.agents.tools.api_tool.pinned_request")
+    def test_ssrf_blocked(self, mock_pinned, get_tool):
+        from docsgpt.security.safe_url import UnsafeUserUrlError
+
+        mock_pinned.side_effect = UnsafeUserUrlError("blocked")
+        result = get_tool.execute_action("any")
+        assert result["status_code"] is None
+        assert "URL validation error" in result["message"]
+
+    @patch("docsgpt.agents.tools.api_tool.pinned_request")
+    def test_ssrf_blocked_with_path_params(self, mock_pinned):
+        from docsgpt.security.safe_url import UnsafeUserUrlError
+
+        tool = APITool(config={
+            "url": "https://api.example.com/{host}/data",
+            "method": "GET",
+            "query_params": {"host": "169.254.169.254"},
+        })
+
+        mock_pinned.side_effect = UnsafeUserUrlError("blocked")
+        result = tool.execute_action("any")
+        assert result["status_code"] is None
+        assert "URL validation error" in result["message"]
+
+
+# =====================================================================
+# Error Handling
+# =====================================================================
+
+
+@pytest.mark.unit
+class TestErrorHandling:
+
+    @patch("docsgpt.agents.tools.api_tool.pinned_request")
+    def test_timeout_error(self, mock_pinned, get_tool):
+        mock_pinned.side_effect = requests.exceptions.Timeout()
+        result = get_tool.execute_action("any")
+        assert result["status_code"] is None
+        assert "timeout" in result["message"].lower()
+
+    @patch("docsgpt.agents.tools.api_tool.pinned_request")
+    def test_connection_error(self, mock_pinned, get_tool):
+        mock_pinned.side_effect = requests.exceptions.ConnectionError("refused")
+        result = get_tool.execute_action("any")
+        assert result["status_code"] is None
+        assert "Connection error" in result["message"]
+
+    @patch("docsgpt.agents.tools.api_tool.pinned_request")
+    def test_http_error_with_json(self, mock_pinned, get_tool):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 422
+        mock_resp.json.return_value = {"error": "invalid_field"}
+        mock_resp.raise_for_status.side_effect = requests.exceptions.HTTPError(
+            response=mock_resp
+        )
+        mock_pinned.return_value = mock_resp
+
+        result = get_tool.execute_action("any")
+        assert result["status_code"] == 422
+        assert result["data"] == {"error": "invalid_field"}
+
+    @patch("docsgpt.agents.tools.api_tool.pinned_request")
+    def test_http_error_non_json_body(self, mock_pinned, get_tool):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 404
+        mock_resp.text = "Not Found"
+        mock_resp.json.side_effect = json.JSONDecodeError("", "", 0)
+        mock_resp.raise_for_status.side_effect = requests.exceptions.HTTPError(
+            response=mock_resp
+        )
+        mock_pinned.return_value = mock_resp
+
+        result = get_tool.execute_action("any")
+        assert result["status_code"] == 404
+        assert result["data"] == "Not Found"
+
+    @patch("docsgpt.agents.tools.api_tool.pinned_request")
+    def test_request_exception(self, mock_pinned, get_tool):
+        mock_pinned.side_effect = requests.exceptions.RequestException("something")
+        result = get_tool.execute_action("any")
+        assert "API call failed" in result["message"]
+
+    @patch("docsgpt.agents.tools.api_tool.pinned_request")
+    def test_unexpected_exception(self, mock_pinned, get_tool):
+        mock_pinned.side_effect = RuntimeError("unexpected")
+        result = get_tool.execute_action("any")
+        assert "Unexpected error" in result["message"]
+
+    @patch("docsgpt.agents.tools.api_tool.pinned_request")
+    def test_body_serialization_error(self, mock_pinned):
+        tool = APITool(config={
+            "url": "https://example.com",
+            "method": "POST",
+            "body_content_type": "application/json",
+        })
+
+        with patch(
+            "docsgpt.agents.tools.api_tool.RequestBodySerializer.serialize",
+            side_effect=ValueError("serialize fail"),
+        ):
+            result = tool.execute_action("any", key="val")
+            assert "serialization error" in result["message"].lower()
+
+
+# =====================================================================
+# Path Param Substitution
+# =====================================================================
+
+
+@pytest.mark.unit
+class TestPathParamSubstitution:
+
+    @patch("docsgpt.agents.tools.api_tool.pinned_request")
+    def test_path_params_substituted(self, mock_pinned):
+        tool = APITool(config={
+            "url": "https://api.example.com/users/{user_id}/posts/{post_id}",
+            "method": "GET",
+            "query_params": {"user_id": "42", "post_id": "7"},
+        })
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.headers = {"Content-Type": "application/json"}
+        mock_resp.json.return_value = []
+        mock_resp.content = b'[]'
+        mock_pinned.return_value = mock_resp
+
+        tool.execute_action("get")
+
+        called_url = mock_pinned.call_args[0][1]
+        assert "/users/42/posts/7" in called_url
+        assert "{user_id}" not in called_url
+
+    @patch("docsgpt.agents.tools.api_tool.pinned_request")
+    def test_remaining_query_params_appended(self, mock_pinned):
+        tool = APITool(config={
+            "url": "https://api.example.com/items",
+            "method": "GET",
+            "query_params": {"page": "2", "limit": "10"},
+        })
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.headers = {"Content-Type": "application/json"}
+        mock_resp.json.return_value = []
+        mock_resp.content = b'[]'
+        mock_pinned.return_value = mock_resp
+
+        tool.execute_action("get")
+
+        called_url = mock_pinned.call_args[0][1]
+        assert "page=2" in called_url
+        assert "limit=10" in called_url
+
+    @patch("docsgpt.agents.tools.api_tool.pinned_request")
+    def test_query_params_append_with_existing_query_string(self, mock_pinned):
+        tool = APITool(config={
+            "url": "https://api.example.com/items?existing=true",
+            "method": "GET",
+            "query_params": {"page": "1"},
+        })
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.headers = {"Content-Type": "application/json"}
+        mock_resp.json.return_value = []
+        mock_resp.content = b'[]'
+        mock_pinned.return_value = mock_resp
+
+        tool.execute_action("get")
+
+        called_url = mock_pinned.call_args[0][1]
+        assert "&page=1" in called_url
+
+    @patch("docsgpt.agents.tools.api_tool.pinned_request")
+    def test_empty_body_no_serialization(self, mock_pinned):
+        tool = APITool(config={"url": "https://example.com", "method": "POST"})
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.headers = {"Content-Type": "application/json"}
+        mock_resp.json.return_value = {}
+        mock_resp.content = b'{}'
+        mock_pinned.return_value = mock_resp
+
+        result = tool.execute_action("create")
+        assert result["status_code"] == 200
+
+    @patch("docsgpt.agents.tools.api_tool.pinned_request")
+    def test_path_params_are_url_encoded(self, mock_pinned):
+        tool = APITool(config={
+            "url": "https://api.example.com/users/{user_id}/profile",
+            "method": "GET",
+            "query_params": {"user_id": "../../admin"},
+        })
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.headers = {"Content-Type": "application/json"}
+        mock_resp.json.return_value = {}
+        mock_resp.content = b'{}'
+        mock_pinned.return_value = mock_resp
+
+        tool.execute_action("get")
+
+        called_url = mock_pinned.call_args[0][1]
+        assert "../../admin" not in called_url
+        assert "%2F" in called_url or "%2f" in called_url
+
+    @patch("docsgpt.agents.tools.api_tool.pinned_request")
+    def test_path_params_query_injection_encoded(self, mock_pinned):
+        tool = APITool(config={
+            "url": "https://api.example.com/items/{item_id}",
+            "method": "GET",
+            "query_params": {"item_id": "x?admin=true"},
+        })
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.headers = {"Content-Type": "application/json"}
+        mock_resp.json.return_value = {}
+        mock_resp.content = b'{}'
+        mock_pinned.return_value = mock_resp
+
+        tool.execute_action("get")
+
+        called_url = mock_pinned.call_args[0][1]
+        assert "x?admin=true" not in called_url
+
+
+# =====================================================================
+# Parse Response
+# =====================================================================
+
+
+@pytest.mark.unit
+class TestParseResponse:
+
+    def test_json_response(self, get_tool):
+        mock_resp = MagicMock()
+        mock_resp.headers = {"Content-Type": "application/json"}
+        mock_resp.json.return_value = {"key": "val"}
+        mock_resp.content = b'{"key":"val"}'
+
+        result = get_tool._parse_response(mock_resp)
+        assert result == {"key": "val"}
+
+    def test_json_decode_error_falls_back_to_text(self, get_tool):
+        mock_resp = MagicMock()
+        mock_resp.headers = {"Content-Type": "application/json"}
+        mock_resp.json.side_effect = json.JSONDecodeError("", "", 0)
+        mock_resp.text = "not valid json"
+        mock_resp.content = b"not valid json"
+
+        result = get_tool._parse_response(mock_resp)
+        assert result == "not valid json"
+
+    def test_text_response(self, get_tool):
+        mock_resp = MagicMock()
+        mock_resp.headers = {"Content-Type": "text/plain"}
+        mock_resp.text = "plain text"
+        mock_resp.content = b"plain text"
+
+        result = get_tool._parse_response(mock_resp)
+        assert result == "plain text"
+
+    def test_xml_response(self, get_tool):
+        mock_resp = MagicMock()
+        mock_resp.headers = {"Content-Type": "application/xml"}
+        mock_resp.text = "<root><item>1</item></root>"
+        mock_resp.content = b"<root><item>1</item></root>"
+
+        result = get_tool._parse_response(mock_resp)
+        assert "<root>" in result
+
+    def test_html_response(self, get_tool):
+        mock_resp = MagicMock()
+        mock_resp.headers = {"Content-Type": "text/html"}
+        mock_resp.text = "<html><body>Hi</body></html>"
+        mock_resp.content = b"<html><body>Hi</body></html>"
+
+        result = get_tool._parse_response(mock_resp)
+        assert "<html>" in result
+
+    def test_empty_content(self, get_tool):
+        mock_resp = MagicMock()
+        mock_resp.headers = {"Content-Type": "application/json"}
+        mock_resp.content = b""
+
+        result = get_tool._parse_response(mock_resp)
+        assert result is None
+
+    def test_binary_response(self, get_tool):
+        mock_resp = MagicMock()
+        mock_resp.headers = {"Content-Type": "application/octet-stream"}
+        mock_resp.text = "binary_text"
+        mock_resp.content = b"\x00\x01\x02"
+
+        result = get_tool._parse_response(mock_resp)
+        assert result is not None
+
+    def test_text_xml_content_type(self, get_tool):
+        mock_resp = MagicMock()
+        mock_resp.headers = {"Content-Type": "text/xml"}
+        mock_resp.text = "<data/>"
+        mock_resp.content = b"<data/>"
+
+        result = get_tool._parse_response(mock_resp)
+        assert result == "<data/>"
+
+
+# =====================================================================
+# Metadata
+# =====================================================================
+
+
+@pytest.mark.unit
+class TestAPIToolMetadata:
+
+    def test_actions_metadata_empty(self, get_tool):
+        assert get_tool.get_actions_metadata() == []
+
+    def test_config_requirements_empty(self, get_tool):
+        assert get_tool.get_config_requirements() == {}
+
+    @patch("docsgpt.agents.tools.api_tool.pinned_request")
+    def test_content_type_set_for_post_with_no_headers(self, mock_pinned):
+        tool = APITool(config={
+            "url": "https://example.com",
+            "method": "POST",
+            "headers": {},
+        })
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.headers = {"Content-Type": "application/json"}
+        mock_resp.json.return_value = {}
+        mock_resp.content = b'{}'
+        mock_pinned.return_value = mock_resp
+
+        tool.execute_action("create")
+        call_headers = mock_pinned.call_args.kwargs["headers"]
+        assert "Content-Type" in call_headers

@@ -1,0 +1,17 @@
+{
+  "base_url": "https://www.xiaoyaoapi.com/v1",
+  "protocol": "openai_chat",
+  "model": "deepseek-v4-pro",
+  "expected_reported_model": "claude-opus-4-8",
+  "timeout_seconds": 90,
+  "retries": 1,
+  "max_output_tokens": 2048,
+  "max_input_bytes": 200000,
+  "input_per_million": null,
+  "output_per_million": null,
+  "env_override": false,
+  "credential_path": "F:/DevSupportCopilot/.secrets/deepseek.dpapi",
+  "thinking": "disabled",
+  "min_request_interval_seconds": 65,
+  "rate_state_path": "F:/DevSupportCopilot/devsupport/runtime/gateway-rate.json"
+}

@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0,viewport-fit=cover" />
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="theme-color" content="#fbfbfb" media="(prefers-color-scheme: light)" />
+  <meta name="theme-color" content="#161616" media="(prefers-color-scheme: dark)" />
+  <script>
+    (function () {
+      try {
+        var stored = localStorage.getItem('selectedTheme');
+        var isDark = stored === 'Dark' ||
+          (stored == null && window.matchMedia &&
+            window.matchMedia('(prefers-color-scheme: dark)').matches);
+        if (isDark) document.documentElement.classList.add('dark');
+        var color = isDark ? '#161616' : '#fbfbfb';
+        document.head.querySelectorAll('meta[name="theme-color"]').forEach(function (m) {
+          m.removeAttribute('media');
+          m.setAttribute('content', color);
+        });
+      } catch (e) { }
+    })();
+  </script>
+  <title>知源 · 个人 RAG 知识助手</title>
+  <link rel="icon" href="/favicon.ico" sizes="48x48" />
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+  <link rel="icon" href="/favicon-96x96.png" type="image/png" sizes="96x96" />
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png" sizes="180x180" />
+  <link rel="manifest" href="/site.webmanifest" />
+  <meta name="apple-mobile-web-app-title" content="知源 · 个人 RAG 知识助手" />
+</head>
+
+<body>
+  <div id="root" class="h-screen"></div>
+  <script type="module" src="/src/main.tsx"></script>
+</body>
+
+</html>

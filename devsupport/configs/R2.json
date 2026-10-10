@@ -1,0 +1,1 @@
+{"variant":"R2","pool":"H1","candidates":50,"query_tokens":512,"document_tokens":512,"joint_forward_count":1,"model":"jinaai/jina-reranker-v3.5","revision":"e8a93f33f0b22108f8c2364f8484ce3422552fbc"}

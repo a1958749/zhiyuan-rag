@@ -1,0 +1,16 @@
+from __future__ import annotations
+
+from typing import Optional
+
+from docsgpt.llm.open_router import OpenRouterLLM
+from docsgpt.llm.providers._apikey_or_llm_name import get_api_key
+from docsgpt.llm.providers.base import Provider
+
+
+class OpenRouterProvider(Provider):
+    name = "openrouter"
+    llm_class = OpenRouterLLM
+    api_key_setting = "OPEN_ROUTER_API_KEY"
+
+    def get_api_key(self, settings) -> Optional[str]:
+        return get_api_key(settings, self.name, settings.OPEN_ROUTER_API_KEY)

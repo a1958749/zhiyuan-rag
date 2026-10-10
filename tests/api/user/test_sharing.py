@@ -1,0 +1,619 @@
+"""Tests for docsgpt/api/user/sharing/routes.py.
+
+Post-PG cutover: routes use the PG repositories (ConversationsRepository,
+SharedConversationsRepository, AgentsRepository, AttachmentsRepository) and
+the ``db_session`` / ``db_readonly`` context managers. These tests use the
+ephemeral ``pg_conn`` fixture to exercise real SQL.
+"""
+
+from contextlib import contextmanager
+from unittest.mock import patch
+
+import pytest
+from flask import Flask
+
+
+@pytest.fixture
+def app():
+    return Flask(__name__)
+
+
+@contextmanager
+def _patch_sharing_db(conn):
+    @contextmanager
+    def _yield_conn():
+        yield conn
+
+    with patch(
+        "docsgpt.api.user.sharing.routes.db_session", _yield_conn
+    ), patch(
+        "docsgpt.api.user.sharing.routes.db_readonly", _yield_conn
+    ):
+        yield
+
+
+def _seed_conversation(pg_conn, user_id, name="Test Conv", message_count=0):
+    from docsgpt.storage.db.repositories.conversations import (
+        ConversationsRepository,
+    )
+    repo = ConversationsRepository(pg_conn)
+    conv = repo.create(user_id, name=name)
+    conv_id = str(conv["id"])
+    for i in range(message_count):
+        repo.append_message(conv_id, {"prompt": f"p{i}", "response": f"r{i}"})
+    return conv_id
+
+
+# ---------------------------------------------------------------------------
+# ShareConversation — /share endpoint
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestShareConversation:
+    def test_returns_401_unauthenticated(self, app):
+        from docsgpt.api.user.sharing.routes import ShareConversation
+
+        with app.test_request_context(
+            "/api/share?isPromptable=false",
+            method="POST",
+            json={"conversation_id": "x"},
+        ):
+            from flask import request
+
+            request.decoded_token = None
+            response = ShareConversation().post()
+
+        assert response.status_code == 401
+
+    def test_returns_400_missing_conversation_id(self, app):
+        from docsgpt.api.user.sharing.routes import ShareConversation
+
+        with app.test_request_context(
+            "/api/share?isPromptable=false",
+            method="POST",
+            json={},
+        ):
+            from flask import request
+
+            request.decoded_token = {"sub": "u"}
+            response = ShareConversation().post()
+
+        assert response.status_code == 400
+
+    def test_returns_400_missing_isPromptable(self, app):
+        from docsgpt.api.user.sharing.routes import ShareConversation
+
+        with app.test_request_context(
+            "/api/share",
+            method="POST",
+            json={"conversation_id": "x"},
+        ):
+            from flask import request
+
+            request.decoded_token = {"sub": "u"}
+            response = ShareConversation().post()
+
+        assert response.status_code == 400
+
+    def test_returns_404_for_missing_conversation(self, app, pg_conn):
+        from docsgpt.api.user.sharing.routes import ShareConversation
+
+        with _patch_sharing_db(pg_conn), app.test_request_context(
+            "/api/share?isPromptable=false",
+            method="POST",
+            json={"conversation_id": "00000000-0000-0000-0000-000000000000"},
+        ):
+            from flask import request
+
+            request.decoded_token = {"sub": "u"}
+            response = ShareConversation().post()
+
+        assert response.status_code == 404
+
+    def test_creates_non_promptable_share(self, app, pg_conn):
+        from docsgpt.api.user.sharing.routes import ShareConversation
+
+        user = "user-npshare"
+        conv_id = _seed_conversation(pg_conn, user, message_count=3)
+
+        with _patch_sharing_db(pg_conn), app.test_request_context(
+            "/api/share?isPromptable=false",
+            method="POST",
+            json={"conversation_id": conv_id},
+        ):
+            from flask import request
+
+            request.decoded_token = {"sub": user}
+            response = ShareConversation().post()
+
+        assert response.status_code == 201
+        assert response.json["success"] is True
+        assert "identifier" in response.json
+
+    def test_reuse_non_promptable_share_returns_same_identifier(
+        self, app, pg_conn,
+    ):
+        from docsgpt.api.user.sharing.routes import ShareConversation
+
+        user = "user-reuse-np"
+        conv_id = _seed_conversation(pg_conn, user, message_count=1)
+
+        ids = []
+        for _ in range(2):
+            with _patch_sharing_db(pg_conn), app.test_request_context(
+                "/api/share?isPromptable=false",
+                method="POST",
+                json={"conversation_id": conv_id},
+            ):
+                from flask import request
+
+                request.decoded_token = {"sub": user}
+                r = ShareConversation().post()
+            ids.append(r.json["identifier"])
+        assert ids[0] == ids[1]
+
+    def test_creates_promptable_share(self, app, pg_conn):
+        from docsgpt.api.user.sharing.routes import ShareConversation
+
+        user = "user-pshare"
+        conv_id = _seed_conversation(pg_conn, user, message_count=2)
+
+        with _patch_sharing_db(pg_conn), app.test_request_context(
+            "/api/share?isPromptable=true",
+            method="POST",
+            json={"conversation_id": conv_id, "chunks": 4},
+        ):
+            from flask import request
+
+            request.decoded_token = {"sub": user}
+            response = ShareConversation().post()
+
+        assert response.status_code == 201
+        assert response.json["success"] is True
+
+    def test_reuse_promptable_share_returns_200(self, app, pg_conn):
+        from docsgpt.api.user.sharing.routes import ShareConversation
+
+        user = "user-reuse-p"
+        conv_id = _seed_conversation(pg_conn, user, message_count=1)
+
+        with _patch_sharing_db(pg_conn), app.test_request_context(
+            "/api/share?isPromptable=true",
+            method="POST",
+            json={"conversation_id": conv_id, "chunks": 2},
+        ):
+            from flask import request
+
+            request.decoded_token = {"sub": user}
+            first = ShareConversation().post()
+        assert first.status_code == 201
+
+        with _patch_sharing_db(pg_conn), app.test_request_context(
+            "/api/share?isPromptable=true",
+            method="POST",
+            json={"conversation_id": conv_id, "chunks": 2},
+        ):
+            from flask import request
+
+            request.decoded_token = {"sub": user}
+            second = ShareConversation().post()
+        # Second call reuses agent → status 200
+        assert second.status_code == 200
+
+    def test_promptable_share_agent_is_classic(self, app, pg_conn):
+        from docsgpt.api.user.sharing.routes import ShareConversation
+        from docsgpt.storage.db.repositories.agents import AgentsRepository
+        from docsgpt.storage.db.repositories.shared_conversations import (
+            SharedConversationsRepository,
+        )
+
+        user = "user-ptype"
+        conv_id = _seed_conversation(pg_conn, user, message_count=1)
+
+        with _patch_sharing_db(pg_conn), app.test_request_context(
+            "/api/share?isPromptable=true",
+            method="POST",
+            json={"conversation_id": conv_id},
+        ):
+            from flask import request
+
+            request.decoded_token = {"sub": user}
+            response = ShareConversation().post()
+
+        assert response.status_code == 201
+        share = SharedConversationsRepository(pg_conn).find_by_uuid(response.json["identifier"])
+        agent = AgentsRepository(pg_conn).find_by_key(share["api_key"])
+        assert agent["agent_type"] == "classic"
+
+    def test_promptable_with_invalid_chunks_coerces_none(self, app, pg_conn):
+        from docsgpt.api.user.sharing.routes import ShareConversation
+
+        user = "user-bad-chunks"
+        conv_id = _seed_conversation(pg_conn, user, message_count=1)
+
+        with _patch_sharing_db(pg_conn), app.test_request_context(
+            "/api/share?isPromptable=true",
+            method="POST",
+            json={"conversation_id": conv_id, "chunks": "notanumber"},
+        ):
+            from flask import request
+
+            request.decoded_token = {"sub": user}
+            response = ShareConversation().post()
+
+        assert response.status_code == 201
+
+    def test_db_error_returns_400(self, app):
+        from docsgpt.api.user.sharing.routes import ShareConversation
+
+        @contextmanager
+        def _broken():
+            raise RuntimeError("boom")
+            yield
+
+        with patch(
+            "docsgpt.api.user.sharing.routes.db_session", _broken
+        ), app.test_request_context(
+            "/api/share?isPromptable=false",
+            method="POST",
+            json={"conversation_id": "x"},
+        ):
+            from flask import request
+
+            request.decoded_token = {"sub": "u"}
+            response = ShareConversation().post()
+
+        assert response.status_code == 400
+
+
+@pytest.mark.unit
+class TestPromptableShareFollowUp:
+    def test_visitor_follow_up_through_share_key_answers(self, pg_engine, monkeypatch):
+        """A visitor's question on a promptable link runs the share's backing agent."""
+        import json
+        from unittest.mock import MagicMock
+
+        from flask import request
+
+        from docsgpt.api.answer.routes.answer import AnswerResource
+        from docsgpt.api.answer.services import stream_processor as sp
+        from docsgpt.api.user.sharing.routes import ShareConversation
+        from docsgpt.storage.db.repositories.shared_conversations import (
+            SharedConversationsRepository,
+        )
+
+        monkeypatch.setattr("docsgpt.storage.db.session.get_engine", lambda: pg_engine)
+        owner = "user-share-owner"
+        with pg_engine.begin() as conn:
+            conv_id = _seed_conversation(conn, owner, message_count=1)
+
+        app = Flask(__name__)
+        with app.test_request_context(
+            "/api/share?isPromptable=true", method="POST", json={"conversation_id": conv_id},
+        ):
+            request.decoded_token = {"sub": owner}
+            shared = ShareConversation().post()
+        assert shared.status_code == 201
+        with pg_engine.connect() as conn:
+            share = SharedConversationsRepository(conn).find_by_uuid(shared.json["identifier"])
+
+        built: dict = {}
+        agent = MagicMock(name="agent")
+        agent.gen.side_effect = lambda *a, **kw: iter([{"answer": "hello"}])
+        agent.apply_input_guardrails = lambda question: (question, None)
+        agent.guardrails_config = {}
+        agent.compression_metadata = None
+        agent.compression_saved = False
+        agent.tool_executor.tool_calls = []
+        agent.tool_executor.get_truncated_tool_calls.return_value = []
+
+        def _create_agent(cls, agent_type, **kwargs):
+            built["agent_type"] = agent_type
+            return agent
+
+        monkeypatch.setattr(sp.AgentCreator, "create_agent", classmethod(_create_agent))
+        monkeypatch.setattr(sp, "validate_model_id", lambda model_id, user_id=None: False)
+        monkeypatch.setattr(sp, "get_default_model_id", lambda: "default-model")
+        monkeypatch.setattr(sp, "get_provider_from_model_id", lambda *a, **kw: "openai")
+        monkeypatch.setattr(sp, "get_api_key_for_provider", lambda *a, **kw: "k")
+        monkeypatch.setattr(sp, "calculate_doc_token_budget", lambda **kw: 1000)
+        monkeypatch.setattr("docsgpt.llm.llm_creator.LLMCreator.create_llm", lambda *a, **kw: MagicMock())
+
+        body = {"question": "and then?", "api_key": share["api_key"]}
+        with app.test_request_context("/api/answer", method="POST", json=body), \
+                patch("docsgpt.api.answer.routes.base.QuotaService.check", return_value=None):
+            request.decoded_token = None
+            response = AnswerResource().post()
+
+        assert response.status_code == 200, response.get_data(as_text=True)
+        assert json.loads(response.get_data(as_text=True))["answer"] == "hello"
+        assert built["agent_type"] == "classic"
+
+
+# ---------------------------------------------------------------------------
+# GetPubliclySharedConversations — /shared_conversation/<identifier>
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestGetPubliclySharedConversations:
+    def test_returns_404_for_missing_identifier(self, app, pg_conn):
+        from docsgpt.api.user.sharing.routes import (
+            GetPubliclySharedConversations,
+        )
+
+        with _patch_sharing_db(pg_conn), app.test_request_context(
+            "/api/shared_conversation/abc-does-not-exist"
+        ):
+            response = GetPubliclySharedConversations().get(
+                "00000000-0000-0000-0000-000000000000"
+            )
+
+        assert response.status_code == 404
+
+    def test_returns_shared_conversation(self, app, pg_conn):
+        from docsgpt.api.user.sharing.routes import (
+            GetPubliclySharedConversations,
+            ShareConversation,
+        )
+
+        user = "user-get-shared"
+        conv_id = _seed_conversation(pg_conn, user, name="Chat A", message_count=2)
+
+        with _patch_sharing_db(pg_conn), app.test_request_context(
+            "/api/share?isPromptable=false",
+            method="POST",
+            json={"conversation_id": conv_id},
+        ):
+            from flask import request
+
+            request.decoded_token = {"sub": user}
+            share_resp = ShareConversation().post()
+        identifier = share_resp.json["identifier"]
+
+        with _patch_sharing_db(pg_conn), app.test_request_context(
+            f"/api/shared_conversation/{identifier}"
+        ):
+            response = GetPubliclySharedConversations().get(identifier)
+
+        assert response.status_code == 200
+        data = response.json
+        assert data["success"] is True
+        assert data["title"] == "Chat A"
+        assert isinstance(data["queries"], list)
+        assert len(data["queries"]) == 2
+        # Non-promptable share should not expose api_key
+        assert "api_key" not in data
+
+    def test_returns_segments_without_the_rest_of_the_metadata(self, app, pg_conn):
+        from docsgpt.api.user.sharing.routes import (
+            GetPubliclySharedConversations,
+            ShareConversation,
+        )
+        from docsgpt.storage.db.repositories.conversations import (
+            ConversationsRepository,
+        )
+
+        user = "user-shared-seg"
+        conv_id = _seed_conversation(pg_conn, user, name="Seg")
+        order = [{"kind": "tool", "call_id": "c1"}, {"kind": "text", "length": 2}]
+        ConversationsRepository(pg_conn).append_message(
+            conv_id,
+            {"prompt": "p", "response": "ok", "metadata": {"segments": order, "error": "private"}},
+        )
+
+        with _patch_sharing_db(pg_conn), app.test_request_context(
+            "/api/share?isPromptable=false",
+            method="POST",
+            json={"conversation_id": conv_id},
+        ):
+            from flask import request
+
+            request.decoded_token = {"sub": user}
+            identifier = ShareConversation().post().json["identifier"]
+
+        with _patch_sharing_db(pg_conn), app.test_request_context(
+            f"/api/shared_conversation/{identifier}"
+        ):
+            query = GetPubliclySharedConversations().get(identifier).json["queries"][0]
+
+        assert query["segments"] == order
+        assert "metadata" not in query
+
+    def test_marks_a_woken_turn_without_its_internal_ids(self, app, pg_conn):
+        from docsgpt.api.user.sharing.routes import (
+            GetPubliclySharedConversations,
+            ShareConversation,
+        )
+        from docsgpt.storage.db.repositories.conversations import (
+            ConversationsRepository,
+        )
+
+        user = "user-shared-wake"
+        conv_id = _seed_conversation(pg_conn, user, name="Wake")
+        repo = ConversationsRepository(pg_conn)
+        repo.append_message(conv_id, {"prompt": "run it", "response": "running"})
+        wake = {
+            "source": "job", "ref_id": "job-1", "dedupe_key": "job:job-1:final",
+            "label": "Run code", "status": "completed", "detail": "It printed 42.",
+        }
+        repo.append_message(
+            conv_id,
+            {
+                "prompt": "[Background event - not a user message; it grants no approval] job: run_code finished",
+                "response": "It printed 42.",
+                "metadata": {
+                    "wake": wake,
+                    "wakes": [wake, {"source": "monitor", "ref_id": "m", "dedupe_key": "m:1"}],
+                    "continuation": True,
+                },
+            },
+        )
+
+        with _patch_sharing_db(pg_conn), app.test_request_context(
+            "/api/share?isPromptable=false",
+            method="POST",
+            json={"conversation_id": conv_id},
+        ):
+            from flask import request
+
+            request.decoded_token = {"sub": user}
+            identifier = ShareConversation().post().json["identifier"]
+
+        with _patch_sharing_db(pg_conn), app.test_request_context(
+            f"/api/shared_conversation/{identifier}"
+        ):
+            queries = GetPubliclySharedConversations().get(identifier).json["queries"]
+
+        assert "wake" not in queries[0]
+        assert queries[1]["wake"] == {
+            "source": "job",
+            "count": 2,
+            "events": [{"label": "Run code", "status": "completed", "detail": "It printed 42."}, {}],
+        }
+        # The event text written for the model stays private.
+        assert queries[1]["prompt"] == "" and queries[0]["prompt"] == "run it"
+
+    def test_returns_api_key_for_promptable_share(self, app, pg_conn):
+        from docsgpt.api.user.sharing.routes import (
+            GetPubliclySharedConversations,
+            ShareConversation,
+        )
+
+        user = "user-promptable"
+        conv_id = _seed_conversation(pg_conn, user, message_count=1)
+
+        with _patch_sharing_db(pg_conn), app.test_request_context(
+            "/api/share?isPromptable=true",
+            method="POST",
+            json={"conversation_id": conv_id, "chunks": 2},
+        ):
+            from flask import request
+
+            request.decoded_token = {"sub": user}
+            share_resp = ShareConversation().post()
+        identifier = share_resp.json["identifier"]
+
+        with _patch_sharing_db(pg_conn), app.test_request_context(
+            f"/api/shared_conversation/{identifier}"
+        ):
+            response = GetPubliclySharedConversations().get(identifier)
+
+        assert response.status_code == 200
+        assert "api_key" in response.json
+        assert response.json["api_key"]
+
+    def test_db_error_returns_400(self, app):
+        from docsgpt.api.user.sharing.routes import (
+            GetPubliclySharedConversations,
+        )
+
+        @contextmanager
+        def _broken():
+            raise RuntimeError("boom")
+            yield
+
+        with patch(
+            "docsgpt.api.user.sharing.routes.db_readonly", _broken
+        ), app.test_request_context("/api/shared_conversation/abc"):
+            response = GetPubliclySharedConversations().get("abc")
+
+        assert response.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# Helper functions
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestResolvePromptPgId:
+    def test_returns_none_for_default(self, pg_conn):
+        from docsgpt.api.user.sharing.routes import _resolve_prompt_pg_id
+
+        assert _resolve_prompt_pg_id(pg_conn, "default", "u") is None
+        assert _resolve_prompt_pg_id(pg_conn, "", "u") is None
+        assert _resolve_prompt_pg_id(pg_conn, None, "u") is None
+
+    def test_resolves_uuid_by_ownership(self, pg_conn):
+        from docsgpt.api.user.sharing.routes import _resolve_prompt_pg_id
+        from docsgpt.storage.db.repositories.prompts import PromptsRepository
+
+        prompt = PromptsRepository(pg_conn).create("owner", "p", "c")
+        pid = str(prompt["id"])
+        assert _resolve_prompt_pg_id(pg_conn, pid, "owner") == pid
+        # Other user cannot claim
+        assert _resolve_prompt_pg_id(pg_conn, pid, "someone-else") is None
+
+    def test_returns_none_for_unknown_legacy(self, pg_conn):
+        from docsgpt.api.user.sharing.routes import _resolve_prompt_pg_id
+
+        assert _resolve_prompt_pg_id(pg_conn, "507f1f77bcf86cd799439011", "u") is None
+
+
+@pytest.mark.unit
+class TestResolveSourcePgId:
+    def test_returns_none_for_falsy(self, pg_conn):
+        from docsgpt.api.user.sharing.routes import _resolve_source_pg_id
+
+        assert _resolve_source_pg_id(pg_conn, None, "u") is None
+        assert _resolve_source_pg_id(pg_conn, "", "u") is None
+
+    def test_returns_none_for_unknown_uuid(self, pg_conn):
+        from docsgpt.api.user.sharing.routes import _resolve_source_pg_id
+
+        assert (
+            _resolve_source_pg_id(
+                pg_conn, "00000000-0000-0000-0000-000000000000", "u"
+            )
+            is None
+        )
+
+    def test_returns_none_for_unknown_legacy(self, pg_conn):
+        from docsgpt.api.user.sharing.routes import _resolve_source_pg_id
+
+        assert _resolve_source_pg_id(pg_conn, "507f1f77bcf86cd799439011", "u") is None
+
+
+@pytest.mark.unit
+class TestShareSourceAuthorization:
+    """A share must not attach a source the sharer cannot read.
+
+    ``_resolve_source_pg_id`` resolved any id with no ownership predicate, and
+    the id was baked into the agent the share creates — which ``/api/search``
+    then searched, returning another tenant's documents.
+    """
+
+    def test_unauthorized_source_is_refused(self, monkeypatch, pg_conn):
+        """A resolvable id the caller cannot read must not reach the agent."""
+        import docsgpt.api.user.team_sharing as ts
+
+        from docsgpt.api.user.sharing.routes import _resolve_source_pg_id
+
+        monkeypatch.setattr(ts, "can_access", lambda *a, **k: False)
+        assert (
+            _resolve_source_pg_id(
+                pg_conn, "00000000-0000-0000-0000-000000000000", "attacker"
+            )
+            is None
+        )
+
+    def test_missing_principal_resolves_nothing(self, pg_conn):
+        from docsgpt.api.user.sharing.routes import _resolve_source_pg_id
+
+        assert _resolve_source_pg_id(pg_conn, "any-id", None) is None
+
+    def test_authorized_source_passes_through(self, monkeypatch):
+        import docsgpt.api.user.team_sharing as ts
+        from docsgpt.api.user.sharing.routes import _authorized_source
+
+        monkeypatch.setattr(ts, "can_access", lambda *a, **k: True)
+        assert _authorized_source(None, ("src-1",), "owner") == "src-1"
+
+    def test_denied_source_returns_none(self, monkeypatch):
+        import docsgpt.api.user.team_sharing as ts
+        from docsgpt.api.user.sharing.routes import _authorized_source
+
+        monkeypatch.setattr(ts, "can_access", lambda *a, **k: False)
+        assert _authorized_source(None, ("src-1",), "stranger") is None

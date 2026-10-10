@@ -1,0 +1,31 @@
+{
+  "budget_start": "devsupport/reports/budget-current-gateway.json",
+  "controls": "devsupport/evaluation/control-cases.json",
+  "corpus": "devsupport/data/corpus.parquet",
+  "generation_max_tokens": 2048,
+  "gpu_url": "http://127.0.0.1:8093",
+  "index": "devsupport/indexes/raw",
+  "profiles": {
+    "H0": {
+      "adaptive": "never",
+      "gate_enabled": false,
+      "retrieval": "H0"
+    },
+    "Q": {
+      "adaptive": "selective",
+      "gate_enabled": false,
+      "retrieval": "H0"
+    },
+    "QAlways": {
+      "adaptive": "always",
+      "gate_enabled": false,
+      "retrieval": "H0"
+    }
+  },
+  "provider": "devsupport/configs/provider.json",
+  "queries": "devsupport/data/queries.parquet",
+  "seeds": [
+    20261008
+  ],
+  "split": "devsupport/reports/split.json"
+}

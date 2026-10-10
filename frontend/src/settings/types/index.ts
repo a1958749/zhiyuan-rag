@@ -1,0 +1,255 @@
+import { ConfigRequirements } from '../../modals/types';
+import type { Access } from '../../utils/accessUtils';
+
+export type ChunkType = {
+  doc_id: string;
+  text: string;
+  /**
+   * Chunk metadata as the vector store recorded it. Values are strings for
+   * most backends, but numbers (`token_count`) survive the round trip on the
+   * JSON-typed ones, so consumers must handle both.
+   */
+  metadata: {
+    title?: string;
+    source?: string;
+    token_count?: number | string;
+    [key: string]: number | string | undefined;
+  };
+};
+
+export type LogEventType =
+  'chat' | 'schedule' | 'webhook' | 'workflow' | 'system' | 'search' | 'graph';
+
+/** Counts rolled up from a trace's spans; every field may be absent. */
+export type TraceCounts = {
+  llm_calls?: number;
+  tool_calls?: number;
+  retrieval_calls?: number;
+  retrieval_ms?: number;
+  input_tokens?: number;
+  output_tokens?: number;
+  errors?: number;
+};
+
+/** The id a Logs row's traces are looked up by. */
+export type TraceRef = {
+  field: 'id' | 'request_id' | 'message_id' | 'activity_id' | 'workflow_run_id';
+  value: string;
+};
+
+/** Trace summary attached to a Logs row (merged over its rounds). */
+export type LogTraceSummary = {
+  ref: TraceRef;
+  count: number;
+  duration_ms: number;
+  status?: string;
+  started_at?: string;
+  summary: TraceCounts;
+};
+
+export type TraceSpanKind =
+  | 'agent'
+  | 'llm'
+  | 'tool'
+  | 'retrieval'
+  | 'search'
+  | 'embedding'
+  | 'rerank'
+  | 'guardrail'
+  | 'step';
+
+export type TraceSpan = {
+  id: string;
+  parent_id: string | null;
+  kind: TraceSpanKind | string;
+  name: string;
+  status: string;
+  offset_ms: number;
+  duration_ms: number;
+  attributes: Record<string, unknown>;
+  preview?: Record<string, unknown>;
+  error?: string;
+};
+
+export type Trace = {
+  id: string;
+  request_id?: string | null;
+  message_id?: string | null;
+  source: string;
+  name?: string | null;
+  status: string;
+  started_at: string;
+  duration_ms: number;
+  span_count: number;
+  dropped_spans: number;
+  summary: TraceCounts;
+  spans: TraceSpan[];
+  otel_trace_id?: string | null;
+};
+
+export type LogData = {
+  id: string;
+  event_type?: LogEventType;
+  action: string;
+  level: 'info' | 'error' | 'warning';
+  user: string;
+  question: string;
+  timestamp: string;
+  // chat events (user_logs)
+  response?: string;
+  sources?: Record<string, any>[];
+  tool_calls?: Record<string, any>[];
+  agent_id?: string;
+  attachments?: string[];
+  request_id?: string;
+  message_id?: string;
+  // system + webhook events (stack_logs)
+  endpoint?: string;
+  stacks?: Record<string, any>[];
+  activity_id?: string;
+  // search + graph events (request_traces)
+  source?: string;
+  duration_ms?: number;
+  // Present when the row has a stored execution trace.
+  trace?: LogTraceSummary;
+  // workflow events (workflow_runs)
+  workflow_name?: string;
+  result?: Record<string, any>;
+  steps?: Record<string, any>[];
+  // schedule events (schedule_runs)
+  status?: string;
+  trigger_source?: string;
+  schedule_name?: string;
+  instruction?: string;
+  output?: string;
+  error?: string;
+  error_type?: string;
+  prompt_tokens?: number;
+  generated_tokens?: number;
+  conversation_id?: string;
+  scheduled_for?: string;
+  started_at?: string;
+  finished_at?: string;
+};
+
+export type ParameterGroupType = {
+  type: 'object';
+  properties: {
+    [key: string]: {
+      type: 'string' | 'integer';
+      description: string;
+      value: string | number;
+      filled_by_llm: boolean;
+      required?: boolean;
+      // A saved secret header / query value: the server sends `value: ""`
+      // and this flag; an empty value on save keeps the stored one.
+      has_value?: boolean;
+    };
+  };
+};
+
+export type UserToolType = {
+  id: string;
+  name: string;
+  displayName: string;
+  customName?: string;
+  description: string;
+  status: boolean;
+  // True for built-in default chat tools — managed via the opt-out list,
+  // not a user_tools row; not deletable. ``scheduler`` is dual-registered
+  // (both ``default`` and ``builtin``).
+  default?: boolean;
+  // True for agent-selectable builtins (e.g. ``scheduler``) — hidden
+  // from the Add-Tool modal; surfaced to the agent picker. May coexist
+  // with ``default`` for dual-registered tools.
+  builtin?: boolean;
+  // True for builtins shown only in the workflow-node tool picker
+  // (e.g. ``read_document``) — hidden from the classic agent picker.
+  workflow_only?: boolean;
+  // Whether the current user owns this tool ('user') or only has access to
+  // it via a team share ('team'). Owner-only actions are gated on 'user'.
+  ownership?: 'user' | 'team';
+  // Access level when shared via a team: 'viewer' (use) or 'editor' (edit
+  // actions; secrets stay owner-only). Null/absent for tools the caller owns.
+  team_access?: 'viewer' | 'editor' | null;
+  // The connection whose account or credentials the tool runs with.
+  connection_id?: string | null;
+  // Whether team members use the owner's account or their own.
+  credential_mode?: 'owner' | 'member';
+  // Caller's role and what it may do (`utils/accessUtils` `can`).
+  access?: Access | null;
+  allowed_actions?: string[];
+  // Whether the tool joins the caller's own agentless chats: the owner's
+  // `status`, or a grantee's personal preference (default off).
+  in_chat?: boolean;
+  // A team through which a shared tool reaches the caller.
+  shared_via?: string | null;
+  // The owner's email or name, when the server can resolve it.
+  owner_label?: string | null;
+  config: {
+    [key: string]: any;
+  };
+  configRequirements?: ConfigRequirements;
+  actions: {
+    name: string;
+    description: string;
+    parameters: {
+      properties: {
+        [key: string]: {
+          type: string;
+          description: string;
+          filled_by_llm: boolean;
+          value: string;
+          required?: boolean;
+        };
+      };
+      additionalProperties: boolean;
+      required: string[];
+      type: string;
+    };
+    active: boolean;
+    require_approval?: boolean;
+    // Read or write, set on tools that come from a connection.
+    access?: 'read' | 'write';
+  }[];
+};
+
+export type APIActionType = {
+  name: string;
+  url: string;
+  description: string;
+  method: 'GET' | 'POST' | 'PUT' | 'DELETE' | 'PATCH' | 'HEAD' | 'OPTIONS';
+  query_params: ParameterGroupType;
+  headers: ParameterGroupType;
+  body: ParameterGroupType;
+  active: boolean;
+  require_approval?: boolean;
+  body_content_type?:
+    | 'application/json'
+    | 'application/x-www-form-urlencoded'
+    | 'multipart/form-data'
+    | 'text/plain'
+    | 'application/xml'
+    | 'application/octet-stream';
+  body_encoding_rules?: {
+    [key: string]: {
+      style?: 'form' | 'spaceDelimited' | 'pipeDelimited' | 'deepObject';
+      explode?: boolean;
+    };
+  };
+};
+
+export type APIToolType = {
+  id: string;
+  name: string;
+  displayName: string;
+  customName?: string;
+  description: string;
+  status: boolean;
+  config: { actions: { [key: string]: APIActionType } };
+  configRequirements?: ConfigRequirements;
+  access?: Access | null;
+  allowed_actions?: string[];
+  ownership?: 'user' | 'team';
+  team_access?: 'viewer' | 'editor' | null;
+};

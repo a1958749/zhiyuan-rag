@@ -1,0 +1,121 @@
+# Pre-built images from Docker Hub (mirrored at ghcr.io/arc53). setup.sh and
+# setup.ps1 run this file. Run it from the repository root:
+#   docker compose --env-file .env -f deployment/docker-compose-hub.yaml up -d
+#   DOCSGPT_IMAGE_TAG      develop (default, follows main) or a release, e.g. 0.21.0;
+#                          pin a release for anything beyond trying it out
+#   DOCSGPT_IMAGE_VARIANT  empty (default, slim) or -docling: docling parser engine,
+#                          its models, and tesseract baked in (OCR-ready)
+#   DOCSGPT_BIND           interface the API (7091) and UI (5173) are published on:
+#                          127.0.0.1 (default, this machine only) or 0.0.0.0 (every
+#                          interface; set AUTH_TYPE first, see Deploying/Security)
+# Set them in ../.env and pass it with --env-file .env (Compose otherwise looks
+# for deployment/.env), or in the shell. Postgres and Redis are
+# published on 127.0.0.1 only, for a backend run on the host. deployment/docker-compose-standalone.yaml runs
+# the same images without a git checkout, with the backend serving the UI on one port.
+name: docsgpt-oss
+services:
+
+  frontend:
+    image: arc53/docsgpt-fe:${DOCSGPT_IMAGE_TAG:-develop}
+    environment:
+      # Every VITE_* the app reads. A bare name is passed through only when it is
+      # set in the shell or the --env-file, so an unset one does not reach the
+      # container as an empty string and override the image's own default.
+      - VITE_API_HOST=http://localhost:7091
+      - VITE_API_STREAMING=${VITE_API_STREAMING:-true}
+      - VITE_BASE_URL
+      - VITE_GOOGLE_CLIENT_ID
+      - VITE_GOOGLE_PICKER_API_KEY
+      - VITE_NOTIFICATION_TEXT
+      - VITE_NOTIFICATION_LINK
+      - VITE_ENABLE_VOICE_INPUT
+      - VITE_DISABLE_SOURCE_FE
+      - VITE_USE_V
+    ports:
+      - "${DOCSGPT_BIND:-127.0.0.1}:5173:5173"
+    depends_on:
+      - backend
+
+
+  backend:
+    user: root
+    image: arc53/docsgpt:${DOCSGPT_IMAGE_TAG:-develop}${DOCSGPT_IMAGE_VARIANT:-}
+    env_file:
+      - ../.env
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/1
+      - CACHE_REDIS_URL=redis://redis:6379/2
+      - POSTGRES_URI=postgresql://docsgpt:docsgpt@postgres:5432/docsgpt
+    ports:
+      - "${DOCSGPT_BIND:-127.0.0.1}:7091:7091"
+    volumes:
+      # Host data stays under application/ (the old package directory) for this
+      # release so an upgraded checkout keeps its indexes; it moves with the
+      # packaging work, together with an upgrade note.
+      - ../application/indexes:/app/indexes
+      - ../application/inputs:/app/inputs
+      - ../application/vectors:/app/vectors
+    depends_on:
+      redis:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+
+
+  worker:
+    user: root
+    image: arc53/docsgpt:${DOCSGPT_IMAGE_TAG:-develop}${DOCSGPT_IMAGE_VARIANT:-}
+    # `parsing` queue carries read_document/parse_document; required for its await to resolve.
+    command: celery -A docsgpt.app.celery worker -l INFO -B -Q docsgpt,parsing,embeddings
+    env_file:
+      - ../.env
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/1
+      - API_URL=http://backend:7091
+      - CACHE_REDIS_URL=redis://redis:6379/2
+      - POSTGRES_URI=postgresql://docsgpt:docsgpt@postgres:5432/docsgpt
+    volumes:
+      # Host data stays under application/ (the old package directory) for this
+      # release so an upgraded checkout keeps its indexes; it moves with the
+      # packaging work, together with an upgrade note.
+      - ../application/indexes:/app/indexes
+      - ../application/inputs:/app/inputs
+      - ../application/vectors:/app/vectors
+    depends_on:
+      redis:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+
+  # NOTE: sandboxed code execution (the `code_executor` / `artifact_generator`
+  # tools) is an OPT-IN feature and is intentionally NOT part of this default
+  # stack. To run it, layer the sandbox overlay on top of this file:
+  #   docker compose --env-file .env -f deployment/docker-compose-hub.yaml \
+  #     -f deployment/optional/docker-compose.optional.sandbox.yaml up -d
+  # See deployment/sandbox/README.md.
+
+  redis:
+    image: redis:6-alpine
+    ports:
+      - "127.0.0.1:6379:6379"
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      - POSTGRES_USER=docsgpt
+      - POSTGRES_PASSWORD=docsgpt
+      - POSTGRES_DB=docsgpt
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U docsgpt -d docsgpt"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  postgres_data:

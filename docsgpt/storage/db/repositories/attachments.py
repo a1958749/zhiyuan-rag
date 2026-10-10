@@ -1,0 +1,491 @@
+"""Repository for the ``attachments`` table."""
+
+from __future__ import annotations
+
+import json
+from typing import Any, Optional
+
+from sqlalchemy import Connection, text
+
+from docsgpt.storage.db.base_repository import looks_like_uuid, row_to_dict
+from docsgpt.utils import strip_null_bytes
+
+
+_UPDATABLE_SCALARS = {
+    "filename", "upload_path", "mime_type", "size",
+    "content", "token_count", "openai_file_id", "google_file_uri",
+    "content_hash",
+}
+_UPDATABLE_JSONB = {"metadata"}
+
+# Columns the chat planner reads; everything but the (large) text.
+_PLANNING_COLUMNS = (
+    "id, user_id, filename, upload_path, mime_type, size, token_count, "
+    "metadata, created_at, legacy_mongo_id, content_hash"
+)
+
+
+def is_archive_row(row: dict) -> bool:
+    """A zip attachment unpacked into member rows (``metadata.archive``)."""
+    metadata = row.get("metadata")
+    return isinstance(metadata, dict) and isinstance(metadata.get("archive"), dict)
+
+
+def _attachment_to_dict(row: Any) -> dict:
+    """row_to_dict + ``upload_path``→``path`` alias.
+
+    Pre-Postgres, the Mongo attachment shape used ``path``. The PG column
+    is ``upload_path``; LLM provider code (google_ai/openai/anthropic and
+    handlers/base) still reads ``attachment.get("path")``. Mirroring the
+    ``id``/``_id`` dual-emit in row_to_dict so consumers don't need to
+    know which storage backend produced the dict.
+    """
+    out = row_to_dict(row)
+    if "upload_path" in out and out.get("path") is None:
+        out["path"] = out["upload_path"]
+    return out
+
+
+class AttachmentsRepository:
+    def __init__(self, conn: Connection) -> None:
+        self._conn = conn
+
+    def create(
+        self,
+        user_id: str,
+        filename: str,
+        upload_path: str,
+        *,
+        mime_type: Optional[str] = None,
+        size: Optional[int] = None,
+        content: Optional[str] = None,
+        token_count: Optional[int] = None,
+        openai_file_id: Optional[str] = None,
+        google_file_uri: Optional[str] = None,
+        metadata: Any = None,
+        legacy_mongo_id: Optional[str] = None,
+        content_hash: Optional[str] = None,
+    ) -> dict:
+        result = self._conn.execute(
+            text(
+                """
+                INSERT INTO attachments (
+                    user_id, filename, upload_path, mime_type, size,
+                    content, token_count, openai_file_id, google_file_uri,
+                    metadata, legacy_mongo_id, content_hash
+                )
+                VALUES (
+                    :user_id, :filename, :upload_path, :mime_type, :size,
+                    :content, :token_count, :openai_file_id, :google_file_uri,
+                    CAST(:metadata AS jsonb), :legacy_mongo_id, :content_hash
+                )
+                RETURNING *
+                """
+            ),
+            {
+                "user_id": user_id,
+                "filename": strip_null_bytes(filename),
+                "upload_path": upload_path,
+                "mime_type": mime_type,
+                "size": size,
+                # A parsed document with embedded NULs (mislabeled binary)
+                # would otherwise fail the INSERT — Postgres rejects \x00.
+                "content": strip_null_bytes(content),
+                "token_count": token_count,
+                "openai_file_id": openai_file_id,
+                "google_file_uri": google_file_uri,
+                "metadata": (
+                    json.dumps(strip_null_bytes(metadata))
+                    if metadata is not None
+                    else None
+                ),
+                "legacy_mongo_id": legacy_mongo_id,
+                "content_hash": content_hash,
+            },
+        )
+        return _attachment_to_dict(result.fetchone())
+
+    def get(self, attachment_id: str, user_id: str) -> Optional[dict]:
+        result = self._conn.execute(
+            text(
+                "SELECT * FROM attachments WHERE id = CAST(:id AS uuid) AND user_id = :user_id"
+            ),
+            {"id": attachment_id, "user_id": user_id},
+        )
+        row = result.fetchone()
+        return _attachment_to_dict(row) if row is not None else None
+
+    def get_for_update(self, attachment_id: str, user_id: str) -> Optional[dict]:
+        """Read one of the owner's rows and lock it until the transaction ends.
+
+        A zip's member tasks finish on different workers; each records its
+        outcome on the zip's row under this lock, so exactly one of them sees
+        the last member done and completes the zip.
+
+        Args:
+            attachment_id: The PG ``attachments.id``.
+            user_id: The owner.
+
+        Returns:
+            The row, or None when it is not the owner's or the id is not a UUID.
+        """
+        if not looks_like_uuid(str(attachment_id)):
+            return None
+        result = self._conn.execute(
+            text("SELECT * FROM attachments WHERE id = CAST(:id AS uuid) AND user_id = :user_id FOR UPDATE"),
+            {"id": str(attachment_id), "user_id": user_id},
+        )
+        row = result.fetchone()
+        return _attachment_to_dict(row) if row is not None else None
+
+    def find_and_lock_processing_archives(self, limit: int = 100) -> list[dict]:
+        """Zips of any user whose members are still parsing, locked for the reconciler.
+
+        Served by the partial index of migration 0045. Rows a member task is
+        updating right now are skipped (``SKIP LOCKED``); the next tick sees
+        them.
+
+        Args:
+            limit: Most rows returned per call, oldest first.
+
+        Returns:
+            The zips' rows, each locked until the transaction ends.
+        """
+        result = self._conn.execute(
+            text(
+                "SELECT * FROM attachments WHERE (metadata->'archive'->>'status') = 'processing' "
+                "ORDER BY created_at LIMIT :limit FOR UPDATE SKIP LOCKED"
+            ),
+            {"limit": int(limit)},
+        )
+        return [_attachment_to_dict(r) for r in result.fetchall()]
+
+    def get_any(self, attachment_id: str, user_id: str) -> Optional[dict]:
+        """Resolve an attachment by either PG UUID or legacy Mongo ObjectId string."""
+        if looks_like_uuid(attachment_id):
+            row = self.get(attachment_id, user_id)
+            if row is not None:
+                return row
+        return self.get_by_legacy_id(attachment_id, user_id)
+
+    def resolve_ids(self, ids: list[str]) -> dict[str, str]:
+        """Batch-resolve a list of attachment ids (PG UUID *or* Mongo
+        ObjectId or post-cutover route-minted UUID stored only in
+        ``legacy_mongo_id``) to their canonical PG ``attachments.id``.
+
+        Returns a ``{input_id: pg_uuid}`` map. Inputs that don't match
+        any row are simply absent from the map (caller decides whether
+        to drop or keep). Single round-trip via ``= ANY(:ids)`` to
+        avoid N+1.
+
+        Resolution prefers ``legacy_mongo_id`` matches first, since
+        the post-cutover ``/store_attachment`` route mints a UUID that
+        is UUID-shaped but only ever lives in ``legacy_mongo_id``
+        (the row's own ``id`` is a fresh PG-generated UUID). A
+        UUID-shaped input that is *also* a real ``attachments.id``
+        falls back to the direct PK match.
+        """
+        if not ids:
+            return {}
+        # Deduplicate while preserving order for stable output mapping.
+        unique_ids: list[str] = []
+        seen: set[str] = set()
+        for raw in ids:
+            if raw is None:
+                continue
+            s = str(raw)
+            if s in seen:
+                continue
+            seen.add(s)
+            unique_ids.append(s)
+        if not unique_ids:
+            return {}
+        result = self._conn.execute(
+            text(
+                "SELECT id::text AS id, legacy_mongo_id "
+                "FROM attachments "
+                "WHERE legacy_mongo_id = ANY(:ids) "
+                "OR id::text = ANY(:ids)"
+            ),
+            {"ids": unique_ids},
+        )
+        rows = result.fetchall()
+        # Build two indexes so we can apply the legacy-first preference.
+        by_legacy: dict[str, str] = {}
+        by_pk: dict[str, str] = {}
+        for row in rows:
+            pg_id = str(row[0])
+            legacy = row[1]
+            by_pk[pg_id] = pg_id
+            if legacy is not None:
+                by_legacy[str(legacy)] = pg_id
+        out: dict[str, str] = {}
+        for s in unique_ids:
+            if s in by_legacy:
+                out[s] = by_legacy[s]
+            elif s in by_pk:
+                out[s] = by_pk[s]
+        return out
+
+    def get_by_legacy_id(self, legacy_mongo_id: str, user_id: str | None = None) -> Optional[dict]:
+        """Fetch an attachment by the original Mongo ObjectId string."""
+        legacy_mongo_id = str(legacy_mongo_id) if legacy_mongo_id is not None else None
+        sql = "SELECT * FROM attachments WHERE legacy_mongo_id = :legacy_id"
+        params: dict[str, str] = {"legacy_id": legacy_mongo_id}
+        if user_id is not None:
+            sql += " AND user_id = :user_id"
+            params["user_id"] = user_id
+        result = self._conn.execute(text(sql), params)
+        row = result.fetchone()
+        return _attachment_to_dict(row) if row is not None else None
+
+    def list_for_planning(self, ids: list[str], user_id: str) -> list[dict]:
+        """Fetch a user's attachments by PG id, without their text.
+
+        The chat attachment planner lists files from earlier turns but never
+        inlines them, so their (up to 100k-token) ``content`` is left out.
+
+        Args:
+            ids: PG ``attachments.id`` values, in the order wanted.
+            user_id: The owner; other users' rows are skipped.
+
+        Returns:
+            The rows found, in the order of ``ids``; unknown or non-UUID ids
+            are skipped.
+        """
+        wanted = [str(i) for i in ids if i is not None and looks_like_uuid(str(i))]
+        if not wanted:
+            return []
+        result = self._conn.execute(
+            text(
+                f"SELECT {_PLANNING_COLUMNS} "
+                "FROM attachments WHERE id = ANY(CAST(:ids AS uuid[])) AND user_id = :user_id"
+            ),
+            {"ids": wanted, "user_id": user_id},
+        )
+        by_id = {}
+        for row in result.fetchall():
+            out = _attachment_to_dict(row)
+            by_id[str(out["id"])] = out
+        rows = [by_id[i] for i in dict.fromkeys(wanted) if i in by_id]
+        return self._with_archive_members(rows, user_id, _PLANNING_COLUMNS)
+
+    def expand_archives(self, rows: list[dict], user_id: str) -> list[dict]:
+        """Follow each zip attachment with its member rows, text included.
+
+        A zip attached to a chat is unpacked by the worker into one row per
+        member; the request names only the zip. Loading a turn's attachments
+        through this puts the members right after their zip, in archive
+        order, so they are planned, read and referenced like any upload.
+
+        Args:
+            rows: Full attachment rows, in upload order.
+            user_id: The owner; only their member rows are added.
+
+        Returns:
+            The rows with members inserted; a row listed twice appears once.
+        """
+        return self._with_archive_members(rows, user_id, "*")
+
+    def _with_archive_members(self, rows: list[dict], user_id: str, columns: str) -> list[dict]:
+        """Insert each archive's member rows after it (owner-scoped, archive order, no repeats)."""
+        parent_ids = [str(r["id"]) for r in rows if is_archive_row(r)]
+        if not parent_ids:
+            return rows
+        result = self._conn.execute(
+            text(
+                f"SELECT {columns} FROM attachments "
+                "WHERE user_id = :user_id AND metadata->>'parent_attachment_id' = ANY(:parent_ids) "
+                "ORDER BY metadata->>'parent_attachment_id', "
+                "CASE WHEN metadata->>'archive_index' ~ '^[0-9]{1,9}$' "
+                "THEN (metadata->>'archive_index')::int END NULLS LAST, created_at"
+            ),
+            {"user_id": user_id, "parent_ids": parent_ids},
+        )
+        members: dict[str, list[dict]] = {}
+        for row in result.fetchall():
+            out = _attachment_to_dict(row)
+            members.setdefault(str(out["metadata"]["parent_attachment_id"]), []).append(out)
+        expanded: list[dict] = []
+        seen: set[str] = set()
+        for row in rows:
+            for item in [row, *members.get(str(row["id"]), [])]:
+                key = str(item["id"])
+                if key not in seen:
+                    seen.add(key)
+                    expanded.append(item)
+        return expanded
+
+    def find_by_hash(
+        self,
+        user_id: str,
+        content_hash: str,
+        *,
+        exclude_legacy_id: Optional[str] = None,
+        archive: Optional[bool] = None,
+    ) -> Optional[dict]:
+        """The user's newest successfully parsed upload of the same bytes.
+
+        Lets an upload of bytes the user already sent reuse the parsed text
+        instead of parsing again; the new upload still gets its own row.
+
+        Args:
+            user_id: The owner; other users' rows are never returned.
+            content_hash: sha256 hex of the original bytes.
+            exclude_legacy_id: Upload handle to skip, so a retried task never
+                matches its own earlier attempt.
+            archive: True to match only zip indexes, False to match only
+                other files (a zip's row holds its index, not text a file
+                with the same bytes could reuse), None for either.
+
+        Returns:
+            The full row, or None when there is no parsed row with that hash
+            (failed parses store no content and are skipped, and so is a zip
+            whose members are still being parsed).
+        """
+        if not content_hash:
+            return None
+        sql = (
+            "SELECT * FROM attachments "
+            "WHERE user_id = :user_id AND content_hash = :content_hash "
+            "AND content IS NOT NULL "
+            "AND (metadata->'archive' IS NULL OR metadata->'archive'->>'status' = 'complete')"
+        )
+        params: dict[str, Any] = {"user_id": user_id, "content_hash": content_hash}
+        if archive is True:
+            sql += " AND metadata->'archive' IS NOT NULL"
+        elif archive is False:
+            sql += " AND metadata->'archive' IS NULL"
+        if exclude_legacy_id is not None:
+            sql += " AND legacy_mongo_id IS DISTINCT FROM :exclude_legacy_id"
+            params["exclude_legacy_id"] = str(exclude_legacy_id)
+        sql += " ORDER BY created_at DESC LIMIT 1"
+        row = self._conn.execute(text(sql), params).fetchone()
+        return _attachment_to_dict(row) if row is not None else None
+
+    def list_for_user(self, user_id: str) -> list[dict]:
+        result = self._conn.execute(
+            text("SELECT * FROM attachments WHERE user_id = :user_id ORDER BY created_at DESC"),
+            {"user_id": user_id},
+        )
+        return [_attachment_to_dict(r) for r in result.fetchall()]
+
+    def update(self, attachment_id: str, user_id: str, fields: dict) -> bool:
+        """Partial update. Used by the LLM providers to cache their
+        uploaded file IDs (``openai_file_id`` / ``google_file_uri``) so we
+        don't re-upload the same blob every call.
+        """
+        filtered = {
+            k: v for k, v in fields.items()
+            if k in _UPDATABLE_SCALARS | _UPDATABLE_JSONB
+        }
+        if not filtered:
+            return False
+        set_clauses: list[str] = []
+        params: dict = {"id": attachment_id, "user_id": user_id}
+        for col, val in filtered.items():
+            val = strip_null_bytes(val)
+            if col in _UPDATABLE_JSONB:
+                set_clauses.append(f"{col} = CAST(:{col} AS jsonb)")
+                params[col] = json.dumps(val) if val is not None else None
+            else:
+                set_clauses.append(f"{col} = :{col}")
+                params[col] = val
+        result = self._conn.execute(
+            text(
+                f"UPDATE attachments SET {', '.join(set_clauses)} "
+                "WHERE id = CAST(:id AS uuid) AND user_id = :user_id"
+            ),
+            params,
+        )
+        return result.rowcount > 0
+
+    def update_any(self, attachment_id: str, user_id: str, fields: dict) -> bool:
+        """Partial update addressed by either PG UUID or legacy Mongo ObjectId.
+
+        Cutover helper used by the LLM provider file-ID caching hot path:
+        the attachment dict in hand may carry a UUID (post-cutover shape)
+        or an ObjectId-string ``_id`` (legacy). Try the UUID path first
+        when the id looks like a UUID; otherwise fall back to the
+        ``legacy_mongo_id`` update. Both branches are user-scoped: the
+        caller must pass the authenticated ``user_id`` so cross-tenant
+        writes are prevented even when the fallback legacy path fires.
+        """
+        if looks_like_uuid(attachment_id):
+            if self.update(attachment_id, user_id, fields):
+                return True
+        return self.update_by_legacy_id(attachment_id, user_id, fields)
+
+    def update_by_legacy_id(
+        self, legacy_mongo_id: str, user_id: str, fields: dict
+    ) -> bool:
+        """Like ``update`` but addressed by the Mongo ObjectId string.
+
+        Used by the LLM file-ID caching path which, at dual-write time,
+        only has the Mongo ``_id`` in hand (the PG UUID hasn't been
+        looked up yet). Scoped by ``user_id`` so a caller that happens to
+        pass an id matching another user's ``legacy_mongo_id`` cannot
+        mutate the wrong row (IDOR).
+        """
+        if user_id is None:
+            return False
+        legacy_mongo_id = str(legacy_mongo_id) if legacy_mongo_id is not None else None
+        filtered = {
+            k: v for k, v in fields.items()
+            if k in _UPDATABLE_SCALARS | _UPDATABLE_JSONB
+        }
+        if not filtered:
+            return False
+        set_clauses: list[str] = []
+        params: dict = {"legacy_id": legacy_mongo_id, "user_id": user_id}
+        for col, val in filtered.items():
+            val = strip_null_bytes(val)
+            if col in _UPDATABLE_JSONB:
+                set_clauses.append(f"{col} = CAST(:{col} AS jsonb)")
+                params[col] = json.dumps(val) if val is not None else None
+            else:
+                set_clauses.append(f"{col} = :{col}")
+                params[col] = val
+        result = self._conn.execute(
+            text(
+                f"UPDATE attachments SET {', '.join(set_clauses)} "
+                "WHERE legacy_mongo_id = :legacy_id AND user_id = :user_id"
+            ),
+            params,
+        )
+        return result.rowcount > 0
+
+    def update_metadata_if_content_null(
+        self, legacy_mongo_id: str, user_id: str, metadata: Any
+    ) -> bool:
+        """Failure-provenance write that refuses to touch stored content.
+
+        The ``content IS NULL`` predicate makes the no-clobber guard atomic:
+        a concurrent success write (task redelivery, the poison guard racing
+        a still-live attempt) can commit between any prior check and this
+        statement, and the row it filled is left alone.
+
+        Returns:
+            True when a NULL-content row was updated.
+        """
+        if user_id is None:
+            return False
+        result = self._conn.execute(
+            text(
+                "UPDATE attachments SET metadata = CAST(:metadata AS jsonb) "
+                "WHERE legacy_mongo_id = :legacy_id AND user_id = :user_id "
+                "AND content IS NULL"
+            ),
+            {
+                "metadata": (
+                    json.dumps(strip_null_bytes(metadata))
+                    if metadata is not None
+                    else None
+                ),
+                "legacy_id": (
+                    str(legacy_mongo_id) if legacy_mongo_id is not None else None
+                ),
+                "user_id": user_id,
+            },
+        )
+        return result.rowcount > 0

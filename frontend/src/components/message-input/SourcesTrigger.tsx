@@ -1,0 +1,78 @@
+import { Database } from 'lucide-react';
+import { useTranslation } from 'react-i18next';
+
+import type { Doc } from '../../models/misc';
+import {
+  MultiSelectPopover,
+  type MultiSelectPopoverItem,
+} from '../MultiSelectPopover';
+import SourcesPopoverFooter from '../SourcesPopoverFooter';
+import { Button } from '../ui/button';
+
+type SourcesTriggerProps = {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  items: MultiSelectPopoverItem[];
+  selectedIds: string[];
+  onToggle: (id: string) => void;
+  selectedDocs: Doc[] | null | undefined;
+  onUploadClick: () => void;
+};
+
+export default function SourcesTrigger({
+  open,
+  onOpenChange,
+  items,
+  selectedIds,
+  onToggle,
+  selectedDocs,
+  onUploadClick,
+}: SourcesTriggerProps) {
+  const { t } = useTranslation();
+
+  return (
+    <MultiSelectPopover
+      open={open}
+      onOpenChange={onOpenChange}
+      title={t('conversation.sources.text')}
+      items={items}
+      selectedIds={selectedIds}
+      onToggle={onToggle}
+      searchPlaceholder={t('settings.sources.searchPlaceholder')}
+      emptyMessage={t('conversation.sources.noSourcesAvailable')}
+      footer={
+        <SourcesPopoverFooter
+          onNavigate={() => onOpenChange(false)}
+          onUploadClick={onUploadClick}
+        />
+      }
+      trigger={
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          shape="pill"
+          className="max-w-[130px] justify-start sm:max-w-[150px]"
+        >
+          <Database className="size-3.5 sm:size-4" />
+          <span
+            className="text-foreground truncate overflow-hidden text-xs sm:text-sm"
+            title={
+              selectedDocs && selectedDocs.length > 0
+                ? selectedDocs.map((doc) => doc.name).join(', ')
+                : undefined
+            }
+          >
+            {selectedDocs && selectedDocs.length > 0
+              ? selectedDocs.length === 1
+                ? selectedDocs[0].name
+                : t('conversation.sources.selectedCount', {
+                    count: selectedDocs.length,
+                  })
+              : t('conversation.sources.knowledge')}
+          </span>
+        </Button>
+      }
+    />
+  );
+}

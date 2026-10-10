@@ -1,0 +1,820 @@
+"""Tests for execute_scheduled_run_body (mocked agent run)."""
+
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
+
+import pytest
+from sqlalchemy import text
+
+from docsgpt.api.user.scheduler_worker import execute_scheduled_run_body
+from docsgpt.storage.db.repositories.schedule_runs import (
+    ScheduleRunsRepository,
+)
+from docsgpt.storage.db.repositories.schedules import SchedulesRepository
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _make_agent(conn, user_id: str = "u1") -> str:
+    row = conn.execute(
+        text(
+            "INSERT INTO agents (user_id, name, status, default_model_id) "
+            "VALUES (:u, 'a', 'draft', '') RETURNING id"
+        ),
+        {"u": user_id},
+    ).fetchone()
+    return str(row[0])
+
+
+def _make_pending_run(conn, *, user_id="u1"):
+    agent_id = _make_agent(conn, user_id)
+    schedule = SchedulesRepository(conn).create(
+        user_id=user_id, agent_id=agent_id, trigger_type="recurring",
+        instruction="hello", cron="* * * * *",
+        next_run_at=_now() + timedelta(minutes=5),
+    )
+    run = ScheduleRunsRepository(conn).record_pending(
+        str(schedule["id"]),
+        user_id,
+        agent_id,
+        _now(),
+    )
+    return schedule, run, agent_id
+
+
+@pytest.fixture
+def patched_engine(pg_engine, monkeypatch):
+    monkeypatch.setattr(
+        "docsgpt.api.user.scheduler_worker.get_engine",
+        lambda: pg_engine,
+    )
+    monkeypatch.setattr(
+        "docsgpt.api.user.scheduler_worker.settings",
+        type("S", (), {
+            "POSTGRES_URI": str(pg_engine.url),
+            "SCHEDULE_AUTOPAUSE_FAILURES": 2,
+        })(),
+    )
+    yield pg_engine
+
+
+@pytest.fixture(autouse=True)
+def quiet_notifications(monkeypatch):
+    """No test here reaches presence, the unread mark or Web Push unless it records them itself."""
+    monkeypatch.setattr("docsgpt.notifications.notify.notify_user", lambda **kw: None)
+
+
+@pytest.fixture
+def stub_events(monkeypatch):
+    captured: list[tuple] = []
+
+    def _fake_publish(user_id, event_type, payload, *, scope=None):
+        captured.append((event_type, payload, scope))
+        return "1-0"
+
+    monkeypatch.setattr(
+        "docsgpt.api.user.scheduler_worker.publish_user_event",
+        _fake_publish,
+    )
+    return captured
+
+
+class TestExecuteScheduledRunBody:
+    def test_success_flow(self, pg_engine, patched_engine, stub_events):
+        with pg_engine.begin() as conn:
+            schedule, run, _ = _make_pending_run(conn)
+        with patch(
+            "docsgpt.api.user.scheduler_worker.run_agent_headless",
+            return_value={
+                "answer": "all done",
+                "tool_calls": [],
+                "sources": [],
+                "thought": "",
+                "prompt_tokens": 10,
+                "generated_tokens": 5,
+                "denied": [],
+                "error_type": None,
+                "model_id": "fake-model",
+            },
+        ):
+            result = execute_scheduled_run_body(str(run["id"]), "celery-1")
+        assert result["status"] == "success"
+        with pg_engine.connect() as conn:
+            row = ScheduleRunsRepository(conn).get_internal(str(run["id"]))
+            sched = SchedulesRepository(conn).get_internal(str(schedule["id"]))
+        assert row["status"] == "success"
+        assert row["output"] == "all done"
+        assert row["prompt_tokens"] == 10
+        assert sched["consecutive_failure_count"] == 0
+        event_types = [e[0] for e in stub_events]
+        assert "schedule.run.completed" in event_types
+
+    def test_agent_exception_marks_failed_and_bumps(
+        self, pg_engine, patched_engine, stub_events,
+    ):
+        with pg_engine.begin() as conn:
+            schedule, run, _ = _make_pending_run(conn)
+        with patch(
+            "docsgpt.api.user.scheduler_worker.run_agent_headless",
+            side_effect=RuntimeError("boom"),
+        ):
+            result = execute_scheduled_run_body(str(run["id"]), "celery-2")
+        assert result["status"] == "failed"
+        with pg_engine.connect() as conn:
+            row = ScheduleRunsRepository(conn).get_internal(str(run["id"]))
+            sched = SchedulesRepository(conn).get_internal(str(schedule["id"]))
+        assert row["status"] == "failed"
+        assert row["error_type"] == "agent_error"
+        assert sched["consecutive_failure_count"] == 1
+        assert "schedule.run.failed" in {e[0] for e in stub_events}
+
+    def test_quota_refusal_marks_budget_exceeded(
+        self, pg_engine, patched_engine, stub_events,
+    ):
+        from datetime import datetime, timezone
+
+        from docsgpt.quotas.service import QuotaExceeded, QuotaExceededError
+
+        exceeded = QuotaExceeded(
+            user_id="u1", bucket="all", budget="tokens", usage=10, limit=10,
+            source="instance", source_id=None,
+            resets_at=datetime(2099, 1, 1, tzinfo=timezone.utc),
+        )
+        with pg_engine.begin() as conn:
+            _, run, _ = _make_pending_run(conn)
+        with patch(
+            "docsgpt.api.user.scheduler_worker.run_agent_headless",
+            side_effect=QuotaExceededError(exceeded),
+        ):
+            result = execute_scheduled_run_body(str(run["id"]), "celery-q")
+        assert result["status"] == "failed"
+        with pg_engine.connect() as conn:
+            row = ScheduleRunsRepository(conn).get_internal(str(run["id"]))
+        assert row["error_type"] == "budget_exceeded"
+        assert "Usage quota reached" in row["error"]
+
+    def test_autopause_after_threshold(
+        self, pg_engine, patched_engine, stub_events,
+    ):
+        with pg_engine.begin() as conn:
+            schedule, run, agent_id = _make_pending_run(conn)
+            SchedulesRepository(conn).bump_failure_count(str(schedule["id"]))
+            another_run = ScheduleRunsRepository(conn).record_pending(
+                str(schedule["id"]),
+                "u1",
+                agent_id,
+                _now() + timedelta(seconds=1),
+            )
+        with patch(
+            "docsgpt.api.user.scheduler_worker.run_agent_headless",
+            side_effect=RuntimeError("boom"),
+        ):
+            execute_scheduled_run_body(str(another_run["id"]), "celery-3")
+        with pg_engine.connect() as conn:
+            sched = SchedulesRepository(conn).get_internal(str(schedule["id"]))
+        assert sched["status"] == "paused"
+        assert "schedule.autopaused" in {e[0] for e in stub_events}
+
+    def test_denied_with_empty_output_marks_tool_not_allowed(
+        self, pg_engine, patched_engine, stub_events,
+    ):
+        with pg_engine.begin() as conn:
+            schedule, run, _ = _make_pending_run(conn)
+        with patch(
+            "docsgpt.api.user.scheduler_worker.run_agent_headless",
+            return_value={
+                "answer": "",
+                "tool_calls": [],
+                "sources": [],
+                "thought": "",
+                "prompt_tokens": 1,
+                "generated_tokens": 0,
+                "denied": [{"tool_name": "telegram"}],
+                "error_type": "tool_not_allowed",
+                "model_id": "fake",
+            },
+        ):
+            execute_scheduled_run_body(str(run["id"]), "celery-4")
+        with pg_engine.connect() as conn:
+            row = ScheduleRunsRepository(conn).get_internal(str(run["id"]))
+        assert row["status"] == "failed"
+        assert row["error_type"] == "tool_not_allowed"
+
+    def test_stream_error_from_runner_marks_failed(
+        self, pg_engine, patched_engine, stub_events,
+    ):
+        """The runner's ``error_type`` must be honoured, not re-derived.
+
+        Regression: the worker only ever inferred ``tool_not_allowed`` itself
+        and never read ``outcome["error_type"]``, so a stream that failed
+        mid-flight was recorded ``success``.
+        """
+        with pg_engine.begin() as conn:
+            schedule, run, _ = _make_pending_run(conn)
+        with patch(
+            "docsgpt.api.user.scheduler_worker.run_agent_headless",
+            return_value={
+                "answer": "",
+                "tool_calls": [],
+                "sources": [],
+                "thought": "",
+                "prompt_tokens": 9417,
+                "generated_tokens": 0,
+                "denied": [],
+                "error_type": "stream_error",
+                "error": "Fallback LLM also failed mid-stream; giving up",
+                "model_id": "fake",
+            },
+        ):
+            result = execute_scheduled_run_body(str(run["id"]), "celery-se")
+        assert result["status"] == "failed"
+        with pg_engine.connect() as conn:
+            row = ScheduleRunsRepository(conn).get_internal(str(run["id"]))
+            sched = SchedulesRepository(conn).get_internal(str(schedule["id"]))
+        assert row["status"] == "failed"
+        assert row["error_type"] == "stream_error"
+        assert "Fallback LLM also failed" in (row["error"] or "")
+        assert sched["consecutive_failure_count"] == 1
+        assert "schedule.run.failed" in {e[0] for e in stub_events}
+
+    def test_empty_output_run_marks_failed(
+        self, pg_engine, patched_engine, stub_events,
+    ):
+        """A run that produced nothing at all is not a success.
+
+        This is the exact prod shape: seven consecutive daily runs recorded
+        ``success`` with NULL output and 0/0 tokens, so nothing surfaced that
+        the user's scheduled agent had been dead since it was created. It is
+        the backstop for silent paths that emit no error event either.
+        """
+        with pg_engine.begin() as conn:
+            schedule, run, _ = _make_pending_run(conn)
+        with patch(
+            "docsgpt.api.user.scheduler_worker.run_agent_headless",
+            return_value={
+                "answer": "",
+                "tool_calls": [],
+                "sources": [],
+                "thought": "",
+                "prompt_tokens": 0,
+                "generated_tokens": 0,
+                "denied": [],
+                "error_type": None,
+                "model_id": "fake",
+            },
+        ):
+            result = execute_scheduled_run_body(str(run["id"]), "celery-eo")
+        assert result["status"] == "failed"
+        with pg_engine.connect() as conn:
+            row = ScheduleRunsRepository(conn).get_internal(str(run["id"]))
+        assert row["status"] == "failed"
+        assert row["error_type"] == "empty_output"
+
+    def test_tool_call_only_run_is_not_empty_output(
+        self, pg_engine, patched_engine, stub_events,
+    ):
+        """A run whose work was tool side effects still counts as a success.
+
+        Guards the backstop against over-reach: "no prose answer" is normal
+        for a schedule whose whole job is to call a tool (post to Slack, file
+        a ticket), so tokens or tool calls are enough to call it a success.
+        """
+        with pg_engine.begin() as conn:
+            schedule, run, _ = _make_pending_run(conn)
+        with patch(
+            "docsgpt.api.user.scheduler_worker.run_agent_headless",
+            return_value={
+                "answer": "",
+                "tool_calls": [{"tool_name": "telegram_send", "result": "ok"}],
+                "sources": [],
+                "thought": "",
+                "prompt_tokens": 120,
+                "generated_tokens": 8,
+                "denied": [],
+                "error_type": None,
+                "model_id": "fake",
+            },
+        ):
+            result = execute_scheduled_run_body(str(run["id"]), "celery-tc")
+        assert result["status"] == "success"
+        with pg_engine.connect() as conn:
+            row = ScheduleRunsRepository(conn).get_internal(str(run["id"]))
+        assert row["status"] == "success"
+        assert row["error_type"] is None
+
+    def test_workflow_run_with_completed_steps_is_not_empty_output(
+        self, pg_engine, patched_engine, stub_events,
+    ):
+        """A workflow that ran its nodes did work, however quiet the stream.
+
+        Workflow tool calls never surface as ``tool_calls`` events (the engine
+        keeps them in its execution log) and node agents own their LLMs, so
+        the runner reports 0 generated tokens. A workflow whose nodes don't
+        stream and whose end node has no output template therefore matches the
+        empty-output shape exactly — ``steps_completed`` is what tells them
+        apart. Without it, every such schedule fails and then autopauses.
+        """
+        with pg_engine.begin() as conn:
+            schedule, run, _ = _make_pending_run(conn)
+        with patch(
+            "docsgpt.api.user.scheduler_worker.run_agent_headless",
+            return_value={
+                "answer": "",
+                "tool_calls": [],
+                "sources": [],
+                "thought": "",
+                "prompt_tokens": 0,
+                "generated_tokens": 0,
+                "denied": [],
+                "error_type": None,
+                "steps_completed": 3,
+                "model_id": "fake",
+            },
+        ):
+            result = execute_scheduled_run_body(str(run["id"]), "celery-wf")
+        assert result["status"] == "success"
+        with pg_engine.connect() as conn:
+            row = ScheduleRunsRepository(conn).get_internal(str(run["id"]))
+        assert row["status"] == "success"
+        assert row["error_type"] is None
+
+    def test_workflow_run_with_no_completed_steps_is_empty_output(
+        self, pg_engine, patched_engine, stub_events,
+    ):
+        """A workflow that completed no node still did nothing."""
+        with pg_engine.begin() as conn:
+            schedule, run, _ = _make_pending_run(conn)
+        with patch(
+            "docsgpt.api.user.scheduler_worker.run_agent_headless",
+            return_value={
+                "answer": "",
+                "tool_calls": [],
+                "sources": [],
+                "thought": "",
+                "prompt_tokens": 0,
+                "generated_tokens": 0,
+                "denied": [],
+                "error_type": None,
+                "steps_completed": 0,
+                "model_id": "fake",
+            },
+        ):
+            result = execute_scheduled_run_body(str(run["id"]), "celery-wf0")
+        assert result["status"] == "failed"
+        with pg_engine.connect() as conn:
+            row = ScheduleRunsRepository(conn).get_internal(str(run["id"]))
+        assert row["error_type"] == "empty_output"
+
+    def test_one_time_loads_chat_history(
+        self, pg_engine, patched_engine, stub_events,
+    ):
+        with pg_engine.begin() as conn:
+            agent_id = _make_agent(conn)
+            schedule = SchedulesRepository(conn).create(
+                user_id="u1", agent_id=agent_id, trigger_type="once",
+                instruction="follow up", run_at=_now() + timedelta(seconds=5),
+                next_run_at=_now(),
+            )
+            conv_id = conn.execute(
+                text(
+                    "INSERT INTO conversations (user_id, agent_id, name) "
+                    "VALUES ('u1', CAST(:a AS uuid), 'origin') RETURNING id"
+                ),
+                {"a": agent_id},
+            ).fetchone()[0]
+            SchedulesRepository(conn).update_internal(
+                str(schedule["id"]),
+                {"origin_conversation_id": str(conv_id)},
+            )
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO conversation_messages
+                        (conversation_id, position, prompt, response, user_id)
+                    VALUES (CAST(:c AS uuid), 0, 'hello', 'hi', 'u1')
+                    """
+                ),
+                {"c": str(conv_id)},
+            )
+            run = ScheduleRunsRepository(conn).record_pending(
+                str(schedule["id"]), "u1", agent_id, _now(),
+            )
+        captured: dict = {}
+        def _fake_run(agent_config, query, **kwargs):
+            captured.update(kwargs)
+            return {
+                "answer": "follow-up answer",
+                "tool_calls": [], "sources": [], "thought": "",
+                "prompt_tokens": 1, "generated_tokens": 1,
+                "denied": [], "error_type": None, "model_id": "fake",
+            }
+        with patch(
+            "docsgpt.api.user.scheduler_worker.run_agent_headless", _fake_run,
+        ):
+            execute_scheduled_run_body(str(run["id"]), "celery-h")
+        assert len(captured.get("chat_history", [])) == 1
+        assert captured["chat_history"][0]["prompt"] == "hello"
+
+    def test_agentless_schedule_uses_system_defaults_and_appends(
+        self, pg_engine, patched_engine, stub_events,
+    ):
+        """Agentless ``once`` schedule → ephemeral classic agent → message appended."""
+        with pg_engine.begin() as conn:
+            conv_id = conn.execute(
+                text(
+                    "INSERT INTO conversations (user_id, name) "
+                    "VALUES ('u1', 'agentless-origin') RETURNING id"
+                )
+            ).fetchone()[0]
+            schedule = SchedulesRepository(conn).create(
+                user_id="u1", agent_id=None, trigger_type="once",
+                instruction="follow up agentless",
+                run_at=_now() + timedelta(seconds=5),
+                next_run_at=_now(),
+                origin_conversation_id=str(conv_id),
+                created_via="chat",
+            )
+            run = ScheduleRunsRepository(conn).record_pending(
+                str(schedule["id"]), "u1", None, _now(),
+            )
+        captured: dict = {}
+
+        def _fake_run(agent_config, query, **kwargs):
+            captured["agent_config"] = agent_config
+            captured["kwargs"] = kwargs
+            return {
+                "answer": "agentless ran",
+                "tool_calls": [], "sources": [], "thought": "",
+                "prompt_tokens": 4, "generated_tokens": 6,
+                "denied": [], "error_type": None, "model_id": "fake",
+            }
+
+        with patch(
+            "docsgpt.api.user.scheduler_worker.run_agent_headless",
+            _fake_run,
+        ):
+            result = execute_scheduled_run_body(str(run["id"]), "celery-agentless")
+        assert result["status"] == "success"
+        # Ephemeral classic config: no source, default retriever, no agent id.
+        cfg = captured["agent_config"]
+        assert cfg["id"] is None
+        assert cfg["user_id"] == "u1"
+        assert cfg["agent_type"] == "classic"
+        assert cfg["retriever"] == "classic"
+        assert cfg["prompt_id"] == "default"
+        with pg_engine.connect() as conn:
+            row = ScheduleRunsRepository(conn).get_internal(str(run["id"]))
+            messages = conn.execute(
+                text(
+                    "SELECT * FROM conversation_messages "
+                    "WHERE conversation_id = CAST(:c AS uuid)"
+                ),
+                {"c": str(conv_id)},
+            ).fetchall()
+        assert row["status"] == "success"
+        assert row["output"] == "agentless ran"
+        assert row["conversation_id"] is not None
+        assert len(messages) == 1
+        # The published event payload tolerates a NULL agent_id.
+        appended_events = [e for e in stub_events if e[0] == "schedule.message.appended"]
+        assert appended_events
+
+    def test_agentless_ephemeral_config_omits_tools_snapshot(
+        self, pg_engine, patched_engine, stub_events,
+    ):
+        """Dead ``tools`` snapshot dropped — toolset is rebuilt at fire time."""
+        with pg_engine.begin() as conn:
+            conv_id = conn.execute(
+                text(
+                    "INSERT INTO conversations (user_id, name) "
+                    "VALUES ('u1', 'no-tools-snap') RETURNING id"
+                )
+            ).fetchone()[0]
+            schedule = SchedulesRepository(conn).create(
+                user_id="u1", agent_id=None, trigger_type="once",
+                instruction="x", run_at=_now() + timedelta(seconds=5),
+                next_run_at=_now(),
+                origin_conversation_id=str(conv_id),
+                created_via="chat",
+            )
+            run = ScheduleRunsRepository(conn).record_pending(
+                str(schedule["id"]), "u1", None, _now(),
+            )
+        captured: dict = {}
+
+        def _fake_run(agent_config, query, **kwargs):
+            captured["agent_config"] = agent_config
+            return {
+                "answer": "ok", "tool_calls": [], "sources": [], "thought": "",
+                "prompt_tokens": 1, "generated_tokens": 1,
+                "denied": [], "error_type": None, "model_id": "fake",
+            }
+
+        with patch(
+            "docsgpt.api.user.scheduler_worker.run_agent_headless",
+            _fake_run,
+        ):
+            execute_scheduled_run_body(str(run["id"]), "celery-no-snap")
+        cfg = captured["agent_config"]
+        # ``tools`` MUST NOT be in the ephemeral shape — the runtime
+        # toolset is rebuilt by ``ToolExecutor`` (which honours headless
+        # filtering for chat-only tools like ``scheduler``).
+        assert "tools" not in cfg
+
+    def test_each_llm_call_is_recorded_once(
+        self, pg_engine, patched_engine, stub_events,
+    ):
+        """A run writes no total of its own: its calls' rows (written as they ran) are the only record."""
+        with pg_engine.begin() as conn:
+            conv_id = conn.execute(
+                text(
+                    "INSERT INTO conversations (user_id, name) "
+                    "VALUES ('u1', 'agentless-tu') RETURNING id"
+                )
+            ).fetchone()[0]
+            schedule = SchedulesRepository(conn).create(
+                user_id="u1", agent_id=None, trigger_type="once",
+                instruction="tu", run_at=_now() + timedelta(seconds=5),
+                next_run_at=_now(),
+                origin_conversation_id=str(conv_id),
+                created_via="chat",
+            )
+            run = ScheduleRunsRepository(conn).record_pending(
+                str(schedule["id"]), "u1", None, _now(),
+            )
+        def _run_with_one_llm_call(*args, **kwargs):
+            # What the usage decorator writes for the run's one LLM call.
+            with pg_engine.begin() as conn:
+                conn.execute(
+                    text(
+                        "INSERT INTO token_usage (user_id, prompt_tokens, generated_tokens, source, model_id) "
+                        "VALUES ('u1', 11, 7, 'agent_stream', 'fake')"
+                    )
+                )
+            return {
+                "answer": "yes",
+                "tool_calls": [], "sources": [], "thought": "",
+                "prompt_tokens": 11, "generated_tokens": 7,
+                "denied": [], "error_type": None, "model_id": "fake",
+            }
+
+        with patch(
+            "docsgpt.api.user.scheduler_worker.run_agent_headless",
+            side_effect=_run_with_one_llm_call,
+        ):
+            execute_scheduled_run_body(str(run["id"]), "celery-tu")
+        with pg_engine.connect() as conn:
+            rows = conn.execute(
+                text("SELECT source, prompt_tokens + generated_tokens AS tokens FROM token_usage WHERE user_id = 'u1'")
+            ).fetchall()
+            run_row = conn.execute(
+                text("SELECT prompt_tokens, generated_tokens FROM schedule_runs WHERE id = CAST(:r AS uuid)"),
+                {"r": str(run["id"])},
+            ).one()
+        assert [(row.source, row.tokens) for row in rows] == [("agent_stream", 18)]
+        # The run keeps its own total on its row.
+        assert (run_row.prompt_tokens, run_row.generated_tokens) == (11, 7)
+
+    def test_one_time_appends_message(
+        self, pg_engine, patched_engine, stub_events,
+    ):
+        with pg_engine.begin() as conn:
+            agent_id = _make_agent(conn)
+            schedule = SchedulesRepository(conn).create(
+                user_id="u1", agent_id=agent_id, trigger_type="once",
+                instruction="hello", run_at=_now() + timedelta(seconds=5),
+                next_run_at=_now(),
+            )
+            conv_id = conn.execute(
+                text(
+                    "INSERT INTO conversations (user_id, agent_id, name) "
+                    "VALUES ('u1', CAST(:a AS uuid), 'origin') RETURNING id"
+                ),
+                {"a": agent_id},
+            ).fetchone()[0]
+            SchedulesRepository(conn).update_internal(
+                str(schedule["id"]),
+                {"origin_conversation_id": str(conv_id)},
+            )
+            run = ScheduleRunsRepository(conn).record_pending(
+                str(schedule["id"]), "u1", agent_id, _now(),
+            )
+        with patch(
+            "docsgpt.api.user.scheduler_worker.run_agent_headless",
+            return_value={
+                "answer": "scheduled answer",
+                "tool_calls": [],
+                "sources": [],
+                "thought": "",
+                "prompt_tokens": 2,
+                "generated_tokens": 3,
+                "denied": [],
+                "error_type": None,
+                "model_id": "fake",
+            },
+        ):
+            execute_scheduled_run_body(str(run["id"]), "celery-5")
+        with pg_engine.connect() as conn:
+            row = ScheduleRunsRepository(conn).get_internal(str(run["id"]))
+            messages = conn.execute(
+                text(
+                    "SELECT * FROM conversation_messages "
+                    "WHERE conversation_id = CAST(:c AS uuid)"
+                ),
+                {"c": str(conv_id)},
+            ).fetchall()
+        assert row["conversation_id"] is not None
+        assert row["message_id"] is not None
+        assert len(messages) == 1
+        meta = messages[0]._mapping["message_metadata"]
+        assert meta.get("scheduled") is True
+        assert "schedule.message.appended" in {e[0] for e in stub_events}
+
+
+class TestOneTimeRunNotifies:
+    """A reminder lands in its conversation while the user may be elsewhere: they are notified like a wake."""
+
+    def _once(self, conn, *, name=None):
+        agent_id = _make_agent(conn)
+        schedule = SchedulesRepository(conn).create(
+            user_id="u1", agent_id=agent_id, trigger_type="once", name=name,
+            instruction="remind me to stretch", run_at=_now() + timedelta(seconds=5), next_run_at=_now(),
+        )
+        conv_id = conn.execute(
+            text(
+                "INSERT INTO conversations (user_id, agent_id, name) "
+                "VALUES ('u1', CAST(:a AS uuid), 'origin') RETURNING id"
+            ),
+            {"a": agent_id},
+        ).fetchone()[0]
+        SchedulesRepository(conn).update_internal(str(schedule["id"]), {"origin_conversation_id": str(conv_id)})
+        run = ScheduleRunsRepository(conn).record_pending(str(schedule["id"]), "u1", agent_id, _now())
+        return str(conv_id), run
+
+    def _execute(self, run, answer):
+        outcome = {
+            "answer": answer, "tool_calls": [], "sources": [], "thought": "", "prompt_tokens": 1,
+            "generated_tokens": 1, "denied": [], "error_type": None, "model_id": "fake",
+        }
+        with patch("docsgpt.api.user.scheduler_worker.run_agent_headless", return_value=outcome):
+            execute_scheduled_run_body(str(run["id"]), "celery-7")
+
+    def test_the_appended_reminder_is_notified(self, pg_engine, patched_engine, stub_events, monkeypatch):
+        notified = []
+        monkeypatch.setattr("docsgpt.notifications.notify.notify_user", lambda **kw: notified.append(kw))
+        with pg_engine.begin() as conn:
+            conv_id, run = self._once(conn, name="Stretch break")
+        self._execute(run, "**Time to stretch!**\n\n- Stand up\n- Roll your shoulders")
+        assert len(notified) == 1
+        sent = notified[0]
+        assert sent["kind"] == "schedule"
+        assert sent["user_id"] == "u1"
+        assert sent["conversation_id"] == conv_id
+        assert sent["url"] == f"/c/{conv_id}"
+        assert sent["title"] == "Stretch break"
+        assert sent["body"] == "Time to stretch! Stand up Roll your shoulders"
+
+    def test_an_unnamed_schedule_is_titled_by_its_instruction(self, pg_engine, patched_engine, stub_events,
+                                                              monkeypatch):
+        notified = []
+        monkeypatch.setattr("docsgpt.notifications.notify.notify_user", lambda **kw: notified.append(kw))
+        with pg_engine.begin() as conn:
+            _conv_id, run = self._once(conn)
+        self._execute(run, "Stretch now.")
+        assert notified[0]["title"] == "remind me to stretch"
+
+    def test_a_run_that_appends_nothing_notifies_nobody(self, pg_engine, patched_engine, stub_events, monkeypatch):
+        notified = []
+        monkeypatch.setattr("docsgpt.notifications.notify.notify_user", lambda **kw: notified.append(kw))
+        with pg_engine.begin() as conn:
+            _schedule, run, _agent = _make_pending_run(conn)
+        self._execute(run, "recurring output")
+        assert notified == []
+
+
+class TestRunAsOwnerAccessRecheck:
+    """A schedule someone set on another user's agent re-checks their access
+    on every run; the run itself always executes as the agent's owner."""
+
+    def _member_run(self, conn, *, grant: bool):
+        import uuid as _uuid
+
+        from docsgpt.storage.db.repositories.team_members import TeamMembersRepository
+        from docsgpt.storage.db.repositories.team_resource_grants import (
+            TeamResourceGrantsRepository,
+        )
+        from docsgpt.storage.db.repositories.teams import TeamsRepository
+
+        agent_id = _make_agent(conn, "owner-x")
+        if grant:
+            team = TeamsRepository(conn).create("T", f"t-{_uuid.uuid4().hex[:8]}", "owner-x")
+            TeamMembersRepository(conn).add_member(str(team["id"]), "member-y")
+            TeamResourceGrantsRepository(conn).grant(
+                str(team["id"]), "agent", agent_id, "owner-x", "owner-x",
+                access_level="viewer",
+            )
+        schedule = SchedulesRepository(conn).create(
+            user_id="member-y", agent_id=agent_id, trigger_type="recurring",
+            instruction="hello", cron="* * * * *",
+            next_run_at=_now() + timedelta(minutes=5),
+        )
+        run = ScheduleRunsRepository(conn).record_pending(
+            str(schedule["id"]), "member-y", agent_id, _now(),
+        )
+        return run
+
+    def test_revoked_member_run_fails_without_running(
+        self, pg_engine, patched_engine, stub_events,
+    ):
+        with pg_engine.begin() as conn:
+            run = self._member_run(conn, grant=False)
+        with patch(
+            "docsgpt.api.user.scheduler_worker.run_agent_headless",
+        ) as headless:
+            result = execute_scheduled_run_body(str(run["id"]), "celery-r")
+        headless.assert_not_called()
+        assert result["status"] == "failed"
+        with pg_engine.connect() as conn:
+            row = ScheduleRunsRepository(conn).get_internal(str(run["id"]))
+        assert row["status"] == "failed"
+        assert row["error"] == "agent access revoked"
+
+    def test_member_with_grant_runs(self, pg_engine, patched_engine, stub_events):
+        with pg_engine.begin() as conn:
+            run = self._member_run(conn, grant=True)
+        with patch(
+            "docsgpt.api.user.scheduler_worker.run_agent_headless",
+            return_value={
+                "answer": "ok", "tool_calls": [], "sources": [], "thought": "",
+                "prompt_tokens": 1, "generated_tokens": 1, "denied": [],
+                "error_type": None, "model_id": "m",
+            },
+        ) as headless:
+            result = execute_scheduled_run_body(str(run["id"]), "celery-g")
+        assert result["status"] == "success"
+        # Runs with the owner's agent row (owner's context).
+        assert headless.call_args.args[0]["user_id"] == "owner-x"
+
+
+_OK = {
+    "answer": "ok", "tool_calls": [], "sources": [], "thought": "",
+    "prompt_tokens": 1, "generated_tokens": 1, "denied": [],
+    "error_type": None, "model_id": "m",
+}
+
+
+class TestCallerRules:
+    """A scheduled run acts as the owner but keeps the rules of whoever set it."""
+
+    def _run(self, conn, *, owner="owner-x", user="owner-x", shared=False, created_via="ui", grant=False):
+        import uuid as _uuid
+
+        from docsgpt.storage.db.repositories.team_members import TeamMembersRepository
+        from docsgpt.storage.db.repositories.team_resource_grants import (
+            TeamResourceGrantsRepository,
+        )
+        from docsgpt.storage.db.repositories.teams import TeamsRepository
+
+        agent_id = _make_agent(conn, owner)
+        conn.execute(text("UPDATE agents SET shared = :s WHERE id = CAST(:id AS uuid)"),
+                     {"s": shared, "id": agent_id})
+        if grant:
+            team = TeamsRepository(conn).create("T", f"t-{_uuid.uuid4().hex[:8]}", owner)
+            TeamMembersRepository(conn).add_member(str(team["id"]), user)
+            TeamResourceGrantsRepository(conn).grant(
+                str(team["id"]), "agent", agent_id, owner, owner, access_level="viewer",
+            )
+        schedule = SchedulesRepository(conn).create(
+            user_id=user, agent_id=agent_id, trigger_type="once", instruction="hello",
+            run_at=_now(), next_run_at=_now(), created_via=created_via,
+        )
+        return ScheduleRunsRepository(conn).record_pending(str(schedule["id"]), user, agent_id, _now())
+
+    def _caller(self, pg_engine, **kwargs):
+        with pg_engine.begin() as conn:
+            run = self._run(conn, **kwargs)
+        with patch("docsgpt.api.user.scheduler_worker.run_agent_headless", return_value=_OK) as headless:
+            assert execute_scheduled_run_body(str(run["id"]), "celery-c")["status"] == "success"
+        return {k: headless.call_args.kwargs.get(k) for k in ("external_caller", "public_link_caller")}
+
+    def test_public_link_users_schedule_runs_as_a_public_link_caller(self, pg_engine, patched_engine, stub_events):
+        assert self._caller(pg_engine, user="stranger", shared=True) == {
+            "external_caller": False, "public_link_caller": True,
+        }
+
+    def test_team_members_schedule_runs_as_a_teammate(self, pg_engine, patched_engine, stub_events):
+        assert self._caller(pg_engine, user="member-y", shared=True, grant=True) == {
+            "external_caller": False, "public_link_caller": False,
+        }
+
+    def test_schedule_set_through_the_api_runs_as_an_external_caller(self, pg_engine, patched_engine, stub_events):
+        assert self._caller(pg_engine, created_via="api") == {
+            "external_caller": True, "public_link_caller": False,
+        }
+
+    def test_owners_own_schedule_runs_as_the_owner(self, pg_engine, patched_engine, stub_events):
+        assert self._caller(pg_engine) == {"external_caller": False, "public_link_caller": False}

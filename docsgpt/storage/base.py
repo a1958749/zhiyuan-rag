@@ -1,0 +1,170 @@
+"""Base storage class for file system abstraction."""
+
+from abc import ABC, abstractmethod
+from typing import BinaryIO, Callable, List, Optional
+
+
+class BaseStorage(ABC):
+    """Abstract base class for storage implementations."""
+
+    @abstractmethod
+    def save_file(self, file_data: BinaryIO, path: str, **kwargs) -> dict:
+        """
+        Save a file to storage.
+
+        Args:
+            file_data: File-like object containing the data
+            path: Path where the file should be stored
+
+        Returns:
+            dict: A dictionary containing metadata about the saved file, including:
+                - 'path': The path where the file was saved
+                - 'storage_type': The type of storage (e.g., 'local', 's3')
+                - Other storage-specific metadata (e.g., 'uri', 'bucket_name', etc.)
+        """
+        pass
+
+    @abstractmethod
+    def get_file(self, path: str) -> BinaryIO:
+        """
+        Retrieve a file from storage.
+
+        Args:
+            path: Path to the file
+
+        Returns:
+            BinaryIO: File-like object containing the file data
+        """
+        pass
+
+    def get_file_size(self, path: str) -> int:
+        """Return a file's encoded size without retaining its bytes in memory.
+
+        Storage backends should override this with a metadata-only lookup. The
+        compatibility fallback seeks an already-open file and is suitable for
+        file-like backends that do not provide object metadata.
+
+        Args:
+            path: Path to the file.
+
+        Returns:
+            File size in bytes.
+        """
+        file_obj = self.get_file(path)
+        try:
+            current = file_obj.tell()
+            file_obj.seek(0, 2)
+            size = file_obj.tell()
+            file_obj.seek(current)
+            return size
+        finally:
+            file_obj.close()
+
+    def generate_presigned_url(
+        self,
+        path: str,
+        expires_in: int = 300,
+        content_type: Optional[str] = None,
+    ) -> str:
+        """Return a short-lived presigned download URL; not all backends support it.
+
+        Args:
+            path: Path to the file
+            expires_in: TTL of the signed URL in seconds
+            content_type: Optional response Content-Type override
+
+        Returns:
+            str: A presigned URL granting time-limited read access
+
+        Raises:
+            NotImplementedError: If the backend cannot mint presigned URLs.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support presigned URLs"
+        )
+
+    @abstractmethod
+    def process_file(self, path: str, processor_func: Callable, **kwargs):
+        """
+        Process a file using the provided processor function.
+
+        This method handles the details of retrieving the file and providing
+        it to the processor function in an appropriate way based on the storage type.
+
+        Args:
+            path: Path to the file
+            processor_func: Function that processes the file
+            **kwargs: Additional arguments to pass to the processor function
+
+        Returns:
+            The result of the processor function
+        """
+        pass
+
+    @abstractmethod
+    def delete_file(self, path: str) -> bool:
+        """
+        Delete a file from storage.
+
+        Args:
+            path: Path to the file
+
+        Returns:
+            bool: True if deletion was successful
+        """
+        pass
+
+    @abstractmethod
+    def file_exists(self, path: str) -> bool:
+        """
+        Check if a file exists.
+
+        Args:
+            path: Path to the file
+
+        Returns:
+            bool: True if the file exists
+        """
+        pass
+
+    @abstractmethod
+    def list_files(self, directory: str) -> List[str]:
+        """
+        List all files in a directory.
+
+        Args:
+            directory: Directory path to list
+
+        Returns:
+            List[str]: List of file paths
+        """
+        pass
+        
+    @abstractmethod
+    def is_directory(self, path: str) -> bool:
+        """
+        Check if a path is a directory.
+
+        Args:
+            path: Path to check
+
+        Returns:
+            bool: True if the path is a directory
+        """
+        pass
+
+    @abstractmethod
+    def remove_directory(self, directory: str) -> bool:
+        """
+        Remove a directory and all its contents.
+
+        For local storage, this removes the directory and all files/subdirectories within it.
+        For S3 storage, this removes all objects with the directory path as a prefix.
+
+        Args:
+            directory: Directory path to remove
+
+        Returns:
+            bool: True if removal was successful, False otherwise
+        """
+        pass

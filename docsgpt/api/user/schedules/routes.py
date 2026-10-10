@@ -1,0 +1,815 @@
+"""Schedules REST API.
+
+A schedule on an agent belongs to the agent's owner: it is stored (and runs)
+under the owner's ``user_id`` whoever creates it, and managing it needs
+``manage_schedules`` on the agent (owner and team editors). A schedule the
+caller made themselves (e.g. via the chat scheduler tool on a shared agent)
+stays theirs to manage.
+"""
+
+from __future__ import annotations
+
+import functools
+import logging
+from datetime import datetime, timezone
+from typing import Any, Callable, Dict, Optional
+
+from flask import current_app, jsonify, make_response, request
+from flask_restx import Namespace, Resource, fields
+
+from docsgpt.agents.scheduler_utils import (
+    ScheduleValidationError,
+    clamp_once_horizon,
+    cron_interval_seconds,
+    next_cron_run,
+    parse_cron,
+    parse_run_at,
+    resolve_timezone,
+)
+from docsgpt.api import api
+from docsgpt.api.user.resource_access import AccessDenied, require
+from docsgpt.core.settings import settings
+from docsgpt.storage.db.base_repository import looks_like_uuid
+from docsgpt.storage.db.repositories.agents import AgentsRepository
+from docsgpt.storage.db.repositories.schedule_runs import (
+    ScheduleRunsRepository,
+)
+from docsgpt.storage.db.repositories.schedules import SchedulesRepository
+from docsgpt.storage.db.session import db_readonly, db_session
+
+
+logger = logging.getLogger(__name__)
+
+
+schedules_ns = Namespace(
+    "schedules", description="Agent schedule management", path="/api",
+)
+
+
+def _ok(data: Any, status: int = 200):
+    return make_response(jsonify(data), status)
+
+
+def _err(message: str, status: int = 400):
+    return make_response(jsonify({"success": False, "message": message}), status)
+
+
+def _safe_route(func: Callable) -> Callable:
+    """Decorator: log + mask exceptions that escape a route body as 500.
+
+    ``ScheduleValidationError`` messages are explicitly surfaced via
+    ``_err(str(exc))`` at each call site (deliberate, user-safe). This
+    decorator only fires for *unexpected* exceptions (DB driver errors,
+    NPEs, etc.) that escape the route body. The full trace is logged
+    server-side; the response body carries no internal detail.
+    """
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except Exception as exc:  # noqa: BLE001
+            try:
+                current_app.logger.exception(
+                    "unhandled exception in schedules route %s: %s",
+                    func.__qualname__, exc,
+                )
+            except RuntimeError:
+                # Out of Flask app context (rare in tests); use module logger.
+                logger.exception(
+                    "unhandled exception in schedules route %s: %s",
+                    func.__qualname__, exc,
+                )
+            return _err("internal error", 500)
+    return wrapper
+
+
+def _format_schedule(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Render a schedule row for the API (id-as-string + ISO timestamps)."""
+    if not row:
+        return {}
+    out = dict(row)
+    for key in (
+        "id", "agent_id", "origin_conversation_id",
+    ):
+        if out.get(key) is not None:
+            out[key] = str(out[key])
+    out.pop("_id", None)  # drop dual-id legacy mirror
+    return out
+
+
+def _format_run(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Render a schedule_run row for the API."""
+    if not row:
+        return {}
+    out = dict(row)
+    for key in (
+        "id", "schedule_id", "agent_id", "conversation_id", "message_id",
+    ):
+        if out.get(key) is not None:
+            out[key] = str(out[key])
+    out.pop("_id", None)
+    return out
+
+
+def _agent_for_schedules(agent_id: str, user_id: str) -> tuple[Dict[str, Any], str]:
+    """The agent row and the id its schedules live under.
+
+    Args:
+        agent_id: Agent id from the URL.
+        user_id: The caller.
+
+    Returns:
+        ``(agent, owner_id)``.
+
+    Raises:
+        AccessDenied: 404 when the agent isn't visible, 403 without
+            ``manage_schedules``.
+    """
+    if not looks_like_uuid(str(agent_id)):
+        raise AccessDenied(404, "agent not found")
+    with db_readonly() as conn:
+        try:
+            ra = require(conn, "agent", agent_id, user_id, "manage_schedules")
+        except AccessDenied as denied:
+            if denied.status == 404:
+                raise AccessDenied(404, "agent not found")
+            raise
+        agent = AgentsRepository(conn).get_by_id(ra.resource_id)
+    if agent is None:
+        raise AccessDenied(404, "agent not found")
+    return agent, ra.owner_id
+
+
+def _schedule_for(conn, schedule_id: str, user_id: str) -> tuple[Dict[str, Any], str]:
+    """Fetch a schedule the caller may manage, and the id to act as.
+
+    The caller's own schedule is always theirs. Otherwise it must be a
+    schedule of an agent they hold ``manage_schedules`` on, stored under
+    that agent's owner (another member's private schedule stays hidden).
+
+    Args:
+        conn: Open database connection.
+        schedule_id: Schedule UUID.
+        user_id: The caller.
+
+    Returns:
+        ``(schedule, acting_user_id)``.
+
+    Raises:
+        AccessDenied: 404 when not visible, 403 when the role can't manage it.
+    """
+    row = SchedulesRepository(conn).get_internal(schedule_id)
+    # A monitor is managed from /api/monitors, never as a schedule.
+    if row is None or row.get("trigger_type") == "monitor":
+        raise AccessDenied(404, "schedule not found")
+    if row.get("user_id") == user_id:
+        return row, user_id
+    agent_id = row.get("agent_id")
+    if not agent_id:
+        raise AccessDenied(404, "schedule not found")
+    try:
+        ra = require(conn, "agent", str(agent_id), user_id, "manage_schedules")
+    except AccessDenied as denied:
+        if denied.status == 404:
+            raise AccessDenied(404, "schedule not found")
+        raise
+    if row.get("user_id") != ra.owner_id:
+        raise AccessDenied(404, "schedule not found")
+    return row, ra.owner_id
+
+
+def _user_id() -> Optional[str]:
+    decoded = getattr(request, "decoded_token", None)
+    if not decoded:
+        return None
+    return decoded.get("sub")
+
+
+def _reschedule_once(
+    existing: Dict[str, Any], run_at_raw: Any, tz_override: Optional[str],
+) -> tuple[Dict[str, Any], Any]:
+    """Validate a new ``run_at`` for a one-time task and build its update.
+
+    Applies the same rules as creating a one-time task: a naive time is read
+    in the task's timezone (the one in the same request, if any), and the time
+    must be in the future and within ``SCHEDULE_ONCE_MAX_HORIZON``. An active
+    task is re-armed at the new time; a paused one keeps ``next_run_at`` empty
+    so that resuming it picks the new ``run_at`` up.
+
+    Args:
+        existing: The stored schedule row.
+        run_at_raw: The ``run_at`` value from the request body.
+        tz_override: The timezone sent in the same request, if any.
+
+    Returns:
+        ``(fields, None)`` with the columns to update, or ``({}, response)``
+        with the error response to return.
+    """
+    if existing.get("trigger_type") != "once":
+        return {}, _err(
+            "run_at can only be changed on a one-time task; "
+            "change a recurring schedule's cron instead",
+        )
+    status = existing.get("status")
+    if status in ("completed", "cancelled"):
+        return {}, _err(f"a {status} task can't be rescheduled", 409)
+    if status == "active" and existing.get("next_run_at") is None:
+        return {}, _err("the task is already running and can't be rescheduled", 409)
+    tz_name = tz_override or existing.get("timezone") or "UTC"
+    try:
+        fire = parse_run_at(run_at_raw, tz_name)
+        clamp_once_horizon(fire, settings.SCHEDULE_ONCE_MAX_HORIZON)
+    except ScheduleValidationError as exc:
+        return {}, _err(str(exc))
+    fields: Dict[str, Any] = {"run_at": fire}
+    if status == "active":
+        fields["next_run_at"] = fire
+    return fields, None
+
+
+def _publish_schedule_event(
+    user_id: str, event_type: str, schedule_id: str, *, status: str,
+) -> None:
+    """Best-effort SSE so other clients revoke a stale schedule state.
+
+    A resume/cancel must override an earlier ``schedule.autopaused``; that
+    envelope is durable and replays from the backlog on reconnect, so
+    without a newer event the schedule reads 'paused' even though it will
+    fire on the next tick.
+    """
+    try:
+        from docsgpt.events.publisher import publish_user_event
+
+        publish_user_event(
+            user_id,
+            event_type,
+            {"schedule_id": str(schedule_id), "status": status},
+            scope={"kind": "schedule", "id": str(schedule_id)},
+        )
+    except Exception:
+        logger.exception(
+            "schedules: publish %s failed for %s", event_type, schedule_id,
+        )
+
+
+@schedules_ns.route("/agents/<string:agent_id>/schedules")
+class AgentSchedules(Resource):
+    @api.doc(description="List schedules for an agent (recurring + one-time).")
+    @_safe_route
+    def get(self, agent_id):
+        user_id = _user_id()
+        if not user_id:
+            return _err("unauthorized", 401)
+        try:
+            agent, owner_id = _agent_for_schedules(agent_id, user_id)
+        except AccessDenied as denied:
+            return _err(denied.message, denied.status)
+        try:
+            with db_readonly() as conn:
+                rows = SchedulesRepository(conn).list_for_agent(
+                    str(agent["id"]), owner_id,
+                )
+        except Exception as exc:
+            current_app.logger.error("list schedules failed: %s", exc, exc_info=True)
+            return _err("internal error", 500)
+        return _ok({"schedules": [_format_schedule(r) for r in rows]})
+
+    create_model = api.model(
+        "ScheduleCreate",
+        {
+            "instruction": fields.String(required=True),
+            "trigger_type": fields.String(
+                required=False,
+                description="'recurring' (default) or 'once'",
+            ),
+            "cron": fields.String(
+                required=False,
+                description="Required when trigger_type == 'recurring'",
+            ),
+            "run_at": fields.String(
+                required=False,
+                description="ISO 8601 — required when trigger_type == 'once'",
+            ),
+            "timezone": fields.String(required=False),
+            "name": fields.String(required=False),
+            "end_at": fields.String(required=False, description="ISO 8601"),
+            "tool_allowlist": fields.List(fields.String, required=False),
+            "model_id": fields.String(required=False),
+            "token_budget": fields.Integer(required=False),
+        },
+    )
+
+    @api.expect(create_model)
+    @api.doc(description="Create a schedule (recurring or one-time) for an agent.")
+    @_safe_route
+    def post(self, agent_id):
+        user_id = _user_id()
+        if not user_id:
+            return _err("unauthorized", 401)
+        try:
+            agent, owner_id = _agent_for_schedules(agent_id, user_id)
+        except AccessDenied as denied:
+            return _err(denied.message, denied.status)
+        data = request.get_json(silent=True) or {}
+        instruction = (data.get("instruction") or "").strip()
+        tz_name = (data.get("timezone") or "UTC").strip() or "UTC"
+        trigger_type = (data.get("trigger_type") or "recurring").strip().lower()
+        if trigger_type not in ("recurring", "once"):
+            return _err("trigger_type must be 'recurring' or 'once'")
+        if not instruction:
+            return _err("instruction is required")
+        try:
+            resolve_timezone(tz_name)
+        except ScheduleValidationError as exc:
+            return _err(str(exc))
+        token_budget = data.get("token_budget")
+        if token_budget is not None:
+            try:
+                token_budget = int(token_budget)
+                if token_budget < 0:
+                    raise ValueError
+            except (TypeError, ValueError):
+                return _err("token_budget must be a non-negative integer")
+        with db_readonly() as conn:
+            count = SchedulesRepository(conn).count_active_for_user(owner_id)
+        if (
+            settings.SCHEDULE_MAX_PER_USER > 0
+            and count >= settings.SCHEDULE_MAX_PER_USER
+        ):
+            return _err("max schedules per user reached", 429)
+
+        if trigger_type == "once":
+            run_at_raw = (data.get("run_at") or "").strip()
+            if not run_at_raw:
+                return _err("run_at is required for trigger_type 'once'")
+            try:
+                fire = parse_run_at(run_at_raw, tz_name)
+                clamp_once_horizon(
+                    fire, settings.SCHEDULE_ONCE_MAX_HORIZON,
+                )
+            except ScheduleValidationError as exc:
+                return _err(str(exc))
+            try:
+                with db_session() as conn:
+                    created = SchedulesRepository(conn).create(
+                        user_id=owner_id,
+                        agent_id=str(agent["id"]),
+                        trigger_type="once",
+                        instruction=instruction,
+                        run_at=fire,
+                        next_run_at=fire,
+                        timezone=tz_name,
+                        name=(data.get("name") or "").strip() or None,
+                        tool_allowlist=data.get("tool_allowlist") or [],
+                        model_id=(data.get("model_id") or None),
+                        token_budget=token_budget,
+                        created_via="ui",
+                    )
+            except Exception as exc:
+                current_app.logger.error(
+                    "create one-time schedule failed: %s", exc, exc_info=True,
+                )
+                return _err("internal error", 500)
+            return _ok({"schedule": _format_schedule(created)}, status=201)
+
+        cron = (data.get("cron") or "").strip()
+        if not cron:
+            return _err("cron is required")
+        try:
+            parse_cron(cron)
+        except ScheduleValidationError as exc:
+            return _err(str(exc))
+        min_interval = max(0, int(settings.SCHEDULE_MIN_INTERVAL))
+        if min_interval > 0:
+            try:
+                cadence = cron_interval_seconds(cron, tz_name)
+            except ScheduleValidationError as exc:
+                return _err(str(exc))
+            if cadence < min_interval:
+                return _err(
+                    "cadence below minimum interval "
+                    f"({cadence}s < {min_interval}s)",
+                )
+        end_at = None
+        if data.get("end_at"):
+            try:
+                end_at = datetime.fromisoformat(
+                    str(data["end_at"]).replace("Z", "+00:00"),
+                )
+            except ValueError:
+                return _err("invalid end_at")
+        try:
+            next_run = next_cron_run(cron, tz_name, after=datetime.now(timezone.utc))
+        except ScheduleValidationError as exc:
+            return _err(str(exc))
+        if end_at is not None and next_run > end_at:
+            return _err("end_at is before the first cron tick")
+        try:
+            with db_session() as conn:
+                created = SchedulesRepository(conn).create(
+                    user_id=owner_id,
+                    agent_id=str(agent["id"]),
+                    trigger_type="recurring",
+                    instruction=instruction,
+                    cron=cron,
+                    timezone=tz_name,
+                    next_run_at=next_run,
+                    end_at=end_at,
+                    name=(data.get("name") or "").strip() or None,
+                    tool_allowlist=data.get("tool_allowlist") or [],
+                    model_id=(data.get("model_id") or None),
+                    token_budget=token_budget,
+                    created_via="ui",
+                )
+        except Exception as exc:
+            current_app.logger.error(
+                "create schedule failed: %s", exc, exc_info=True,
+            )
+            return _err("internal error", 500)
+        return _ok({"schedule": _format_schedule(created)}, status=201)
+
+
+@schedules_ns.route("/agents/<string:agent_id>/schedules/stats")
+class AgentScheduleStats(Resource):
+    @api.doc(
+        description="Run stats for an agent's schedules over a recent window.",
+        params={"days": "Window in days (default 30, clamped to 1..365)"},
+    )
+    @_safe_route
+    def get(self, agent_id: str):
+        """Return run count, failures, tokens and latest failure for an agent.
+
+        Args:
+            agent_id: Agent id from the URL.
+
+        Returns:
+            A Flask response with ``days``, ``runs``, ``failed``, ``tokens``
+            and ``latest_failure`` (or an error envelope).
+        """
+        user_id = _user_id()
+        if not user_id:
+            return _err("unauthorized", 401)
+        try:
+            agent, owner_id = _agent_for_schedules(agent_id, user_id)
+        except AccessDenied as denied:
+            return _err(denied.message, denied.status)
+        try:
+            days = max(1, min(int(request.args.get("days", 30)), 365))
+        except (TypeError, ValueError):
+            days = 30
+        try:
+            with db_readonly() as conn:
+                stats = ScheduleRunsRepository(conn).stats_for_agent(
+                    str(agent["id"]), owner_id, days=days,
+                )
+        except Exception as exc:
+            current_app.logger.error(
+                "schedule stats failed: %s", exc, exc_info=True,
+            )
+            return _err("internal error", 500)
+        latest = stats.get("latest_failure")
+        return _ok(
+            {
+                "days": days,
+                "runs": stats["runs"],
+                "failed": stats["failed"],
+                "tokens": stats["tokens"],
+                "latest_failure": _format_run(latest) if latest else None,
+            }
+        )
+
+
+@schedules_ns.route("/schedules/<string:schedule_id>")
+class ScheduleResource(Resource):
+    @api.doc(description="Get schedule by id.")
+    @_safe_route
+    def get(self, schedule_id):
+        user_id = _user_id()
+        if not user_id:
+            return _err("unauthorized", 401)
+        if not looks_like_uuid(schedule_id):
+            return _err("invalid schedule id", 400)
+        with db_readonly() as conn:
+            try:
+                row, _acting = _schedule_for(conn, schedule_id, user_id)
+            except AccessDenied as denied:
+                return _err(denied.message, denied.status)
+        return _ok({"schedule": _format_schedule(row)})
+
+    @api.doc(description="Edit a schedule's editable fields.")
+    @_safe_route
+    def put(self, schedule_id):
+        user_id = _user_id()
+        if not user_id:
+            return _err("unauthorized", 401)
+        if not looks_like_uuid(schedule_id):
+            return _err("invalid schedule id", 400)
+        data = request.get_json(silent=True) or {}
+        fields_in: Dict[str, Any] = {}
+        if "instruction" in data:
+            inst = (data["instruction"] or "").strip()
+            if not inst:
+                return _err("instruction must not be empty")
+            fields_in["instruction"] = inst
+        if "cron" in data:
+            cron = (data["cron"] or "").strip()
+            try:
+                parse_cron(cron)
+            except ScheduleValidationError as exc:
+                return _err(str(exc))
+            fields_in["cron"] = cron
+        if "timezone" in data:
+            tz_name = (data["timezone"] or "UTC").strip() or "UTC"
+            try:
+                resolve_timezone(tz_name)
+            except ScheduleValidationError as exc:
+                return _err(str(exc))
+            fields_in["timezone"] = tz_name
+        if "tool_allowlist" in data:
+            fields_in["tool_allowlist"] = data["tool_allowlist"] or []
+        if "name" in data:
+            fields_in["name"] = (data["name"] or "").strip() or None
+        if "model_id" in data:
+            fields_in["model_id"] = (data["model_id"] or None)
+        if "token_budget" in data:
+            tb = data["token_budget"]
+            if tb is not None:
+                try:
+                    tb = int(tb)
+                    if tb < 0:
+                        raise ValueError
+                except (TypeError, ValueError):
+                    return _err("token_budget must be a non-negative integer")
+            fields_in["token_budget"] = tb
+        if "end_at" in data:
+            if data["end_at"]:
+                try:
+                    fields_in["end_at"] = datetime.fromisoformat(
+                        str(data["end_at"]).replace("Z", "+00:00"),
+                    )
+                except ValueError:
+                    return _err("invalid end_at")
+            else:
+                fields_in["end_at"] = None
+        # Recompute next_run_at when cron/tz changes.
+        with db_session() as conn:
+            try:
+                existing, acting = _schedule_for(conn, schedule_id, user_id)
+            except AccessDenied as denied:
+                return _err(denied.message, denied.status)
+            if "run_at" in data:
+                rescheduled, error = _reschedule_once(
+                    existing, data["run_at"], fields_in.get("timezone"),
+                )
+                if error is not None:
+                    return error
+                fields_in.update(rescheduled)
+            if (
+                ("cron" in fields_in or "timezone" in fields_in)
+                and existing.get("trigger_type") == "recurring"
+            ):
+                cron_eff = fields_in.get("cron") or existing.get("cron")
+                tz_eff = fields_in.get("timezone") or existing.get("timezone")
+                if cron_eff:
+                    min_interval = max(0, int(settings.SCHEDULE_MIN_INTERVAL))
+                    if min_interval > 0:
+                        try:
+                            cadence = cron_interval_seconds(cron_eff, tz_eff)
+                        except ScheduleValidationError as exc:
+                            return _err(str(exc))
+                        if cadence < min_interval:
+                            return _err(
+                                "cadence below minimum interval "
+                                f"({cadence}s < {min_interval}s)",
+                            )
+                    try:
+                        fields_in["next_run_at"] = next_cron_run(
+                            cron_eff, tz_eff, after=datetime.now(timezone.utc),
+                        )
+                    except ScheduleValidationError as exc:
+                        return _err(str(exc))
+            # A reschedule only lands on a task that is still pending: the
+            # dispatcher may have claimed it (or someone paused it) since it
+            # was read above, and re-arming it then would lose the edit.
+            updated = SchedulesRepository(conn).update(
+                schedule_id, acting, fields_in,
+                pending_once_status=(
+                    existing.get("status") if "run_at" in data else None
+                ),
+            )
+            if updated is None and "run_at" in data:
+                return _err(
+                    "the task started or changed while you edited it; reload and try again",
+                    409,
+                )
+        return _ok({"schedule": _format_schedule(updated or {})})
+
+    @api.doc(description="Pause / resume a schedule.")
+    @_safe_route
+    def patch(self, schedule_id):
+        user_id = _user_id()
+        if not user_id:
+            return _err("unauthorized", 401)
+        if not looks_like_uuid(schedule_id):
+            return _err("invalid schedule id", 400)
+        data = request.get_json(silent=True) or {}
+        action = (data.get("action") or "").lower().strip()
+        if action not in {"pause", "resume"}:
+            return _err("action must be 'pause' or 'resume'")
+        with db_session() as conn:
+            try:
+                existing, acting = _schedule_for(conn, schedule_id, user_id)
+            except AccessDenied as denied:
+                return _err(denied.message, denied.status)
+            if existing.get("status") in ("cancelled", "completed"):
+                return _err("schedule is terminal", 409)
+            if action == "pause":
+                fields_in: Dict[str, Any] = {"status": "paused", "next_run_at": None}
+            else:
+                # Resume: recurring recomputes from now; once honours run_at if still future.
+                fields_in = {"status": "active"}
+                if existing.get("trigger_type") == "recurring":
+                    try:
+                        fields_in["next_run_at"] = next_cron_run(
+                            existing["cron"],
+                            existing["timezone"],
+                            after=datetime.now(timezone.utc),
+                        )
+                    except ScheduleValidationError as exc:
+                        return _err(str(exc))
+                else:
+                    new_run_at = data.get("run_at")
+                    if new_run_at:
+                        try:
+                            run_at_dt = datetime.fromisoformat(
+                                str(new_run_at).replace("Z", "+00:00"),
+                            )
+                        except ValueError:
+                            return _err("invalid run_at")
+                        if run_at_dt <= datetime.now(timezone.utc):
+                            return _err(
+                                "run_at must be in the future to resume", 409,
+                            )
+                        fields_in["next_run_at"] = run_at_dt
+                        fields_in["run_at"] = run_at_dt
+                    else:
+                        run_at = existing.get("run_at")
+                        if run_at:
+                            if isinstance(run_at, str):
+                                try:
+                                    run_at_dt = datetime.fromisoformat(
+                                        run_at.replace("Z", "+00:00"),
+                                    )
+                                except ValueError:
+                                    return _err("schedule run_at is invalid")
+                            else:
+                                run_at_dt = run_at
+                            if run_at_dt <= datetime.now(timezone.utc):
+                                return _err(
+                                    "the once schedule has elapsed; recreate "
+                                    "it or supply a new run_at",
+                                    409,
+                                )
+                            fields_in["next_run_at"] = run_at_dt
+            updated = SchedulesRepository(conn).update(
+                schedule_id, acting, fields_in,
+            )
+            if action == "resume":
+                SchedulesRepository(conn).reset_failure_count(schedule_id)
+        if action == "resume" and updated:
+            _publish_schedule_event(
+                acting, "schedule.resumed", schedule_id, status="active",
+            )
+        return _ok({"schedule": _format_schedule(updated or {})})
+
+    @api.doc(description="Cancel / delete a schedule.")
+    @_safe_route
+    def delete(self, schedule_id):
+        user_id = _user_id()
+        if not user_id:
+            return _err("unauthorized", 401)
+        if not looks_like_uuid(schedule_id):
+            return _err("invalid schedule id", 400)
+        with db_session() as conn:
+            try:
+                _row, acting = _schedule_for(conn, schedule_id, user_id)
+            except AccessDenied as denied:
+                return _err(denied.message, denied.status)
+            ok = SchedulesRepository(conn).delete(schedule_id, acting)
+        if not ok:
+            return _err("schedule not found", 404)
+        _publish_schedule_event(
+            acting, "schedule.cancelled", schedule_id, status="cancelled",
+        )
+        return _ok({"success": True})
+
+
+@schedules_ns.route("/schedules/<string:schedule_id>/run")
+class ScheduleRunNow(Resource):
+    @api.doc(description="Run a schedule immediately (trigger_source='manual').")
+    @_safe_route
+    def post(self, schedule_id):
+        user_id = _user_id()
+        if not user_id:
+            return _err("unauthorized", 401)
+        if not looks_like_uuid(schedule_id):
+            return _err("invalid schedule id", 400)
+        # FOR UPDATE serializes concurrent Run-Now POSTs (timestamp-unique
+        # scheduled_for values would otherwise sneak past the unique index).
+        with db_session() as conn:
+            try:
+                _row, acting = _schedule_for(conn, schedule_id, user_id)
+            except AccessDenied as denied:
+                return _err(denied.message, denied.status)
+            schedule = SchedulesRepository(conn).get_for_update(
+                schedule_id, acting,
+            )
+            if schedule is None:
+                return _err("schedule not found", 404)
+            if schedule.get("status") == "cancelled":
+                return _err("schedule is cancelled", 409)
+            if ScheduleRunsRepository(conn).has_active_run(schedule_id):
+                return _err("a run is already in flight", 409)
+            scheduled_for = datetime.now(timezone.utc)
+            agent_id_raw = schedule.get("agent_id")
+            # The run belongs to (and executes as) the schedule's owner.
+            run = ScheduleRunsRepository(conn).record_pending(
+                schedule_id,
+                acting,
+                str(agent_id_raw) if agent_id_raw else None,
+                scheduled_for,
+                trigger_source="manual",
+            )
+        if run is None:
+            return _err("could not claim run (concurrent dispatch)", 409)
+        # Import inside the handler to avoid a circular tasks <-> routes import.
+        try:
+            from docsgpt.api.user.tasks import execute_scheduled_run
+            execute_scheduled_run.apply_async(args=[str(run["id"])], queue="docsgpt")
+        except Exception as exc:
+            current_app.logger.error(
+                "run-now enqueue failed: %s", exc, exc_info=True,
+            )
+            return _err("enqueue failed", 500)
+        return _ok({"run": _format_run(run)}, status=202)
+
+
+@schedules_ns.route("/schedules/<string:schedule_id>/runs")
+class ScheduleRunList(Resource):
+    @api.doc(
+        description="Paginated run log for a schedule.",
+        params={"limit": "Page size (default 50)", "offset": "Page offset"},
+    )
+    @_safe_route
+    def get(self, schedule_id):
+        user_id = _user_id()
+        if not user_id:
+            return _err("unauthorized", 401)
+        if not looks_like_uuid(schedule_id):
+            return _err("invalid schedule id", 400)
+        try:
+            limit = max(1, min(int(request.args.get("limit", 50)), 200))
+        except (TypeError, ValueError):
+            limit = 50
+        try:
+            offset = max(0, int(request.args.get("offset", 0)))
+        except (TypeError, ValueError):
+            offset = 0
+        with db_readonly() as conn:
+            try:
+                _schedule, acting = _schedule_for(conn, schedule_id, user_id)
+            except AccessDenied as denied:
+                return _err(denied.message, denied.status)
+            rows = ScheduleRunsRepository(conn).list_runs(
+                schedule_id, acting, limit=limit, offset=offset,
+            )
+        return _ok(
+            {
+                "runs": [_format_run(r) for r in rows],
+                "limit": limit,
+                "offset": offset,
+            }
+        )
+
+
+@schedules_ns.route("/schedules/<string:schedule_id>/runs/<string:run_id>")
+class ScheduleRunDetail(Resource):
+    @api.doc(description="Full output / error for a single run.")
+    @_safe_route
+    def get(self, schedule_id, run_id):
+        user_id = _user_id()
+        if not user_id:
+            return _err("unauthorized", 401)
+        if not looks_like_uuid(schedule_id) or not looks_like_uuid(run_id):
+            return _err("invalid id", 400)
+        with db_readonly() as conn:
+            try:
+                schedule, acting = _schedule_for(conn, schedule_id, user_id)
+            except AccessDenied as denied:
+                return _err(denied.message, denied.status)
+            run = ScheduleRunsRepository(conn).get(run_id, acting)
+            if run is None or str(run.get("schedule_id")) != str(
+                schedule["id"]
+            ):
+                return _err("run not found", 404)
+        return _ok({"run": _format_run(run)})

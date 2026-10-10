@@ -1,0 +1,8 @@
+{
+  "repository": "https://github.com/arc53/DocsGPT",
+  "commit": "43bc3dfd0e0fca2246e669e34aadabe03fa70a1d",
+  "source_archive_sha256": "b73a27379f51d252dc3ef38ce621fe49b9e31a14d99e57418d8965a5eada0eed",
+  "acquired_on": "2026-10-08",
+  "license": "MIT",
+  "import_method": "Official GitHub commit archive; local history begins at verified import."
+}

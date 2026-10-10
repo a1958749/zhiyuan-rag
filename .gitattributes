@@ -1,0 +1,5 @@
+# Auto detect text files and perform LF normalization
+* text=auto
+
+# Frozen tokenizer ranks are hash-verified at runtime; preserve their exact bytes.
+docsgpt/core/encodings/*.tiktoken -text

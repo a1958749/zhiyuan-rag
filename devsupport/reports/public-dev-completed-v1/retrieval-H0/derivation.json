@@ -1,0 +1,575 @@
+{
+  "schema": "devsupport.public-record.v1",
+  "source_name": "H0.jsonl",
+  "source_sha256": "5203b24ed5482e3fc359c2b6ab87444c6ceb6d5552a94587b8f0f7ca25558c5a",
+  "rows": 53,
+  "ordered_query_ids": [
+    "76184540",
+    "76404464",
+    "76447153",
+    "76482024",
+    "76482987",
+    "76574260",
+    "76621589",
+    "76768113",
+    "76864606",
+    "76906469",
+    "77018045",
+    "77082429",
+    "77124499",
+    "77217193",
+    "77231728",
+    "77365175",
+    "77376190",
+    "77438980",
+    "77470249",
+    "77507520",
+    "77520963",
+    "77561864",
+    "77570838",
+    "77660869",
+    "77679383",
+    "77683730",
+    "77714704",
+    "77759618",
+    "77797689",
+    "77844073",
+    "77868284",
+    "77910495",
+    "77921898",
+    "77981098",
+    "78020395",
+    "78023380",
+    "78023750",
+    "78052517",
+    "78100828",
+    "78165764",
+    "78171159",
+    "78171598",
+    "78188862",
+    "78216871",
+    "78314847",
+    "78409544",
+    "78472764",
+    "78481278",
+    "78485621",
+    "78489329",
+    "78503869",
+    "78549270",
+    "78631323"
+  ],
+  "method": "H0",
+  "rules": {
+    "schema": "devsupport.public-record.v1",
+    "projection": {
+      "query_id": "atom",
+      "query_sha256": "atom",
+      "elapsed_seconds": "atom",
+      "error": "atom",
+      "status": "atom",
+      "packet_sha256": "atom",
+      "manifest_sha256": "atom",
+      "seed": "atom",
+      "provider_error_code": "atom",
+      "profile": "atom",
+      "ranked_ids": [
+        "text"
+      ],
+      "score_kinds": [
+        "text"
+      ],
+      "prepack_ids": [
+        "text"
+      ],
+      "packed_ids": [
+        "text"
+      ],
+      "scores": [
+        "number"
+      ],
+      "prepack_scores": [
+        "number"
+      ],
+      "metrics": [
+        "metrics",
+        "number"
+      ],
+      "metrics_prepack": [
+        "metrics",
+        "number"
+      ],
+      "metrics_packed": [
+        "metrics",
+        "number"
+      ],
+      "stage_seconds": {
+        "dense_seconds": "number",
+        "embedding_seconds": "number",
+        "fusion_seconds": "number",
+        "lexical_seconds": "number",
+        "total_seconds": "number"
+      },
+      "leg_ids": {
+        "dense": [
+          "text"
+        ],
+        "lexical": [
+          "text"
+        ]
+      },
+      "context_sha256": [
+        "map",
+        "text"
+      ],
+      "hits": [
+        {
+          "doc_id": "atom",
+          "score": "atom",
+          "rank": "atom",
+          "score_kind": "atom"
+        }
+      ],
+      "result": {
+        "answer_text": "atom",
+        "decision": "atom",
+        "evaluation_phase": "atom",
+        "prompt_hash": "atom",
+        "query": "atom",
+        "runtime_hash": "atom",
+        "search_id": "atom",
+        "cost": "atom",
+        "cost_scope": "atom",
+        "cost_status": "atom",
+        "citation_ids": [
+          "text"
+        ],
+        "evidence_ids": [
+          "text"
+        ],
+        "ranked_ids": [
+          "text"
+        ],
+        "score_kinds": [
+          "text"
+        ],
+        "scores": [
+          "number"
+        ],
+        "missing_information": [
+          "text"
+        ],
+        "context": [
+          {
+            "doc_id": "atom",
+            "text": "atom",
+            "citation_number": "atom",
+            "rank": "atom",
+            "score": "atom",
+            "score_kind": "atom",
+            "metadata": {
+              "url": "atom",
+              "start_byte": "atom",
+              "end_byte": "atom"
+            }
+          }
+        ],
+        "trace": {
+          "elapsed_seconds": "number",
+          "final_candidate_ids": [
+            "text"
+          ],
+          "adaptive": {
+            "additional_rounds": "atom",
+            "anchored_query_count": "atom",
+            "anchoring_error": "atom",
+            "anchoring_policy": "atom",
+            "failure_code": "atom",
+            "failure_stage": "atom",
+            "fallback": "atom",
+            "preflight_policy": "atom",
+            "reason": "atom",
+            "triggered": "atom",
+            "appended_identifiers": [
+              "text"
+            ],
+            "effective_subqueries": [
+              "text"
+            ],
+            "model_subqueries": [
+              "text"
+            ],
+            "subqueries": [
+              "text"
+            ]
+          },
+          "gate": {
+            "decision": "atom",
+            "enabled": "atom",
+            "reason": "atom",
+            "missing_information": [
+              "text"
+            ]
+          },
+          "generation": {
+            "attempts": "number",
+            "error": "atom",
+            "validation_failures": [
+              {
+                "error": "text"
+              }
+            ]
+          },
+          "packing": {
+            "budget": "atom",
+            "counter": "atom",
+            "exact_generation_tokens": "atom",
+            "used": "atom",
+            "skipped_ids": [
+              "text"
+            ]
+          },
+          "prompt_versions": {
+            "answer": "text",
+            "decomposition": "text",
+            "gate": "text"
+          },
+          "provider_calls": [
+            {
+              "stage": "atom",
+              "attempts": "atom",
+              "cost": "atom",
+              "cost_status": "atom",
+              "elapsed_seconds": "atom",
+              "error": "atom",
+              "actual_model": "atom",
+              "requested_model": "atom",
+              "expected_reported_model": "atom",
+              "identity_status": "atom",
+              "known_response_cost": "atom",
+              "max_tokens": "atom",
+              "pacing_status": "atom",
+              "pacing_wait_seconds": "atom",
+              "prompt_hash": "atom",
+              "protocol": "atom",
+              "reasoning_prefix_removed": "atom",
+              "stop_reason": "atom",
+              "thinking": "atom",
+              "truncated": "atom",
+              "provider_error_code": "atom",
+              "usage": {
+                "input_tokens": "number",
+                "output_tokens": "number",
+                "cache_read_input_tokens": "number",
+                "cache_creation_input_tokens": "number"
+              },
+              "http_error": {
+                "status_code": "atom",
+                "retry_after_seconds": "atom",
+                "provider_error_code": "atom",
+                "provider_error_type": "atom"
+              },
+              "events": [
+                {
+                  "attempt": "atom",
+                  "status": "atom",
+                  "cost": "atom",
+                  "pacing_wait_seconds": "atom",
+                  "usage": {
+                    "input_tokens": "number",
+                    "output_tokens": "number",
+                    "cache_read_input_tokens": "number",
+                    "cache_creation_input_tokens": "number"
+                  }
+                }
+              ]
+            }
+          ],
+          "reranking": [
+            {
+              "requested_model": "atom",
+              "revision": "atom",
+              "actual_model": "atom",
+              "variant": "atom",
+              "device": "atom",
+              "fallback": "atom",
+              "error": "atom",
+              "forward_count": "atom",
+              "instruction": "atom",
+              "query_cap": "atom",
+              "document_cap": "atom",
+              "dtype": "atom",
+              "attention": "atom",
+              "prepared_sha256": "atom",
+              "elapsed_seconds": "atom",
+              "peak_gpu_bytes": "atom",
+              "input_ids": [
+                "text"
+              ],
+              "prompt_token_counts": [
+                "number"
+              ],
+              "model_files_sha256": [
+                "map",
+                [
+                  "text_or_object",
+                  {
+                    "sha256": "text",
+                    "bytes": "number"
+                  }
+                ]
+              ],
+              "lengths": {
+                "query": {
+                  "original": "number",
+                  "retained": "number"
+                },
+                "documents": [
+                  {
+                    "original": "number",
+                    "retained": "number"
+                  }
+                ]
+              },
+              "outputs": [
+                {
+                  "doc_id": "atom",
+                  "score": "atom",
+                  "rank": "atom",
+                  "score_kind": "atom"
+                }
+              ],
+              "retries": [
+                {
+                  "attempt": "atom",
+                  "error": "atom",
+                  "batch_size": "atom",
+                  "elapsed_seconds": "atom"
+                }
+              ]
+            }
+          ],
+          "retrieval": [
+            {
+              "ids": [
+                "text"
+              ],
+              "leg_ids": {
+                "dense": [
+                  "text"
+                ],
+                "lexical": [
+                  "text"
+                ]
+              },
+              "query": "text",
+              "timings": {
+                "dense_seconds": "number",
+                "embedding_seconds": "number",
+                "fusion_seconds": "number",
+                "lexical_seconds": "number",
+                "total_seconds": "number"
+              }
+            }
+          ]
+        },
+        "usage": {
+          "input_tokens": "number",
+          "output_tokens": "number",
+          "cache_read_input_tokens": "number",
+          "cache_creation_input_tokens": "number"
+        }
+      },
+      "trace": {
+        "requested_model": "atom",
+        "revision": "atom",
+        "actual_model": "atom",
+        "variant": "atom",
+        "device": "atom",
+        "fallback": "atom",
+        "error": "atom",
+        "forward_count": "atom",
+        "instruction": "atom",
+        "query_cap": "atom",
+        "document_cap": "atom",
+        "dtype": "atom",
+        "attention": "atom",
+        "prepared_sha256": "atom",
+        "elapsed_seconds": "atom",
+        "peak_gpu_bytes": "atom",
+        "input_ids": [
+          "text"
+        ],
+        "prompt_token_counts": [
+          "number"
+        ],
+        "model_files_sha256": [
+          "map",
+          [
+            "text_or_object",
+            {
+              "sha256": "text",
+              "bytes": "number"
+            }
+          ]
+        ],
+        "lengths": {
+          "query": {
+            "original": "number",
+            "retained": "number"
+          },
+          "documents": [
+            {
+              "original": "number",
+              "retained": "number"
+            }
+          ]
+        },
+        "outputs": [
+          {
+            "doc_id": "atom",
+            "score": "atom",
+            "rank": "atom",
+            "score_kind": "atom"
+          }
+        ],
+        "retries": [
+          {
+            "attempt": "atom",
+            "error": "atom",
+            "batch_size": "atom",
+            "elapsed_seconds": "atom"
+          }
+        ],
+        "profile": "atom",
+        "native_class": "atom",
+        "native_store": "atom",
+        "requested_candidates": "atom",
+        "native_internal_fetch_k": "atom",
+        "native_doc_token_limit": "atom",
+        "native_effective_token_budget": "atom",
+        "rephrase_calls": "atom",
+        "generation_calls": "atom",
+        "canonical_corpus_sha256": "atom",
+        "score_kind": "atom",
+        "seconds": "atom",
+        "ranked_ids": [
+          "text"
+        ],
+        "embedding": {
+          "attention": "atom",
+          "device": "atom",
+          "dimension": "atom",
+          "dtype": "atom",
+          "max_length": "atom",
+          "model": "atom",
+          "pooling": "atom",
+          "query_instruction": "atom",
+          "revision": "atom",
+          "model_files_sha256": [
+            "map",
+            [
+              "text_or_object",
+              {
+                "sha256": "text",
+                "bytes": "number"
+              }
+            ]
+          ]
+        }
+      },
+      "provider": {
+        "stage": "atom",
+        "attempts": "atom",
+        "cost": "atom",
+        "cost_status": "atom",
+        "elapsed_seconds": "atom",
+        "error": "atom",
+        "actual_model": "atom",
+        "requested_model": "atom",
+        "expected_reported_model": "atom",
+        "identity_status": "atom",
+        "known_response_cost": "atom",
+        "max_tokens": "atom",
+        "pacing_status": "atom",
+        "pacing_wait_seconds": "atom",
+        "prompt_hash": "atom",
+        "protocol": "atom",
+        "reasoning_prefix_removed": "atom",
+        "stop_reason": "atom",
+        "thinking": "atom",
+        "truncated": "atom",
+        "provider_error_code": "atom",
+        "usage": {
+          "input_tokens": "number",
+          "output_tokens": "number",
+          "cache_read_input_tokens": "number",
+          "cache_creation_input_tokens": "number"
+        },
+        "http_error": {
+          "status_code": "atom",
+          "retry_after_seconds": "atom",
+          "provider_error_code": "atom",
+          "provider_error_type": "atom"
+        },
+        "events": [
+          {
+            "attempt": "atom",
+            "status": "atom",
+            "cost": "atom",
+            "pacing_wait_seconds": "atom",
+            "usage": {
+              "input_tokens": "number",
+              "output_tokens": "number",
+              "cache_read_input_tokens": "number",
+              "cache_creation_input_tokens": "number"
+            }
+          }
+        ]
+      },
+      "reviews": {
+        "reviews": [
+          {
+            "review_id": "text",
+            "reason": "text",
+            "refusal": "text",
+            "nugget_coverage": [
+              "map",
+              "text"
+            ],
+            "scores": {
+              "correctness": "number",
+              "completeness": "number",
+              "faithfulness": "number",
+              "citation_support": "number",
+              "answer_relevance": "number"
+            }
+          }
+        ]
+      }
+    },
+    "excluded": [
+      "account observations",
+      "raw provider text",
+      "validation-failure response_text",
+      "all unknown fields at every explicit schema boundary"
+    ],
+    "optional_transform": {
+      "policy": "query_sk_key_pattern_v1",
+      "scope": "only original/retrieval/adaptive query text; every change disclosed",
+      "known_credentials": "reject before transformation",
+      "answer_and_evidence_text": "unchanged; key patterns still reject"
+    },
+    "not_resumable": true,
+    "metrics_source": "private complete original cohorts; never derived subsets"
+  },
+  "rules_sha256": "6183242efe0c76abb337ea368605188a405b7f08d8e95658936e21a44b171ea7",
+  "output_sha256": "8bd25f1762d3a1cfb2a4aa73f1510966566431eb0f81559afdcd650513331495",
+  "output_bytes": 770590,
+  "not_resumable": true,
+  "acceptance_scope": "projection integrity only; not cohort completeness or semantic quality",
+  "query_key_redaction": {
+    "enabled": true,
+    "fields": 0,
+    "rows": 0
+  }
+}

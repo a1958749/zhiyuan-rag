@@ -1,0 +1,453 @@
+import {
+  createListenerMiddleware,
+  createSlice,
+  isAnyOf,
+  PayloadAction,
+} from '@reduxjs/toolkit';
+
+import { Agent, AgentFolder } from '../agents/types';
+import { ActiveState, Doc, Prompt } from '../models/misc';
+import { RootState } from '../store';
+import {
+  getLocalPrompt,
+  getLocalRecentDocs,
+  setLocalApiKey,
+  setLocalRecentDocs,
+} from './preferenceApi';
+
+import type { Model } from '../models/types';
+import type { ConversationSummary } from './types';
+
+/** Chats per request; a shorter page means the oldest chat is loaded. */
+export const CONVERSATIONS_PAGE_SIZE = 30;
+
+/** Whether `c` sorts after `last` in the list's (date, id) newest-first order. */
+const isOlderThan = (
+  c: ConversationSummary,
+  last: ConversationSummary,
+): boolean => {
+  if (!c.date || !last.date) return false;
+  if (c.date !== last.date) return c.date < last.date;
+  return c.id < last.id;
+};
+export interface Preference {
+  apiKey: string;
+  prompt: { name: string; id: string; type: string };
+  prompts: Prompt[];
+  chunks: string;
+  selectedDocs: Doc[];
+  sourceDocs: Doc[] | null;
+  conversations: {
+    data: ConversationSummary[] | null;
+    loading: boolean;
+    /** Older chats exist past the last one loaded. */
+    hasMore?: boolean;
+  };
+  token: string | null;
+  modalState: ActiveState;
+  paginatedDocuments: Doc[] | null;
+  templateAgents: Agent[] | null;
+  agents: Agent[] | null;
+  sharedAgents: Agent[] | null;
+  selectedAgent: Agent | null;
+  selectedModel: Model | null;
+  availableModels: Model[];
+  modelsLoading: boolean;
+  agentFolders: AgentFolder[] | null;
+  // RBAC roles for the current principal, fetched fresh from /api/user/me each
+  // session (DB-authoritative — deliberately NOT persisted to localStorage, so
+  // a demotion can't survive a reload). ``rolesResolved`` gates UI that must
+  // not act before the first /me response (avoids a first-paint admin bounce).
+  roles: string[];
+  rolesResolved: boolean;
+  // Speech features the server has switched on (/api/config). True until the
+  // config loads, so a backend without these flags keeps showing the controls.
+  ttsAvailable: boolean;
+  sttAvailable: boolean;
+  // The server rejects unauthenticated calls (/api/config ``requires_auth``).
+  authRequired: boolean;
+  // Share of the model's window a turn's attached files may take
+  // (/api/config ``attachment_budget_share``); null until the config loads.
+  attachmentBudgetShare: number | null;
+}
+
+const initialState: Preference = {
+  apiKey: 'xxx',
+  prompt: { name: 'default', id: 'default', type: 'public' },
+  prompts: [
+    { name: 'default', id: 'default', type: 'public' },
+    { name: 'creative', id: 'creative', type: 'public' },
+    { name: 'strict', id: 'strict', type: 'public' },
+  ],
+  chunks: '6',
+  selectedDocs: [],
+  sourceDocs: null,
+  conversations: {
+    data: null,
+    loading: false,
+  },
+  token: localStorage.getItem('authToken') || null,
+  modalState: 'INACTIVE',
+  paginatedDocuments: null,
+  templateAgents: null,
+  agents: null,
+  sharedAgents: null,
+  selectedAgent: null,
+  selectedModel: null,
+  availableModels: [],
+  modelsLoading: false,
+  agentFolders: null,
+  roles: [],
+  rolesResolved: false,
+  ttsAvailable: true,
+  sttAvailable: true,
+  authRequired: false,
+  attachmentBudgetShare: null,
+};
+
+export const prefSlice = createSlice({
+  name: 'preference',
+  initialState,
+  reducers: {
+    setApiKey: (state, action) => {
+      state.apiKey = action.payload;
+    },
+    setSelectedDocs: (state, action) => {
+      state.selectedDocs = action.payload;
+    },
+    setSourceDocs: (state, action) => {
+      state.sourceDocs = action.payload;
+    },
+    setPaginatedDocuments: (state, action) => {
+      state.paginatedDocuments = action.payload;
+    },
+    setConversations: (state, action) => {
+      state.conversations = action.payload;
+    },
+    /** Flags a fetch in flight without touching the chats already listed. */
+    setConversationsLoading: (state, action: PayloadAction<boolean>) => {
+      state.conversations.loading = action.payload;
+    },
+    /**
+     * The newest page, fetched again after a new chat, a rename or a
+     * delete. It replaces the top of the list and keeps the older chats
+     * already scrolled to; a short page is the whole list.
+     */
+    setConversationsHead: (
+      state,
+      action: PayloadAction<ConversationSummary[]>,
+    ) => {
+      const head = action.payload;
+      const existing = state.conversations.data ?? [];
+      if (head.length < CONVERSATIONS_PAGE_SIZE) {
+        state.conversations = { data: head, loading: false, hasMore: false };
+        return;
+      }
+      const last = head[head.length - 1];
+      const inHead = new Set(head.map((c) => c.id));
+      const older = existing.filter(
+        (c) => !inHead.has(c.id) && isOlderThan(c, last),
+      );
+      state.conversations = {
+        data: [...head, ...older],
+        loading: false,
+        hasMore: older.length ? (state.conversations.hasMore ?? true) : true,
+      };
+    },
+    /** A newest-page fetch: merged in as above, or cleared when it failed. */
+    receiveConversations: (
+      state,
+      action: PayloadAction<{
+        data: ConversationSummary[] | null;
+        loading: boolean;
+      }>,
+    ) => {
+      if (!action.payload.data) {
+        state.conversations = { data: null, loading: false };
+        return;
+      }
+      prefSlice.caseReducers.setConversationsHead(state, {
+        type: 'preference/setConversationsHead',
+        payload: action.payload.data,
+      });
+    },
+    /** An older page, loaded as the sidebar's end scrolls into view. */
+    appendConversations: (
+      state,
+      action: PayloadAction<ConversationSummary[]>,
+    ) => {
+      const existing = state.conversations.data ?? [];
+      const seen = new Set(existing.map((c) => c.id));
+      state.conversations.data = [
+        ...existing,
+        ...action.payload.filter((c) => !seen.has(c.id)),
+      ];
+      state.conversations.hasMore =
+        action.payload.length >= CONVERSATIONS_PAGE_SIZE;
+    },
+    removeConversation: (state, action: PayloadAction<string>) => {
+      if (!state.conversations.data) return;
+      state.conversations.data = state.conversations.data.filter(
+        (c) => c.id !== action.payload,
+      );
+    },
+    /** A rename keeps the chat's place, so it is applied here, not refetched. */
+    renameConversation: (
+      state,
+      action: PayloadAction<{ id: string; name: string }>,
+    ) => {
+      const chat = state.conversations.data?.find(
+        (c) => c.id === action.payload.id,
+      );
+      if (chat) chat.name = action.payload.name;
+    },
+    setToken: (state, action) => {
+      state.token = action.payload;
+    },
+    setPrompt: (state, action) => {
+      state.prompt = action.payload;
+    },
+    setPrompts: (state, action: PayloadAction<Prompt[]>) => {
+      state.prompts = action.payload;
+    },
+    setChunks: (state, action) => {
+      state.chunks = action.payload;
+    },
+    setModalStateDeleteConv: (state, action: PayloadAction<ActiveState>) => {
+      state.modalState = action.payload;
+    },
+    setTemplateAgents: (state, action) => {
+      state.templateAgents = action.payload;
+    },
+    setAgents: (state, action) => {
+      state.agents = action.payload;
+    },
+    setSharedAgents: (state, action) => {
+      state.sharedAgents = action.payload;
+    },
+    setSelectedAgent: (state, action) => {
+      state.selectedAgent = action.payload;
+    },
+    setSelectedModel: (state, action: PayloadAction<Model | null>) => {
+      state.selectedModel = action.payload;
+    },
+    setAvailableModels: (state, action: PayloadAction<Model[]>) => {
+      state.availableModels = action.payload;
+    },
+    setModelsLoading: (state, action: PayloadAction<boolean>) => {
+      state.modelsLoading = action.payload;
+    },
+    setAgentFolders: (state, action: PayloadAction<AgentFolder[] | null>) => {
+      state.agentFolders = action.payload;
+    },
+    setRoles: (state, action: PayloadAction<string[]>) => {
+      state.roles = action.payload;
+      state.rolesResolved = true;
+    },
+    clearRoles: (state) => {
+      state.roles = [];
+      state.rolesResolved = false;
+    },
+    setSpeechAvailability: (
+      state,
+      action: PayloadAction<{ tts: boolean; stt: boolean }>,
+    ) => {
+      state.ttsAvailable = action.payload.tts;
+      state.sttAvailable = action.payload.stt;
+    },
+    setAuthRequired: (state, action: PayloadAction<boolean>) => {
+      state.authRequired = action.payload;
+    },
+    setAttachmentBudgetShare: (state, action: PayloadAction<number | null>) => {
+      state.attachmentBudgetShare = action.payload;
+    },
+  },
+});
+
+export const {
+  setApiKey,
+  setSelectedDocs,
+  setSourceDocs,
+  setConversations,
+  setConversationsHead,
+  receiveConversations,
+  appendConversations,
+  removeConversation,
+  renameConversation,
+  setConversationsLoading,
+  setToken,
+  setPrompt,
+  setPrompts,
+  setChunks,
+  setModalStateDeleteConv,
+  setPaginatedDocuments,
+  setTemplateAgents,
+  setAgents,
+  setSharedAgents,
+  setSelectedAgent,
+  setSelectedModel,
+  setAvailableModels,
+  setModelsLoading,
+  setAgentFolders,
+  setRoles,
+  clearRoles,
+  setSpeechAvailability,
+  setAuthRequired,
+  setAttachmentBudgetShare,
+} = prefSlice.actions;
+export default prefSlice.reducer;
+
+export const prefListenerMiddleware = createListenerMiddleware();
+prefListenerMiddleware.startListening({
+  matcher: isAnyOf(setApiKey),
+  effect: (action, listenerApi) => {
+    setLocalApiKey((listenerApi.getState() as RootState).preference.apiKey);
+  },
+});
+
+prefListenerMiddleware.startListening({
+  matcher: isAnyOf(setSelectedDocs),
+  effect: (action, listenerApi) => {
+    const state = listenerApi.getState() as RootState;
+    setLocalRecentDocs(
+      state.preference.selectedDocs.length > 0
+        ? state.preference.selectedDocs
+        : null,
+    );
+  },
+});
+
+prefListenerMiddleware.startListening({
+  matcher: isAnyOf(setPrompt),
+  effect: (action, listenerApi) => {
+    localStorage.setItem(
+      'DocsGPTPrompt',
+      JSON.stringify((listenerApi.getState() as RootState).preference.prompt),
+    );
+  },
+});
+
+prefListenerMiddleware.startListening({
+  matcher: isAnyOf(setChunks),
+  effect: (action, listenerApi) => {
+    localStorage.setItem(
+      'DocsGPTChunks',
+      JSON.stringify((listenerApi.getState() as RootState).preference.chunks),
+    );
+  },
+});
+
+prefListenerMiddleware.startListening({
+  matcher: isAnyOf(setSourceDocs),
+  effect: (_action, listenerApi) => {
+    const state = listenerApi.getState() as RootState;
+    const sourceDocs = state.preference.sourceDocs;
+    // ``null`` means the list hasn't loaded; an empty array is a real answer
+    // and still has to prune a stored selection, or a deleted last source
+    // stays checked forever.
+    if (!sourceDocs) return;
+    const validatedDocs = getLocalRecentDocs(sourceDocs);
+    listenerApi.dispatch(setSelectedDocs(validatedDocs ?? []));
+  },
+});
+
+prefListenerMiddleware.startListening({
+  matcher: isAnyOf(setPrompts),
+  effect: (_action, listenerApi) => {
+    const state = listenerApi.getState() as RootState;
+    const availablePrompts = state.preference.prompts;
+    if (availablePrompts && availablePrompts.length > 0) {
+      const validatedPrompt = getLocalPrompt(availablePrompts);
+      if (validatedPrompt !== null) {
+        listenerApi.dispatch(setPrompt(validatedPrompt));
+      } else {
+        const defaultPrompt =
+          availablePrompts.find((p) => p.id === 'default') ||
+          availablePrompts[0];
+        if (defaultPrompt) {
+          listenerApi.dispatch(setPrompt(defaultPrompt));
+        }
+      }
+    }
+  },
+});
+
+prefListenerMiddleware.startListening({
+  matcher: isAnyOf(setSelectedModel),
+  effect: (action, listenerApi) => {
+    const model = (listenerApi.getState() as RootState).preference
+      .selectedModel;
+    if (model) {
+      localStorage.setItem('DocsGPTSelectedModel', JSON.stringify(model));
+    } else {
+      localStorage.removeItem('DocsGPTSelectedModel');
+    }
+  },
+});
+
+// Reconcile selectedModel when availableModels changes so a deleted
+// BYOM doesn't leave a stale id in localStorage.
+prefListenerMiddleware.startListening({
+  matcher: isAnyOf(setAvailableModels),
+  effect: (_action, listenerApi) => {
+    const state = listenerApi.getState() as RootState;
+    const { selectedModel, availableModels } = state.preference;
+    if (!availableModels.length) return;
+    if (!selectedModel) return;
+    const stillValid = availableModels.some((m) => m.id === selectedModel.id);
+    if (!stillValid) {
+      listenerApi.dispatch(setSelectedModel(availableModels[0]));
+    }
+  },
+});
+
+export const selectApiKey = (state: RootState) => state.preference.apiKey;
+export const selectApiKeyStatus = (state: RootState) =>
+  !!state.preference.apiKey;
+export const selectSelectedDocsStatus = (state: RootState) =>
+  state.preference.selectedDocs.length > 0;
+export const selectSourceDocs = (state: RootState) =>
+  state.preference.sourceDocs;
+export const selectModalStateDeleteConv = (state: RootState) =>
+  state.preference.modalState;
+export const selectSelectedDocs = (state: RootState) =>
+  state.preference.selectedDocs;
+export const selectConversations = (state: RootState) =>
+  state.preference.conversations;
+export const selectConversationId = (state: RootState) =>
+  state.conversation.conversationId;
+export const selectToken = (state: RootState) => state.preference.token;
+export const selectPrompt = (state: RootState) => state.preference.prompt;
+export const selectPrompts = (state: RootState) => state.preference.prompts;
+export const selectChunks = (state: RootState) => state.preference.chunks;
+export const selectPaginatedDocuments = (state: RootState) =>
+  state.preference.paginatedDocuments;
+export const selectTemplateAgents = (state: RootState) =>
+  state.preference.templateAgents;
+export const selectAgents = (state: RootState) => state.preference.agents;
+export const selectSharedAgents = (state: RootState) =>
+  state.preference.sharedAgents;
+export const selectSelectedAgent = (state: RootState) =>
+  state.preference.selectedAgent;
+export const selectSelectedModel = (state: RootState) =>
+  state.preference.selectedModel;
+export const selectAvailableModels = (state: RootState) =>
+  state.preference.availableModels;
+export const selectModelsLoading = (state: RootState) =>
+  state.preference.modelsLoading;
+export const selectAgentFolders = (state: RootState) =>
+  state.preference.agentFolders;
+export const selectRoles = (state: RootState) => state.preference.roles;
+export const selectRolesResolved = (state: RootState) =>
+  state.preference.rolesResolved;
+export const selectIsAdmin = (state: RootState) =>
+  state.preference.roles.includes('admin');
+// Speech needs a signed-in user wherever the server requires auth, so a
+// signed-out viewer of a shared conversation gets no Speak button.
+export const selectTtsAvailable = (state: RootState) =>
+  state.preference.ttsAvailable &&
+  (!state.preference.authRequired || !!state.preference.token);
+export const selectSttAvailable = (state: RootState) =>
+  state.preference.sttAvailable;
+export const selectAttachmentBudgetShare = (state: RootState) =>
+  state.preference.attachmentBudgetShare;

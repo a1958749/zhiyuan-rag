@@ -1,0 +1,98 @@
+import { LogOut } from 'lucide-react';
+import { useTranslation } from 'react-i18next';
+
+import useTokenAuth from '../hooks/useTokenAuth';
+import { Avatar } from './ui/avatar';
+import { Button } from './ui/button';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from './ui/dropdown-menu';
+
+/**
+ * Top-right account menu for OIDC sessions: an avatar that opens a menu
+ * showing the signed-in name/email and a sign-out action. Renders nothing for
+ * other auth modes, which carry no user identity.
+ */
+export default function ProfileButton({
+  size = 'sm',
+}: {
+  /** Trigger avatar: `sm` (32px) in the desktop corner, `xs` (28px) in the mobile bar. */
+  size?: 'xs' | 'sm';
+} = {}) {
+  const { t } = useTranslation();
+  const { authType, userName, userEmail, userPicture, logout } = useTokenAuth();
+
+  if (authType !== 'oidc' || (!userName && !userEmail)) return null;
+
+  const initial = (userName || userEmail || '?').charAt(0).toUpperCase();
+  // `sm` is size-8/text-sm, `lg` is size-10/text-base; the size variant
+  // also brings the flex centring and the overflow-hidden that clips both the
+  // photo and the initials to the circle.
+  const renderAvatar = (avatarSize: 'xs' | 'sm' | 'lg') =>
+    userPicture ? (
+      <Avatar
+        size={avatarSize}
+        shape="circle"
+        src={userPicture}
+        alt={userName || userEmail || t('components.profile.avatarAlt')}
+        imgClassName="size-full object-cover"
+      />
+    ) : (
+      <Avatar size={avatarSize} shape="circle" variant="primary">
+        {initial}
+      </Avatar>
+    );
+
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        {/* inline + pill: the avatar sets the size and the Button brings
+            only the round focus ring; ghost's hover fill sits under it. */}
+        <Button
+          type="button"
+          variant="ghost"
+          size="inline"
+          shape="pill"
+          aria-label={t('auth.account')}
+        >
+          {renderAvatar(size)}
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" sideOffset={8} className="w-64">
+        <DropdownMenuLabel>
+          <div className="flex items-center gap-3">
+            {renderAvatar('lg')}
+            <span className="flex min-w-0 flex-col">
+              {userName && (
+                <span
+                  className="text-foreground truncate text-sm font-medium"
+                  title={userName}
+                >
+                  {userName}
+                </span>
+              )}
+              {userEmail && (
+                <span
+                  className="text-muted-foreground truncate text-xs font-normal"
+                  title={userEmail}
+                >
+                  {userEmail}
+                </span>
+              )}
+            </span>
+          </div>
+        </DropdownMenuLabel>
+        <DropdownMenuSeparator />
+        <DropdownMenuItem onSelect={logout} data-testid="oidc-signout">
+          <LogOut aria-hidden />
+          {t('auth.signOut')}
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}

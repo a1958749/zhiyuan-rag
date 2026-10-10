@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "devsupport"
+version = "0.1.0"
+description = "Isolated developer-support retrieval and offline evaluation"
+requires-python = ">=3.10"
+dependencies = ["pyarrow>=14", "tiktoken>=0.13,<0.15", "markdown-it-py>=2.2,<5"]
+
+[project.optional-dependencies]
+test = ["pytest>=8.4"]
+retrieval = ["numpy>=1.26", "faiss-cpu>=1.8", "bm25s==0.2.14"]
+models = ["torch==2.11.0", "transformers==4.57.6", "safetensors>=0.4"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-ra --disable-plugin-autoload"

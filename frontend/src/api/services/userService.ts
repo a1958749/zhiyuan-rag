@@ -1,0 +1,428 @@
+import apiClient, { throttledApiClient } from '../client';
+import endpoints from '../endpoints';
+
+const userService = {
+  getConfig: (): Promise<any> =>
+    throttledApiClient.get(endpoints.USER.CONFIG, null),
+  getMe: (token: string | null): Promise<any> =>
+    apiClient.get(endpoints.USER.ME, token),
+  getQuota: (token: string | null): Promise<any> =>
+    apiClient.get(endpoints.USER.QUOTA, token),
+  getNewToken: (): Promise<any> =>
+    throttledApiClient.get(endpoints.USER.NEW_TOKEN, null),
+  // Token deliberately null: a stale Authorization header must not be able
+  // to interfere with redeeming the one-time OIDC handoff code.
+  exchangeOidcCode: (code: string): Promise<any> =>
+    apiClient.post(endpoints.USER.OIDC_TOKEN, { code }, null),
+  refreshOidcSession: (token: string | null): Promise<any> =>
+    apiClient.post(endpoints.USER.OIDC_REFRESH, {}, token),
+  getDocs: (token: string | null): Promise<any> =>
+    apiClient.get(`${endpoints.USER.DOCS}`, token),
+  getDocsWithPagination: (query: string, token: string | null): Promise<any> =>
+    apiClient.get(`${endpoints.USER.DOCS_PAGINATED}?${query}`, token),
+  getAgent: (id: string, token: string | null): Promise<any> =>
+    throttledApiClient.get(endpoints.USER.AGENT(id), token),
+  getAgents: (token: string | null): Promise<any> =>
+    throttledApiClient.get(endpoints.USER.AGENTS, token),
+  getGuardrailCatalog: (token: string | null): Promise<any> =>
+    throttledApiClient.get(endpoints.USER.GUARDRAIL_CATALOG, token),
+  getGuardrailEvents: (
+    agentId: string,
+    token: string | null,
+    limit = 100,
+    offset = 0,
+    filters: { days?: number; check?: string; outcome?: string } = {},
+  ): Promise<any> =>
+    throttledApiClient.get(
+      endpoints.USER.GUARDRAIL_EVENTS(agentId, limit, offset, filters),
+      token,
+    ),
+  getGuardrailSummary: (
+    token: string | null,
+    agentId?: string,
+    days = 30,
+  ): Promise<any> =>
+    throttledApiClient.get(
+      endpoints.USER.GUARDRAIL_SUMMARY(agentId, days),
+      token,
+    ),
+  createAgent: (data: any, token: string | null): Promise<any> =>
+    apiClient.postFormData(endpoints.USER.CREATE_AGENT, data, token),
+  updateAgent: (
+    agent_id: string,
+    data: any,
+    token: string | null,
+  ): Promise<any> =>
+    apiClient.putFormData(endpoints.USER.UPDATE_AGENT(agent_id), data, token),
+  deleteAgent: (id: string, token: string | null): Promise<any> =>
+    apiClient.delete(endpoints.USER.DELETE_AGENT(id), token),
+  exportAgent: (id: string, token: string | null): Promise<Response> =>
+    apiClient.get(endpoints.USER.EXPORT_AGENT(id), token),
+  planImportAgent: (yaml: string, token: string | null): Promise<Response> =>
+    apiClient.post(endpoints.USER.IMPORT_AGENT_PLAN, { yaml }, token),
+  importAgent: (
+    payload: { yaml: string; resolution?: unknown },
+    token: string | null,
+  ): Promise<Response> =>
+    apiClient.post(endpoints.USER.IMPORT_AGENT, payload, token),
+  getPinnedAgents: (token: string | null): Promise<any> =>
+    throttledApiClient.get(endpoints.USER.PINNED_AGENTS, token),
+  togglePinAgent: (id: string, token: string | null): Promise<any> =>
+    apiClient.post(endpoints.USER.TOGGLE_PIN_AGENT(id), {}, token),
+  getSharedAgent: (id: string, token: string | null): Promise<any> =>
+    apiClient.get(endpoints.USER.SHARED_AGENT(id), token),
+  getSharedAgents: (token: string | null): Promise<any> =>
+    throttledApiClient.get(endpoints.USER.SHARED_AGENTS, token),
+  shareAgent: (data: any, token: string | null): Promise<any> =>
+    apiClient.put(endpoints.USER.SHARE_AGENT, data, token),
+  removeSharedAgent: (id: string, token: string | null): Promise<any> =>
+    apiClient.delete(endpoints.USER.REMOVE_SHARED_AGENT(id), token),
+  getTemplateAgents: (token: string | null): Promise<any> =>
+    throttledApiClient.get(endpoints.USER.TEMPLATE_AGENTS, token),
+  adoptAgent: (id: string, token: string | null): Promise<any> =>
+    apiClient.post(endpoints.USER.ADOPT_AGENT(id), {}, token),
+  getAgentWebhook: (id: string, token: string | null): Promise<any> =>
+    apiClient.get(endpoints.USER.AGENT_WEBHOOK(id), token),
+  regenerateAgentKey: (id: string, token: string | null): Promise<any> =>
+    apiClient.post(endpoints.USER.REGENERATE_AGENT_KEY(id), {}, token),
+  getPrompts: (token: string | null): Promise<any> =>
+    apiClient.get(endpoints.USER.PROMPTS, token),
+  createPrompt: (data: any, token: string | null): Promise<any> =>
+    apiClient.post(endpoints.USER.CREATE_PROMPT, data, token),
+  deletePrompt: (data: any, token: string | null): Promise<any> =>
+    apiClient.post(endpoints.USER.DELETE_PROMPT, data, token),
+  updatePrompt: (data: any, token: string | null): Promise<any> =>
+    apiClient.post(endpoints.USER.UPDATE_PROMPT, data, token),
+  getSinglePrompt: (id: string, token: string | null): Promise<any> =>
+    apiClient.get(endpoints.USER.SINGLE_PROMPT(id), token),
+  deletePath: (docPath: string, token: string | null): Promise<any> =>
+    apiClient.get(endpoints.USER.DELETE_PATH(docPath), token),
+  getMessageAnalytics: (data: any, token: string | null): Promise<any> =>
+    apiClient.post(endpoints.USER.MESSAGE_ANALYTICS, data, token),
+  getTokenAnalytics: (data: any, token: string | null): Promise<any> =>
+    apiClient.post(endpoints.USER.TOKEN_ANALYTICS, data, token),
+  getFeedbackAnalytics: (data: any, token: string | null): Promise<any> =>
+    apiClient.post(endpoints.USER.FEEDBACK_ANALYTICS, data, token),
+  getToolAnalytics: (data: any, token: string | null): Promise<any> =>
+    apiClient.post(endpoints.USER.TOOL_ANALYTICS, data, token),
+  getScheduleAnalytics: (data: any, token: string | null): Promise<any> =>
+    apiClient.post(endpoints.USER.SCHEDULE_ANALYTICS, data, token),
+  getLogs: (data: any, token: string | null): Promise<any> =>
+    apiClient.post(endpoints.USER.LOGS, data, token),
+  getTraces: (
+    params: Record<string, string>,
+    token: string | null,
+    signal?: AbortSignal,
+  ): Promise<any> =>
+    apiClient.get(
+      endpoints.USER.TRACES(new URLSearchParams(params).toString()),
+      token,
+      {},
+      signal,
+    ),
+  manageSync: (data: any, token: string | null): Promise<any> =>
+    apiClient.post(endpoints.USER.MANAGE_SYNC, data, token),
+  syncSource: (data: any, token: string | null): Promise<any> =>
+    apiClient.post(endpoints.USER.SYNC_SOURCE, data, token),
+  reingestSource: (data: any, token: string | null): Promise<any> =>
+    apiClient.post(endpoints.USER.REINGEST_SOURCE, data, token),
+  createSourceFromAttachments: (
+    data: { attachment_ids: string[]; name?: string },
+    token: string | null,
+    idempotencyKey?: string,
+  ): Promise<Response> =>
+    apiClient.post(
+      endpoints.USER.SOURCE_FROM_ATTACHMENTS,
+      data,
+      token,
+      idempotencyKey ? { 'Idempotency-Key': idempotencyKey } : {},
+    ),
+  updateSourceConfig: (
+    sourceId: string,
+    config: any,
+    token: string | null,
+  ): Promise<Response> =>
+    apiClient.patch(endpoints.USER.SOURCE_CONFIG(sourceId), config, token),
+  testSourceRetrieval: (
+    sourceId: string,
+    data: { query: string; retrieval?: any },
+    token: string | null,
+  ): Promise<Response> =>
+    apiClient.post(endpoints.USER.SOURCE_SEARCH(sourceId), data, token),
+  createWiki: (
+    data: { name: string; initial_content?: string },
+    token: string | null,
+  ): Promise<Response> =>
+    apiClient.post(endpoints.USER.CREATE_WIKI, data, token),
+  convertToWiki: (sourceId: string, token: string | null): Promise<Response> =>
+    apiClient.post(endpoints.USER.CONVERT_TO_WIKI(sourceId), {}, token),
+  enableGraphRAG: (sourceId: string, token: string | null): Promise<Response> =>
+    apiClient.post(endpoints.USER.ENABLE_GRAPHRAG(sourceId), {}, token),
+  getSourceGraph: (
+    sourceId: string,
+    token: string | null,
+    limit?: number,
+  ): Promise<Response> =>
+    throttledApiClient.get(endpoints.USER.SOURCE_GRAPH(sourceId, limit), token),
+  getSourceGraphNodes: (
+    sourceId: string,
+    params: { q?: string; type?: string; page?: number; perPage?: number },
+    token: string | null,
+  ): Promise<Response> =>
+    throttledApiClient.get(
+      endpoints.USER.SOURCE_GRAPH_NODES(sourceId, params),
+      token,
+    ),
+  getSourceGraphNode: (
+    sourceId: string,
+    nodeId: string,
+    token: string | null,
+  ): Promise<Response> =>
+    throttledApiClient.get(
+      endpoints.USER.SOURCE_GRAPH_NODE(sourceId, nodeId),
+      token,
+    ),
+  getTaskStatus: (taskId: string, token: string | null): Promise<Response> =>
+    apiClient.get(endpoints.USER.TASK_STATUS(taskId), token),
+  getWikiPages: (sourceId: string, token: string | null): Promise<Response> =>
+    throttledApiClient.get(endpoints.USER.WIKI_PAGES(sourceId), token),
+  getWikiPage: (
+    sourceId: string,
+    path: string,
+    token: string | null,
+  ): Promise<Response> =>
+    throttledApiClient.get(endpoints.USER.WIKI_PAGE(sourceId, path), token),
+  updateWikiPage: (
+    sourceId: string,
+    data: { path: string; content: string; expected_version?: number },
+    token: string | null,
+  ): Promise<Response> =>
+    apiClient.put(endpoints.USER.WIKI_PAGE(sourceId, data.path), data, token),
+  getWikiSettings: (
+    sourceId: string,
+    token: string | null,
+  ): Promise<Response> =>
+    apiClient.get(endpoints.USER.WIKI_SETTINGS(sourceId), token),
+  updateWikiSettings: (
+    sourceId: string,
+    data: { allow_outside_edits: boolean },
+    token: string | null,
+  ): Promise<Response> =>
+    apiClient.put(endpoints.USER.WIKI_SETTINGS(sourceId), data, token),
+  getAvailableTools: (token: string | null): Promise<any> =>
+    apiClient.get(endpoints.USER.GET_AVAILABLE_TOOLS, token),
+  getUserTools: (token: string | null): Promise<any> =>
+    apiClient.get(endpoints.USER.GET_USER_TOOLS, token),
+  createTool: (data: any, token: string | null): Promise<any> =>
+    apiClient.post(endpoints.USER.CREATE_TOOL, data, token),
+  updateToolStatus: (data: any, token: string | null): Promise<any> =>
+    apiClient.post(endpoints.USER.UPDATE_TOOL_STATUS, data, token),
+  updateTool: (data: any, token: string | null): Promise<any> =>
+    apiClient.post(endpoints.USER.UPDATE_TOOL, data, token),
+  deleteTool: (data: any, token: string | null): Promise<any> =>
+    apiClient.post(endpoints.USER.DELETE_TOOL, data, token),
+  parseSpec: (file: File, token: string | null): Promise<any> => {
+    const formData = new FormData();
+    formData.append('file', file);
+    return apiClient.postFormData(endpoints.USER.PARSE_SPEC, formData, token);
+  },
+  transcribeAudio: (
+    file: File,
+    token: string | null,
+    language?: string,
+  ): Promise<Response> => {
+    const formData = new FormData();
+    formData.append('file', file);
+    if (language) {
+      formData.append('language', language);
+    }
+    return apiClient.postFormData(endpoints.USER.STT, formData, token);
+  },
+  startLiveTranscription: (
+    token: string | null,
+    language?: string,
+  ): Promise<Response> =>
+    apiClient.post(
+      endpoints.USER.LIVE_STT_START,
+      language ? { language } : {},
+      token,
+    ),
+  transcribeLiveAudioChunk: (
+    sessionId: string,
+    chunkIndex: number,
+    file: File,
+    token: string | null,
+    isSilence?: boolean,
+  ): Promise<Response> => {
+    const formData = new FormData();
+    formData.append('session_id', sessionId);
+    formData.append('chunk_index', String(chunkIndex));
+    if (typeof isSilence === 'boolean') {
+      formData.append('is_silence', String(isSilence));
+    }
+    formData.append('file', file);
+    return apiClient.postFormData(
+      endpoints.USER.LIVE_STT_CHUNK,
+      formData,
+      token,
+    );
+  },
+  finishLiveTranscription: (
+    sessionId: string,
+    token: string | null,
+  ): Promise<Response> =>
+    apiClient.post(
+      endpoints.USER.LIVE_STT_FINISH,
+      { session_id: sessionId },
+      token,
+    ),
+  getDocumentChunks: (
+    docId: string,
+    page: number,
+    perPage: number,
+    token: string | null,
+    path?: string,
+    search?: string,
+  ): Promise<any> =>
+    throttledApiClient.get(
+      endpoints.USER.GET_CHUNKS(docId, page, perPage, path, search),
+      token,
+    ),
+  /** The chunk behind a citation, by the content key retrieval labelled it with. */
+  getSourceChunk: (
+    sourceId: string,
+    chunkKey: string,
+    token: string | null,
+    excerpt?: string,
+  ): Promise<Response> =>
+    throttledApiClient.get(
+      endpoints.USER.SOURCE_CHUNK(sourceId, chunkKey, excerpt),
+      token,
+    ),
+  addChunk: (data: any, token: string | null): Promise<any> =>
+    apiClient.post(endpoints.USER.ADD_CHUNK, data, token),
+  deleteChunk: (
+    docId: string,
+    chunkId: string,
+    token: string | null,
+  ): Promise<any> =>
+    apiClient.delete(endpoints.USER.DELETE_CHUNK(docId, chunkId), token),
+  updateChunk: (data: any, token: string | null): Promise<any> =>
+    apiClient.put(endpoints.USER.UPDATE_CHUNK, data, token),
+  getDirectoryStructure: (docId: string, token: string | null): Promise<any> =>
+    throttledApiClient.get(endpoints.USER.DIRECTORY_STRUCTURE(docId), token),
+  manageSourceFiles: (data: FormData, token: string | null): Promise<any> =>
+    apiClient.postFormData(endpoints.USER.MANAGE_SOURCE_FILES, data, token),
+  testMCPConnection: (data: any, token: string | null): Promise<any> =>
+    apiClient.post(endpoints.USER.MCP_TEST_CONNECTION, data, token),
+  saveMCPServer: (data: any, token: string | null): Promise<any> =>
+    apiClient.post(endpoints.USER.MCP_SAVE_SERVER, data, token),
+  getMCPAuthStatus: (token: string | null): Promise<any> =>
+    throttledApiClient.get(endpoints.USER.MCP_AUTH_STATUS, token),
+  // The source's own connection syncs it; no browser token is involved.
+  syncConnector: (docId: string, token: string | null): Promise<any> =>
+    apiClient.post(endpoints.USER.SYNC_CONNECTOR, { source_id: docId }, token),
+  getConnectorAuthUrl: (
+    provider: string,
+    token: string | null,
+    connectionId?: string,
+    install?: boolean,
+  ): Promise<any> =>
+    apiClient.get(
+      endpoints.USER.CONNECTOR_AUTH(provider, connectionId, install),
+      token,
+    ),
+  completeConnectorAuth: (
+    data: { code: string; state: string },
+    token: string | null,
+  ): Promise<any> =>
+    apiClient.post(endpoints.USER.CONNECTOR_AUTH_COMPLETE, data, token),
+  getConnectorFiles: (
+    data: any,
+    token: string | null,
+    signal?: AbortSignal,
+  ): Promise<any> =>
+    throttledApiClient.post(
+      endpoints.USER.CONNECTOR_FILES,
+      data,
+      token,
+      {},
+      signal,
+    ),
+  textToSpeech: (
+    text: string,
+    token: string | null,
+    signal?: AbortSignal,
+  ): Promise<any> =>
+    apiClient.post(endpoints.USER.TTS, { text }, token, {}, signal),
+  getAgentFolders: (token: string | null): Promise<any> =>
+    throttledApiClient.get(endpoints.USER.AGENT_FOLDERS, token),
+  createAgentFolder: (
+    data: { name: string; parent_id?: string },
+    token: string | null,
+  ): Promise<any> => apiClient.post(endpoints.USER.AGENT_FOLDERS, data, token),
+  getAgentFolder: (id: string, token: string | null): Promise<any> =>
+    apiClient.get(endpoints.USER.AGENT_FOLDER(id), token),
+  updateAgentFolder: (
+    id: string,
+    data: { name?: string; parent_id?: string },
+    token: string | null,
+  ): Promise<any> =>
+    apiClient.put(endpoints.USER.AGENT_FOLDER(id), data, token),
+  deleteAgentFolder: (id: string, token: string | null): Promise<any> =>
+    apiClient.delete(endpoints.USER.AGENT_FOLDER(id), token),
+  moveAgentToFolder: (
+    data: { agent_id: string; folder_id?: string | null },
+    token: string | null,
+  ): Promise<any> =>
+    apiClient.post(endpoints.USER.MOVE_AGENT_TO_FOLDER, data, token),
+  getArtifact: (artifactId: string, token: string | null): Promise<any> =>
+    apiClient.get(endpoints.USER.GET_ARTIFACT(artifactId), token),
+  getDocumentArtifact: (
+    artifactId: string,
+    token: string | null,
+  ): Promise<Response> =>
+    apiClient.get(endpoints.USER.GET_DOCUMENT_ARTIFACT(artifactId), token),
+  listWorkflowRunArtifacts: (
+    workflowRunId: string,
+    token: string | null,
+  ): Promise<Response> =>
+    apiClient.get(
+      endpoints.USER.LIST_WORKFLOW_RUN_ARTIFACTS(workflowRunId),
+      token,
+    ),
+  downloadArtifact: (
+    artifactId: string,
+    token: string | null,
+    version?: number,
+    disposition?: 'url',
+  ): Promise<Response> =>
+    apiClient.get(
+      endpoints.USER.DOWNLOAD_ARTIFACT(artifactId, version, disposition),
+      token,
+      // ?disposition=url asks the s3 strategy to return the presigned URL as
+      // JSON (for a top-level navigation) instead of a CORS-blocked 302; the
+      // Accept header is the same opt-in via content negotiation.
+      disposition === 'url' ? { Accept: 'application/json' } : {},
+    ),
+  restoreArtifactVersion: (
+    artifactId: string,
+    version: number,
+    token: string | null,
+  ): Promise<Response> =>
+    apiClient.post(
+      endpoints.USER.RESTORE_ARTIFACT(artifactId),
+      { version },
+      token,
+    ),
+  getWorkflow: (id: string, token: string | null): Promise<any> =>
+    apiClient.get(endpoints.USER.WORKFLOW(id), token),
+  createWorkflow: (data: any, token: string | null): Promise<any> =>
+    apiClient.post(endpoints.USER.WORKFLOWS, data, token),
+  updateWorkflow: (id: string, data: any, token: string | null): Promise<any> =>
+    apiClient.put(endpoints.USER.WORKFLOW(id), data, token),
+  deleteWorkflow: (id: string, token: string | null): Promise<any> =>
+    apiClient.delete(endpoints.USER.WORKFLOW(id), token),
+};
+
+export default userService;

@@ -1,0 +1,50 @@
+{
+  "repo": "jinaai/jina-reranker-v3.5",
+  "revision": "e8a93f33f0b22108f8c2364f8484ce3422552fbc",
+  "files": {
+    "added_tokens.json": {
+      "sha256": "7e57ca349de401cc35df7a7f04f6202f444ffaeb9ee83a5c1709f87bc99bf01b",
+      "bytes": 795
+    },
+    "config.json": {
+      "sha256": "6750b018f53b2dc66a9a584ce0c1993542166ce39f9a996f71e0d031ea9c426f",
+      "bytes": 1516
+    },
+    "generation_config.json": {
+      "sha256": "4bb63613633138e256b1fa3a1ef653feb34175620f6f92ad8f415b7a9f175be1",
+      "bytes": 202
+    },
+    "merges.txt": {
+      "sha256": "8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5",
+      "bytes": 1671853
+    },
+    "model.safetensors": {
+      "sha256": "50c684b703a1770389cd2992c6ca3c5f76ad0a270e975374c182cde3e5dfb6fe",
+      "bytes": 1193708152
+    },
+    "modeling.py": {
+      "sha256": "ec6612461b4307eb3bab089e6916c00881b7e6b2e8edfbd56a9ace4560244837",
+      "bytes": 10389
+    },
+    "README.md": {
+      "sha256": "da4fd1e360aef1139a5e0dc12cee19093e1fb7958a46682df062430a2a990ffc",
+      "bytes": 6678
+    },
+    "special_tokens_map.json": {
+      "sha256": "9c61cd9afb8a31aea657bb51fd6e53d758a1ebb288f284b0b7420cad3e8417e7",
+      "bytes": 777
+    },
+    "tokenizer.json": {
+      "sha256": "4e95945ab0cef486709f760b81efcc7a6e75747f9165d13ead29159737455803",
+      "bytes": 11423225
+    },
+    "tokenizer_config.json": {
+      "sha256": "88bbd231e995ec6cadadf7115691703b0376a64e9dae124fd59aa1508ad02ee3",
+      "bytes": 10723
+    },
+    "vocab.json": {
+      "sha256": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910",
+      "bytes": 2776833
+    }
+  }
+}

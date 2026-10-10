@@ -1,0 +1,879 @@
+from contextlib import contextmanager
+
+import pytest
+
+from docsgpt.usage import (
+    _count_prompt_tokens,
+    _count_tokens,
+    _serialize_for_token_count,
+    gen_token_usage,
+    stream_token_usage,
+)
+
+
+class _FakeTokenUsageRepo:
+    """In-memory stand-in for TokenUsageRepository used by the usage tests."""
+
+    last_instance = None
+
+    def __init__(self, conn=None):
+        self.inserted = []
+        _FakeTokenUsageRepo.last_instance = self
+
+    def insert(self, **kwargs):
+        self.inserted.append(kwargs)
+
+
+@contextmanager
+def _fake_db_session():
+    yield None
+
+
+def _install_fake_token_repo(monkeypatch):
+    """Replace TokenUsageRepository + db_session with in-memory stubs."""
+    _FakeTokenUsageRepo.last_instance = None
+    monkeypatch.setattr(
+        "docsgpt.usage.TokenUsageRepository", _FakeTokenUsageRepo
+    )
+    monkeypatch.setattr("docsgpt.usage.db_session", _fake_db_session)
+
+
+@pytest.mark.unit
+def test_count_tokens_includes_tool_call_payloads():
+    payload = [
+        {
+            "function_call": {
+                "name": "search_docs",
+                "args": {"query": "pricing limits"},
+                "call_id": "call_1",
+            }
+        },
+        {
+            "function_response": {
+                "name": "search_docs",
+                "response": {"result": "Found 3 docs"},
+                "call_id": "call_1",
+            }
+        },
+    ]
+
+    assert _count_tokens(payload) > 0
+
+
+@pytest.mark.unit
+def test_gen_token_usage_writes_row_per_call(monkeypatch):
+    """Always-on persistence: every decorated ``gen`` call writes one row."""
+    _install_fake_token_repo(monkeypatch)
+
+    class DummyLLM:
+        decoded_token = {"sub": "user_123"}
+        user_api_key = "api_key_123"
+        agent_id = "agent_123"
+        token_usage = {"prompt_tokens": 0, "generated_tokens": 0}
+
+    @gen_token_usage
+    def wrapped(self, model, messages, stream, tools, **kwargs):
+        _ = (model, messages, stream, tools, kwargs)
+        return {
+            "tool_calls": [
+                {"name": "read_webpage", "arguments": {"url": "https://example.com"}}
+            ]
+        }
+
+    messages = [
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "function_call": {
+                        "name": "search_docs",
+                        "args": {"query": "pricing"},
+                        "call_id": "1",
+                    }
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "content": [
+                {
+                    "function_response": {
+                        "name": "search_docs",
+                        "response": {"result": "Found docs"},
+                        "call_id": "1",
+                    }
+                }
+            ],
+        },
+    ]
+
+    llm = DummyLLM()
+    wrapped(llm, "gpt-4o", messages, False, None)
+
+    inserted = _FakeTokenUsageRepo.last_instance.inserted
+    assert len(inserted) == 1
+    assert inserted[0]["user_id"] == "user_123"
+    assert inserted[0]["api_key"] == "api_key_123"
+    assert inserted[0]["agent_id"] == "agent_123"
+    assert inserted[0]["prompt_tokens"] > 0
+    assert inserted[0]["generated_tokens"] > 0
+    # Default source for unmarked LLMs.
+    assert inserted[0]["source"] == "agent_stream"
+    # Running totals also accumulate on the LLM instance.
+    assert llm.token_usage["prompt_tokens"] > 0
+    assert llm.token_usage["generated_tokens"] > 0
+
+
+@pytest.mark.unit
+def test_stream_token_usage_writes_row_per_call(monkeypatch):
+    """Stream variant: same per-call write as ``gen``."""
+    _install_fake_token_repo(monkeypatch)
+
+    class ToolChunk:
+        def model_dump(self):
+            return {
+                "delta": {
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "function": {
+                                "name": "get_weather",
+                                "arguments": '{"location":"Seattle"}',
+                            },
+                        }
+                    ]
+                }
+            }
+
+    class DummyLLM:
+        decoded_token = {"sub": "user_123"}
+        user_api_key = "api_key_123"
+        agent_id = "agent_123"
+        token_usage = {"prompt_tokens": 0, "generated_tokens": 0}
+
+    @stream_token_usage
+    def wrapped(self, model, messages, stream, tools, **kwargs):
+        _ = (model, messages, stream, tools, kwargs)
+        yield ToolChunk()
+        yield "done"
+
+    messages = [
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "function_call": {
+                        "name": "get_weather",
+                        "args": {"location": "Seattle"},
+                        "call_id": "1",
+                    }
+                }
+            ],
+        }
+    ]
+
+    llm = DummyLLM()
+    list(wrapped(llm, "gpt-4o", messages, True, None))
+
+    inserted = _FakeTokenUsageRepo.last_instance.inserted
+    assert len(inserted) == 1
+    assert inserted[0]["prompt_tokens"] > 0
+    assert inserted[0]["generated_tokens"] > 0
+    assert llm.token_usage["prompt_tokens"] > 0
+    assert llm.token_usage["generated_tokens"] > 0
+
+
+@pytest.mark.unit
+def test_stream_token_usage_matches_whole_text_token_count(monkeypatch):
+    """A streamed reply must count the same tokens as the same text returned whole.
+
+    BPE merges across a split point, so summing each chunk's token count on
+    its own can only be greater than or equal to tokenizing the joined text
+    once; splitting mid-word is the simplest way to force that. ``generated_tokens``
+    feeds billing and quota, so a provider that streams in small deltas and does
+    not report its own usage (Gemini, or an OpenAI-compatible server that ignores
+    ``stream_options``) must not be charged more than one that returns the
+    identical text unstreamed.
+    """
+    _install_fake_token_repo(monkeypatch)
+    text = "The quick brown fox jumps over the lazy dog repeatedly until it gets tired."
+    chunks = [text[i : i + 3] for i in range(0, len(text), 3)]
+    assert "".join(chunks) == text
+
+    class DummyLLM:
+        decoded_token = {"sub": "user_123"}
+        user_api_key = "api_key_123"
+        agent_id = "agent_123"
+
+        def __init__(self):
+            # Instance attribute: two ``DummyLLM``s must not share one dict.
+            self.token_usage = {"prompt_tokens": 0, "generated_tokens": 0}
+
+    @gen_token_usage
+    def whole(self, model, messages, stream, tools, **kwargs):
+        _ = (model, messages, stream, tools, kwargs)
+        return text
+
+    @stream_token_usage
+    def chunked(self, model, messages, stream, tools, **kwargs):
+        _ = (model, messages, stream, tools, kwargs)
+        yield from chunks
+
+    whole_llm = DummyLLM()
+    whole(whole_llm, "gpt-4o", [], False, None)
+
+    stream_llm = DummyLLM()
+    list(chunked(stream_llm, "gpt-4o", [], True, None))
+
+    assert (
+        stream_llm.token_usage["generated_tokens"]
+        == whole_llm.token_usage["generated_tokens"]
+    )
+
+
+@pytest.mark.unit
+def test_decorator_propagates_request_id_and_source(monkeypatch):
+    """``_request_id`` + ``_token_usage_source`` on the LLM ride along
+    with the row insert so DISTINCT counts and source filters work."""
+    _install_fake_token_repo(monkeypatch)
+
+    class TitleLLM:
+        decoded_token = {"sub": "u"}
+        user_api_key = "ak"
+        agent_id = "agent"
+        token_usage = {"prompt_tokens": 0, "generated_tokens": 0}
+        _token_usage_source = "title"
+        _request_id = "req-abc-123"
+
+    @gen_token_usage
+    def wrapped(self, model, messages, stream, tools, **kwargs):
+        _ = (model, messages, stream, tools, kwargs)
+        return "title"
+
+    wrapped(TitleLLM(), "m", [{"role": "user", "content": "hi"}], False, None)
+
+    inserted = _FakeTokenUsageRepo.last_instance.inserted
+    assert len(inserted) == 1
+    assert inserted[0]["source"] == "title"
+    assert inserted[0]["request_id"] == "req-abc-123"
+
+
+@pytest.mark.unit
+def test_decorator_skips_zero_token_calls(monkeypatch):
+    """Per-call write skipped when both counts are zero (e.g., empty result)."""
+    _install_fake_token_repo(monkeypatch)
+
+    class EmptyLLM:
+        decoded_token = {"sub": "u"}
+        user_api_key = "ak"
+        agent_id = None
+        token_usage = {"prompt_tokens": 0, "generated_tokens": 0}
+
+    @gen_token_usage
+    def wrapped(self, model, messages, stream, tools, **kwargs):
+        _ = (model, messages, stream, tools, kwargs)
+        return None  # Forces both counts to 0
+
+    wrapped(EmptyLLM(), "m", [], False, None)
+
+    # When zero-token short-circuits, the repo is never instantiated.
+    assert (
+        _FakeTokenUsageRepo.last_instance is None
+        or _FakeTokenUsageRepo.last_instance.inserted == []
+    )
+
+
+@pytest.mark.unit
+def test_decorator_skips_when_no_attribution(monkeypatch, caplog):
+    """No user_id and no api_key → warn and skip."""
+    import logging
+
+    _install_fake_token_repo(monkeypatch)
+
+    class OrphanLLM:
+        decoded_token = None
+        user_api_key = None
+        agent_id = None
+        token_usage = {"prompt_tokens": 0, "generated_tokens": 0}
+
+    @gen_token_usage
+    def wrapped(self, model, messages, stream, tools, **kwargs):
+        _ = (model, messages, stream, tools, kwargs)
+        return "ok"
+
+    with caplog.at_level(logging.WARNING, logger="docsgpt.usage"):
+        wrapped(
+            OrphanLLM(),
+            "m",
+            [{"role": "user", "content": "hello"}],
+            False,
+            None,
+        )
+
+    # The decorator short-circuits before constructing the repo.
+    assert (
+        _FakeTokenUsageRepo.last_instance is None
+        or _FakeTokenUsageRepo.last_instance.inserted == []
+    )
+    assert any(
+        "no user_id/api_key" in r.message
+        for r in caplog.records
+    )
+
+
+@pytest.mark.unit
+def test_gen_token_usage_counts_tools_and_image_inputs(monkeypatch):
+    """Tools+attachments inflate the prompt-token count on the LLM's
+    running totals.
+    """
+    _install_fake_token_repo(monkeypatch)
+
+    class DummyLLM:
+        decoded_token = {"sub": "user_123"}
+        user_api_key = "api_key_123"
+        agent_id = "agent_123"
+        token_usage = {"prompt_tokens": 0, "generated_tokens": 0}
+
+    @gen_token_usage
+    def wrapped(self, model, messages, stream, tools, **kwargs):
+        _ = (model, messages, stream, tools, kwargs)
+        return "ok"
+
+    messages = [{"role": "user", "content": "What is in this image?"}]
+    tools_payload = [
+        {
+            "type": "function",
+            "function": {
+                "name": "describe_image",
+                "description": "Describe image content",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"detail": {"type": "string"}},
+                },
+            },
+        }
+    ]
+    usage_attachments = [
+        {
+            "mime_type": "image/png",
+            "path": "attachments/example.png",
+            "data": "abc123",
+        }
+    ]
+
+    llm = DummyLLM()
+    wrapped(llm, "gpt-4o", messages, False, None)
+    after_first = llm.token_usage["prompt_tokens"]
+    wrapped(
+        llm,
+        "gpt-4o",
+        messages,
+        False,
+        tools_payload,
+        _usage_attachments=usage_attachments,
+    )
+    after_second = llm.token_usage["prompt_tokens"]
+
+    # Second call carries tools+attachments → strictly more prompt tokens.
+    assert (after_second - after_first) > after_first
+
+
+@pytest.mark.unit
+def test_stream_token_usage_counts_tools_and_image_inputs(monkeypatch):
+    """Stream variant of the prompt-inflation check."""
+    _install_fake_token_repo(monkeypatch)
+
+    class DummyLLM:
+        decoded_token = {"sub": "user_123"}
+        user_api_key = "api_key_123"
+        agent_id = "agent_123"
+        token_usage = {"prompt_tokens": 0, "generated_tokens": 0}
+
+    @stream_token_usage
+    def wrapped(self, model, messages, stream, tools, **kwargs):
+        _ = (model, messages, stream, tools, kwargs)
+        yield "ok"
+
+    messages = [{"role": "user", "content": "What is in this image?"}]
+    tools_payload = [
+        {
+            "type": "function",
+            "function": {
+                "name": "describe_image",
+                "description": "Describe image content",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"detail": {"type": "string"}},
+                },
+            },
+        }
+    ]
+    usage_attachments = [
+        {
+            "mime_type": "image/png",
+            "path": "attachments/example.png",
+            "data": "abc123",
+        }
+    ]
+
+    llm = DummyLLM()
+    list(wrapped(llm, "gpt-4o", messages, True, None))
+    after_first = llm.token_usage["prompt_tokens"]
+    list(
+        wrapped(
+            llm,
+            "gpt-4o",
+            messages,
+            True,
+            tools_payload,
+            _usage_attachments=usage_attachments,
+        )
+    )
+    after_second = llm.token_usage["prompt_tokens"]
+
+    assert (after_second - after_first) > after_first
+
+
+# ── _serialize_for_token_count ──────────────────────────────────────────────
+
+
+@pytest.mark.unit
+class TestSerializeForTokenCount:
+
+    def test_string_passthrough(self):
+        assert _serialize_for_token_count("hello") == "hello"
+
+    def test_data_url_returns_empty(self):
+        data_url = "data:image/png;base64,iVBORw0KGgoAAAA..."
+        assert _serialize_for_token_count(data_url) == ""
+
+    def test_none_returns_empty(self):
+        assert _serialize_for_token_count(None) == ""
+
+    def test_bytes_returns_empty(self):
+        # Regression: image/file attachments arrive as ``bytes`` from the
+        # provider-specific message preparation. Without an explicit
+        # branch they fell through to ``str(value)`` and inflated
+        # ``prompt_tokens`` by millions per call.
+        png_header = b"\x89PNG\r\n\x1a\n" + b"\x00" * 4096
+        assert _serialize_for_token_count(png_header) == ""
+        assert _serialize_for_token_count(bytearray(png_header)) == ""
+        assert _serialize_for_token_count(memoryview(png_header)) == ""
+
+    def test_list_recursion(self):
+        result = _serialize_for_token_count(["hello", "world"])
+        assert result == ["hello", "world"]
+
+    def test_dict_skips_binary_fields(self):
+        data = {
+            "text": "hello",
+            "data": "binary_stuff",
+            "base64": "encoded_data",
+            "image_data": "img_bytes",
+        }
+        result = _serialize_for_token_count(data)
+        assert "text" in result
+        assert "data" not in result
+        assert "base64" not in result
+        assert "image_data" not in result
+
+    def test_dict_skips_base64_url(self):
+        data = {"url": "data:image/png;base64,abc123"}
+        result = _serialize_for_token_count(data)
+        assert "url" not in result
+
+    def test_dict_keeps_normal_url(self):
+        data = {"url": "https://example.com/image.png"}
+        result = _serialize_for_token_count(data)
+        assert "url" in result
+
+    def test_object_with_model_dump(self):
+        class PydanticLike:
+            def model_dump(self):
+                return {"key": "value"}
+
+        result = _serialize_for_token_count(PydanticLike())
+        assert result == {"key": "value"}
+
+    def test_object_with_to_dict(self):
+        class DictLike:
+            def to_dict(self):
+                return {"key": "value"}
+
+        result = _serialize_for_token_count(DictLike())
+        assert result == {"key": "value"}
+
+    def test_object_with_dict_attr(self):
+        class SimpleObj:
+            def __init__(self):
+                self.name = "test"
+
+        result = _serialize_for_token_count(SimpleObj())
+        assert result == {"name": "test"}
+
+    def test_number_to_string(self):
+        assert _serialize_for_token_count(42) == "42"
+
+    def test_nested_dict_with_list(self):
+        data = {"items": ["a", "b"], "nested": {"key": "val"}}
+        result = _serialize_for_token_count(data)
+        assert result["items"] == ["a", "b"]
+        assert result["nested"] == {"key": "val"}
+
+
+# ── _count_tokens ───────────────────────────────────────────────────────────
+
+
+@pytest.mark.unit
+class TestCountTokens:
+
+    def test_none_returns_zero(self):
+        assert _count_tokens(None) == 0
+
+    def test_empty_string_returns_zero(self):
+        assert _count_tokens("") == 0
+
+    def test_data_url_returns_zero(self):
+        data_url = "data:image/png;base64,iVBORw0KGgoAAAA..."
+        assert _count_tokens(data_url) == 0
+
+    def test_bytes_returns_zero(self):
+        # Regression: a multi-megabyte ``bytes`` payload (image attachment)
+        # used to be repr-stringified and counted as millions of tokens.
+        assert _count_tokens(b"\x89PNG\r\n\x1a\n" + b"\x00" * 100000) == 0
+
+    def test_dict_counts(self):
+        assert _count_tokens({"key": "some text here"}) > 0
+
+    def test_list_counts(self):
+        assert _count_tokens(["some text", "more text"]) > 0
+
+
+# ── _count_prompt_tokens ────────────────────────────────────────────────────
+
+
+@pytest.mark.unit
+class TestCountPromptTokens:
+
+    def test_empty_messages(self):
+        assert _count_prompt_tokens([], tools=None) == 0
+
+    def test_none_messages(self):
+        assert _count_prompt_tokens(None, tools=None) == 0
+
+    def test_dict_messages(self):
+        messages = [{"content": "Hello world"}]
+        tokens = _count_prompt_tokens(messages, tools=None)
+        assert tokens > 0
+
+    def test_non_dict_messages(self):
+        class MessageObj:
+            def __init__(self):
+                self.content = "Hello world"
+
+        messages = [MessageObj()]
+        tokens = _count_prompt_tokens(messages, tools=None)
+        assert tokens > 0
+
+    def test_with_tools(self):
+        messages = [{"content": "Hello"}]
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "search",
+                    "parameters": {"type": "object"},
+                },
+            }
+        ]
+        tokens_without = _count_prompt_tokens(messages, tools=None)
+        tokens_with = _count_prompt_tokens(messages, tools=tools)
+        assert tokens_with > tokens_without
+
+    def test_with_usage_attachments(self):
+        messages = [{"content": "Hello"}]
+        attachments = [{"mime_type": "text/plain", "content": "file data"}]
+        tokens_without = _count_prompt_tokens(messages, tools=None)
+        tokens_with = _count_prompt_tokens(
+            messages, tools=None, usage_attachments=attachments
+        )
+        assert tokens_with > tokens_without
+
+    def test_with_response_format(self):
+        messages = [{"content": "Hello"}]
+        tokens_without = _count_prompt_tokens(messages, tools=None)
+        tokens_with = _count_prompt_tokens(
+            messages, tools=None, response_format={"type": "json_object"}
+        )
+        assert tokens_with > tokens_without
+
+    def test_bytes_in_message_content_does_not_inflate_count(self):
+        # Production regression: a single image attachment landed as bytes
+        # inside ``content`` and the prior repr-fallback pushed
+        # ``prompt_tokens`` past 2,000,000 on Axiom. Verify the bytes
+        # branch keeps the count bounded by the surrounding text.
+        text_only = [{"content": "Summarize this image."}]
+        with_bytes = [
+            {
+                "content": [
+                    {"type": "text", "text": "Summarize this image."},
+                    {"type": "image", "data": b"\x89PNG\r\n" + b"\x00" * 200_000},
+                ]
+            }
+        ]
+        baseline = _count_prompt_tokens(text_only, tools=None)
+        with_attachment = _count_prompt_tokens(with_bytes, tools=None)
+        # 200KB of zero bytes used to register as ~200K tokens; cap the
+        # acceptable inflation at a small constant for tool-format overhead.
+        assert with_attachment - baseline < 50
+
+    def test_message_with_tool_calls_field(self):
+        messages = [
+            {
+                "content": "Hello",
+                "tool_calls": [
+                    {"id": "call_1", "function": {"name": "test", "arguments": "{}"}}
+                ],
+            }
+        ]
+        tokens = _count_prompt_tokens(messages, tools=None)
+        assert tokens > 0
+
+    def test_message_with_tool_call_id(self):
+        messages = [
+            {
+                "content": "Result of tool",
+                "tool_call_id": "call_1",
+            }
+        ]
+        tokens = _count_prompt_tokens(messages, tools=None)
+        assert tokens > 0
+
+
+# ── prompt-cache breakdown ────────────────────────────────────────────────────
+#
+# Providers report ``cached_tokens`` (and, on newer OpenAI-family models,
+# ``cache_write_tokens``) as breakdowns of ``prompt_tokens``. The prompt bin
+# stays the provider total (never subtract the details back out); the two
+# sub-bins ride alongside so persistence and the finish events can chart a
+# cache hit rate.
+
+
+class _ReportingLLM:
+    decoded_token = {"sub": "user_1"}
+    user_api_key = None
+    agent_id = None
+    token_usage = {"prompt_tokens": 0, "generated_tokens": 0}
+
+    def __init__(self, details):
+        self._last_usage = {
+            "prompt_tokens": 1000,
+            "completion_tokens": 10,
+            "total_tokens": 1010,
+        }
+        if details is not None:
+            self._last_usage["prompt_tokens_details"] = details
+        self._last_usage_claimed = False
+        self.emitted = []
+
+    def _emit_gen_finished_log(self, model, **kwargs):
+        self.emitted.append(kwargs)
+
+
+@pytest.mark.unit
+def test_prefer_provider_usage_carries_cache_bins():
+    from docsgpt.usage import _prefer_provider_usage
+
+    llm = _ReportingLLM({"cached_tokens": 800, "cache_write_tokens": 100})
+    usage = _prefer_provider_usage(llm, {"prompt_tokens": 1, "generated_tokens": 1})
+    assert usage["prompt_tokens"] == 1000
+    assert usage["generated_tokens"] == 10
+    assert usage["cached_tokens"] == 800
+    assert usage["cache_write_tokens"] == 100
+
+
+@pytest.mark.unit
+def test_prefer_provider_usage_maps_anthropic_cache_creation_to_writes():
+    from docsgpt.usage import _prefer_provider_usage
+
+    llm = _ReportingLLM({"cached_tokens": 3, "cache_creation_tokens": 9})
+    usage = _prefer_provider_usage(llm, {"prompt_tokens": 1, "generated_tokens": 1})
+    assert usage["cached_tokens"] == 3
+    assert usage["cache_write_tokens"] == 9
+
+
+@pytest.mark.unit
+def test_prefer_provider_usage_without_details_has_no_cache_keys():
+    from docsgpt.usage import _prefer_provider_usage
+
+    llm = _ReportingLLM(None)
+    usage = _prefer_provider_usage(llm, {"prompt_tokens": 1, "generated_tokens": 1})
+    assert "cached_tokens" not in usage
+    assert "cache_write_tokens" not in usage
+
+
+@pytest.mark.unit
+def test_prefer_provider_usage_keeps_the_rest_of_the_call_record():
+    from docsgpt.usage import _prefer_provider_usage
+
+    llm = _ReportingLLM(None)
+    usage = _prefer_provider_usage(
+        llm, {"prompt_tokens": 1, "generated_tokens": 1, "model": "m"}
+    )
+    assert usage["model"] == "m"
+
+
+@pytest.mark.unit
+def test_decorator_persists_and_emits_cache_bins(monkeypatch):
+    _install_fake_token_repo(monkeypatch)
+    llm = _ReportingLLM({"cached_tokens": 800, "cache_write_tokens": 100})
+
+    @gen_token_usage
+    def wrapped(self, model, messages, stream, tools, **kwargs):
+        _ = (model, messages, stream, tools, kwargs)
+        return "ok"
+
+    wrapped(llm, "m", [{"role": "user", "content": "hi"}], False, None)
+
+    row = _FakeTokenUsageRepo.last_instance.inserted[0]
+    assert row["prompt_tokens"] == 1000
+    assert row["cached_tokens"] == 800
+    assert row["cache_write_tokens"] == 100
+    assert llm.emitted[0]["cached_tokens"] == 800
+    assert llm.emitted[0]["cache_write_tokens"] == 100
+
+
+@pytest.mark.unit
+def test_decorator_omits_cache_bins_when_provider_reports_none(monkeypatch):
+    _install_fake_token_repo(monkeypatch)
+    llm = _ReportingLLM(None)
+
+    @gen_token_usage
+    def wrapped(self, model, messages, stream, tools, **kwargs):
+        _ = (model, messages, stream, tools, kwargs)
+        return "ok"
+
+    wrapped(llm, "m", [{"role": "user", "content": "hi"}], False, None)
+
+    row = _FakeTokenUsageRepo.last_instance.inserted[0]
+    assert row["cached_tokens"] is None
+    assert row["cache_write_tokens"] is None
+    assert llm.emitted[0]["cached_tokens"] is None
+    assert llm.emitted[0]["cache_write_tokens"] is None
+
+
+def _persist_with_cost(monkeypatch, llm, cost_fn):
+    from docsgpt.usage import _persist_call_usage
+
+    _install_fake_token_repo(monkeypatch)
+    monkeypatch.setattr("docsgpt.usage.compute_cost_usd", cost_fn)
+    _persist_call_usage(
+        llm, {"prompt_tokens": 1000, "generated_tokens": 10, "cached_tokens": 400}
+    )
+    return _FakeTokenUsageRepo.last_instance.inserted[0]
+
+
+class _CostLLM:
+    decoded_token = {"sub": "user_123"}
+    user_api_key = None
+    agent_id = None
+    _canonical_model_id = "priced-model"
+
+
+@pytest.mark.unit
+def test_persist_prices_the_call_by_canonical_model(monkeypatch):
+    seen = {}
+
+    def cost_fn(model, prompt, generated, cached_tokens=None, cache_write_tokens=None):
+        seen.update(model=model, prompt=prompt, generated=generated, cached=cached_tokens)
+        return 0.0123
+
+    row = _persist_with_cost(monkeypatch, _CostLLM(), cost_fn)
+
+    assert row["cost"] == 0.0123
+    assert seen == {"model": "priced-model", "prompt": 1000, "generated": 10, "cached": 400}
+
+
+@pytest.mark.unit
+def test_persist_records_byom_calls_at_zero_cost(monkeypatch):
+    llm = _CostLLM()
+    llm._is_byom = True
+
+    row = _persist_with_cost(monkeypatch, llm, lambda *a, **k: 9.9)
+
+    assert row["cost"] == 0.0
+    assert row["prompt_tokens"] == 1000
+
+
+@pytest.mark.unit
+def test_persist_keeps_the_row_when_pricing_fails(monkeypatch):
+    def boom(*args, **kwargs):
+        raise RuntimeError("registry unavailable")
+
+    row = _persist_with_cost(monkeypatch, _CostLLM(), boom)
+
+    assert row["cost"] == 0.0
+
+
+# ── Attachments are counted once ────────────────────────────────────────────
+
+
+class _Usage:
+    """Stands in for the agent's attachment dispatch."""
+
+    def __init__(self, tokens):
+        self.tokens = tokens
+
+    def usage_tokens(self, messages):
+        return self.tokens
+
+
+class _UsageLLM:
+    decoded_token = {"sub": "user_123"}
+    user_api_key = None
+    agent_id = None
+
+    def __init__(self):
+        self.token_usage = {"prompt_tokens": 0, "generated_tokens": 0}
+
+
+_INLINED = [{"role": "user", "content": "the file text is already here"}]
+_ROW = [{"id": "a1", "mime_type": "text/plain", "content": "word " * 5_000, "metadata": {}}]
+
+
+@pytest.mark.unit
+class TestAttachmentsCountedOnce:
+    def _stream(self, monkeypatch, **kwargs):
+        _install_fake_token_repo(monkeypatch)
+
+        @stream_token_usage
+        def wrapped(self, model, messages, stream, tools, **kw):
+            assert "_attachment_dispatch" not in kw
+            yield "ok"
+
+        llm = _UsageLLM()
+        list(wrapped(llm, "m", _INLINED, True, None, **kwargs))
+        return llm.token_usage["prompt_tokens"]
+
+    def test_text_already_in_the_messages_is_not_counted_again(self, monkeypatch):
+        bare = self._stream(monkeypatch)
+        counted = self._stream(monkeypatch, _usage_attachments=_ROW, _attachment_dispatch=_Usage(0))
+        assert counted == bare
+
+    def test_native_parts_are_counted_at_the_plans_size(self, monkeypatch):
+        bare = self._stream(monkeypatch)
+        counted = self._stream(monkeypatch, _usage_attachments=_ROW, _attachment_dispatch=_Usage(3_000))
+        assert counted == bare + 3_000
+
+    def test_non_streaming_counts_the_same_way(self, monkeypatch):
+        _install_fake_token_repo(monkeypatch)
+
+        @gen_token_usage
+        def wrapped(self, model, messages, stream, tools, **kw):
+            assert "_attachment_dispatch" not in kw
+            return "ok"
+
+        bare_llm, llm = _UsageLLM(), _UsageLLM()
+        wrapped(bare_llm, "m", _INLINED, False, None)
+        wrapped(llm, "m", _INLINED, False, None, _usage_attachments=_ROW, _attachment_dispatch=_Usage(700))
+        assert llm.token_usage["prompt_tokens"] == bare_llm.token_usage["prompt_tokens"] + 700

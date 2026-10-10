@@ -1,0 +1,88 @@
+{
+  "config_bytes_identical_to_v1": true,
+  "controller_sha256": "d5f7d8b7702b4ec0c68eac1ab6857fd6129005d8842d56c03f57f40c5be0bd23",
+  "final_contract_sha256": "5b0e89be88826853c5cbe1808d85798a8369791d9d757773c5cc18bd334e4674",
+  "first_test_context_audit": "test-initial-framing-context-v1/summary.json",
+  "human_ratings": 0,
+  "observed_at_utc": "2026-10-10T07:18:41.927227+00:00",
+  "observed_stage": "test_rerank150",
+  "original_failure_retained": true,
+  "original_state_sha256": "954b153ef374973e2e5afc4eb8fc7a02840b4a462e36f236b2996dc04e480b07",
+  "paid_calls_by_this_observer": 0,
+  "process": {
+    "Id": 3308,
+    "ProcessName": "python"
+  },
+  "project_complete": false,
+  "retrieval_counts": {
+    "B0": {
+      "attempted": 150,
+      "errors": 0,
+      "source_sha256": "47322c399f548455821217427590de7738888fe38fb870380febf959316430f7"
+    },
+    "B1": {
+      "attempted": 150,
+      "errors": 0,
+      "source_sha256": "5cc8c36885c36ab3b774f8850ef3bb21d76dee0a36527207cc86086ab96c379f"
+    },
+    "C": {
+      "attempted": 150,
+      "errors": 0,
+      "source_sha256": "48bbf10f4078c156ead482532ecf1dd8fc34a72067546be96fddab861f7bcc49"
+    },
+    "H0": {
+      "attempted": 150,
+      "errors": 0,
+      "source_sha256": "6b7280175e56c5621e30bcf04598413904e81ca8e535b601dd3a0e4a129f30e6"
+    },
+    "H1": {
+      "attempted": 150,
+      "errors": 0,
+      "source_sha256": "cf1a091ff43914d19fc24e5a807f69382b78f69a377706c57b448108dfd37687"
+    },
+    "U": {
+      "attempted": 150,
+      "errors": 0,
+      "source_sha256": "12d6b6019390a678229ef9176cd27daad6c6cd52a726081b1d8842876c07d6ed"
+    }
+  },
+  "schema": "devsupport.corrective-final-launch.v2",
+  "scope": "Actual launch observation, not whole TEST acceptance",
+  "session_id": 86337,
+  "state_bytes_sha256": "9abf7e2d0aabffe80ebc8cff2a0182a3b10b55d075bb5b4d30ee602b8e100747",
+  "state_snapshot": {
+    "all_non_source_contract_fields_unchanged": true,
+    "changed_framing_sources": [
+      "devsupport/scripts/audit_context_budget.py",
+      "devsupport/scripts/evaluate_pipeline.py",
+      "devsupport/scripts/evaluate_reranking.py",
+      "devsupport/scripts/report_evaluation.py",
+      "devsupport/src/devsupport/evaluate.py",
+      "devsupport/src/devsupport/experiments.py"
+    ],
+    "final_contract_sha256": "5b0e89be88826853c5cbe1808d85798a8369791d9d757773c5cc18bd334e4674",
+    "last_exit_code": 0,
+    "no_agent_paid_ui": true,
+    "notes": [
+      "Corrective parser-source version, not TEST-driven method selection.",
+      "Original local TEST retained; new local rerun is not an independent replicate.",
+      "No original paid TEST attempt is replayed."
+    ],
+    "observed_at_utc": "2026-10-10T07:15:47.665619+00:00",
+    "original_final_contract_sha256": "9c9e0edf88fd1903d0f25bff4d9f2d22ca4c604245f51769596a675866bfb65c",
+    "original_local_record_sha256": {
+      "B0": "ae6ef5a26de0d947acafb7f09b06178255a9356227faa3b02f99e32796ddfa3e",
+      "B1": "e147adca650b321f13cdd17a00c1cd2fcf58de62b7db05321eca61cbf2109e7b",
+      "C": "bc8176043a453328ef3a3dbc17f0bea81b10a6873ebec3889c6f3dac6f53af14",
+      "H0": "e3d61a8333d0f7f23d3606ecce5d42dd1e56d8952821b730e539e839197f9a31",
+      "H1": "09314e1bc24b2628847b027de96e346c32a42ae7d669cff7355b99797e156907"
+    },
+    "original_selection_sha256": "69362ffcfd4906812dfe2f5a3a845534eba6de456fb52e60ee2bf8af4784cad3",
+    "original_valid_records": 750,
+    "pid": 3308,
+    "project_complete": false,
+    "script_sha256": "d5f7d8b7702b4ec0c68eac1ab6857fd6129005d8842d56c03f57f40c5be0bd23",
+    "stage": "test_rerank150",
+    "started_at_utc": "2026-10-10T07:10:37.080587+00:00"
+  }
+}

@@ -1,0 +1,1 @@
+{"variant":"Q","pool":"H0","reranker":null,"pipeline":{"adaptive":"selective","gate_enabled":false,"context_budget":4000,"candidate_limit":50,"generation_max_tokens":2048}}

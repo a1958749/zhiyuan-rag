@@ -1,0 +1,618 @@
+import i18n from 'i18next';
+import { createSelector, createSlice, PayloadAction } from '@reduxjs/toolkit';
+
+import {
+  DismissedEntry,
+  isDismissed,
+  loadDismissed,
+  saveDismissed,
+} from '../notifications/dismissedPersistence';
+import { sseEventReceived } from '../notifications/notificationsSlice';
+import { RootState } from '../store';
+
+const DISMISSED_SOURCE_IDS_STORAGE_KEY = 'docsgpt:dismissedUploadSourceIds';
+// Must outlive the backend SSE backlog (``EVENTS_STREAM_MAXLEN`` ≈ 24h,
+// longer under light traffic). If the dismissal expires first, a replayed
+// ``source.ingest.*`` for a dismissed source auto-creates a fresh task
+// with ``dismissed=false`` and the toast re-pops. 7 days clears the window.
+const DISMISSED_SOURCE_IDS_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const DISMISSED_SOURCE_IDS_CAP = 200;
+
+function recordDismissedSourceId(
+  list: DismissedEntry[],
+  sourceId: string,
+): DismissedEntry[] {
+  const now = Date.now();
+  const cutoff = now - DISMISSED_SOURCE_IDS_TTL_MS;
+  const next = list.filter(
+    (entry) => entry.at >= cutoff && entry.id !== sourceId,
+  );
+  next.push({ id: sourceId, at: now });
+  return next.length > DISMISSED_SOURCE_IDS_CAP
+    ? next.slice(-DISMISSED_SOURCE_IDS_CAP)
+    : next;
+}
+
+export interface Attachment {
+  id: string; // Client-side state-management id (uuid generated in MessageInput)
+  fileName: string;
+  progress: number;
+  status: 'uploading' | 'processing' | 'completed' | 'failed';
+  taskId: string; // Server-assigned celery task ID (used for API calls)
+  /**
+   * Server-assigned attachment id (stable across the lifecycle —
+   * ``attachment.*`` SSE events use this in ``scope.id``). Set as
+   * soon as the upload response returns. Distinct from ``id``
+   * (client) and ``taskId`` (celery).
+   */
+  attachmentId?: string;
+  token_count?: number;
+  /** Mime type the server stored (a converted TIFF/BMP reports ``image/png``). */
+  mimeType?: string;
+  /**
+   * ``metadata.extraction.status`` of a completed attachment: ``ok``, or
+   * ``no_text`` for a scanned PDF kept for models that read it natively.
+   */
+  extractionStatus?: string;
+  /** Why a ``failed`` attachment failed, when known (server or client gate). */
+  errorMessage?: string;
+  /**
+   * How many ``attachment.queued`` / ``attachment.progress`` events the row
+   * has taken, live or replayed. The composer's processing watchdog reads a
+   * change as a sign of life, so it fails only a file that went silent.
+   */
+  activity?: number;
+}
+
+export type UploadTaskStatus =
+  'preparing' | 'uploading' | 'training' | 'completed' | 'failed';
+
+export interface UploadTask {
+  id: string;
+  fileName: string;
+  progress: number;
+  status: UploadTaskStatus;
+  taskId?: string;
+  /**
+   * Server-derived source id (uuid5 over the idempotency key) returned by
+   * the upload endpoint. Used to correlate inbound SSE ingest events
+   * (``source.ingest.*``) back to this task without consulting the
+   * polling endpoint.
+   */
+  sourceId?: string;
+  errorMessage?: string;
+  dismissed?: boolean;
+  /**
+   * Ingest phase from the latest ``source.ingest.progress`` event:
+   * ``parsing`` (parse/OCR, lower band of the bar) or ``embedding``
+   * (upper band). Drives the phase label in ``UploadToast``.
+   */
+  stage?: 'parsing' | 'embedding';
+  /**
+   * Flipped when ``source.ingest.completed`` carries
+   * ``payload.limited === true`` (the worker hit a token cap during
+   * ingest). The slice routes such events to a failed status and
+   * sets this flag so ``UploadToast`` can surface a translated
+   * token-limit message instead of a generic error. Forward-looking:
+   * no worker code path sets ``limited: true`` today.
+   */
+  tokenLimitReached?: boolean;
+}
+
+/** ``attachment.*`` events held for a row that has not learned its id yet. */
+interface EarlyAttachmentEvents {
+  /** Wallclock ms of the first stashed event, for the TTL. */
+  at: number;
+  events: Array<{ type: string; payload: Record<string, unknown> }>;
+}
+
+interface UploadState {
+  attachments: Attachment[];
+  tasks: UploadTask[];
+  /** Persisted dismissed sourceIds; keeps backlog-replay auto-creates silent. */
+  dismissedSourceIds: DismissedEntry[];
+  /**
+   * ``attachment.*`` events that arrived before their upload response,
+   * keyed by attachment id. The worker can finish a small file before the
+   * response tells the row its attachment id; these are replayed onto the
+   * row once it does. Bounded by ``EARLY_ATTACHMENT_EVENTS_CAP`` and
+   * ``EARLY_ATTACHMENT_EVENTS_TTL_MS``.
+   */
+  earlyAttachmentEvents: Record<string, EarlyAttachmentEvents>;
+}
+
+/** Most attachment ids whose early events are held at once. */
+export const EARLY_ATTACHMENT_EVENTS_CAP = 200;
+/**
+ * How long early events wait for their row. The response that binds the id
+ * follows the event by about one round trip, so minutes is generous.
+ */
+export const EARLY_ATTACHMENT_EVENTS_TTL_MS = 2 * 60_000;
+/** Events kept per attachment; the worker sends about four per file. */
+const EARLY_EVENTS_PER_ATTACHMENT_CAP = 8;
+
+/**
+ * Give a completed row the server's attachment id as its ``id``.
+ *
+ * Every send path reads ``id``; until completion it holds the client
+ * placeholder, which the backend cannot resolve and silently drops. A row
+ * can complete through the SSE reducer or through ``updateAttachment``
+ * (the race recovery, when the terminal event beat the upload response),
+ * so both go through here.
+ */
+function bindServerId(attachment: Attachment): Attachment {
+  if (attachment.status === 'completed' && attachment.attachmentId) {
+    attachment.id = attachment.attachmentId;
+  }
+  return attachment;
+}
+
+/** An attachment ready to go out with a message: its server id and name. */
+export interface SendableAttachment {
+  id: string;
+  fileName: string;
+}
+
+/**
+ * The attachments a send should carry: completed rows only, by server id.
+ *
+ * The one place that decides which id goes on the wire, so every send path
+ * (chat, agent preview, shared chat, workflow runs) sends the same thing.
+ * A repeated server id is sent once.
+ */
+export function toSendableAttachments(
+  attachments: Attachment[],
+): SendableAttachment[] {
+  const seen = new Set<string>();
+  const sendable: SendableAttachment[] = [];
+  for (const attachment of attachments) {
+    if (attachment.status !== 'completed') continue;
+    const id = attachment.attachmentId ?? attachment.id;
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    sendable.push({ id, fileName: attachment.fileName });
+  }
+  return sendable;
+}
+
+/**
+ * The reason an ``attachment.failed`` event gives (its ``error``), if any.
+ *
+ * Args:
+ *   payload: The event's payload.
+ *
+ * Returns:
+ *   The worker's reason, or undefined when it sent none.
+ */
+export function attachmentFailureReason(
+  payload: Record<string, unknown>,
+): string | undefined {
+  const error = payload.error;
+  return typeof error === 'string' && error.trim() ? error.trim() : undefined;
+}
+
+/**
+ * Apply one ``attachment.*`` event to its row. Shared by the live SSE path
+ * and the replay of events that arrived before the row knew its id.
+ */
+function applyAttachmentEvent(
+  attachment: Attachment,
+  type: string,
+  payload: Record<string, unknown>,
+): void {
+  switch (type) {
+    case 'attachment.queued':
+    case 'attachment.progress': {
+      if (attachment.status === 'completed' || attachment.status === 'failed') {
+        break;
+      }
+      attachment.status = 'processing';
+      attachment.activity = (attachment.activity ?? 0) + 1;
+      const current = Number(payload.current);
+      if (Number.isFinite(current)) {
+        const clamped = Math.max(0, Math.min(100, current));
+        if (clamped > attachment.progress) {
+          attachment.progress = clamped;
+        }
+      }
+      break;
+    }
+    case 'attachment.completed': {
+      attachment.status = 'completed';
+      attachment.progress = 100;
+      bindServerId(attachment);
+      const tokenCount = Number(payload.token_count);
+      if (Number.isFinite(tokenCount)) {
+        attachment.token_count = tokenCount;
+      }
+      if (typeof payload.mime_type === 'string') {
+        attachment.mimeType = payload.mime_type;
+      }
+      if (typeof payload.extraction_status === 'string') {
+        attachment.extractionStatus = payload.extraction_status;
+      }
+      break;
+    }
+    case 'attachment.failed': {
+      attachment.status = 'failed';
+      const reason = attachmentFailureReason(payload);
+      if (reason) attachment.errorMessage = reason;
+      break;
+    }
+    default:
+      break;
+  }
+}
+
+function pruneEarlyAttachmentEvents(state: UploadState): void {
+  const cutoff = Date.now() - EARLY_ATTACHMENT_EVENTS_TTL_MS;
+  for (const [id, entry] of Object.entries(state.earlyAttachmentEvents)) {
+    if (entry.at < cutoff) delete state.earlyAttachmentEvents[id];
+  }
+}
+
+/**
+ * Hold an event whose row has not learned its attachment id yet. Only while
+ * an upload is still waiting for its response: otherwise the event belongs
+ * to another tab or to the backlog a page load replays.
+ */
+function stashEarlyAttachmentEvent(
+  state: UploadState,
+  attachmentId: string,
+  type: string,
+  payload: Record<string, unknown>,
+): void {
+  const awaitingId = state.attachments.some(
+    (a) => a.status === 'uploading' && !a.attachmentId,
+  );
+  if (!awaitingId) return;
+  pruneEarlyAttachmentEvents(state);
+  let entry = state.earlyAttachmentEvents[attachmentId];
+  if (!entry) {
+    const ids = Object.keys(state.earlyAttachmentEvents);
+    for (let i = 0; i <= ids.length - EARLY_ATTACHMENT_EVENTS_CAP; i++) {
+      delete state.earlyAttachmentEvents[ids[i]];
+    }
+    entry = { at: Date.now(), events: [] };
+    state.earlyAttachmentEvents[attachmentId] = entry;
+  }
+  entry.events.push({ type, payload });
+  if (entry.events.length > EARLY_EVENTS_PER_ATTACHMENT_CAP) {
+    entry.events.splice(
+      0,
+      entry.events.length - EARLY_EVENTS_PER_ATTACHMENT_CAP,
+    );
+  }
+}
+
+/** Replay the events stashed for ``attachment``'s id onto it, then drop them. */
+function replayEarlyAttachmentEvents(
+  state: UploadState,
+  attachment: Attachment,
+): void {
+  const attachmentId = attachment.attachmentId;
+  if (!attachmentId) return;
+  pruneEarlyAttachmentEvents(state);
+  const entry = state.earlyAttachmentEvents[attachmentId];
+  if (!entry) return;
+  delete state.earlyAttachmentEvents[attachmentId];
+  for (const event of entry.events) {
+    applyAttachmentEvent(attachment, event.type, event.payload);
+  }
+}
+
+const initialState: UploadState = {
+  attachments: [],
+  tasks: [],
+  earlyAttachmentEvents: {},
+  dismissedSourceIds: loadDismissed(
+    DISMISSED_SOURCE_IDS_STORAGE_KEY,
+    DISMISSED_SOURCE_IDS_TTL_MS,
+  ),
+};
+
+export const uploadSlice = createSlice({
+  name: 'upload',
+  initialState,
+  reducers: {
+    addAttachment: (state, action: PayloadAction<Attachment>) => {
+      state.attachments.push(action.payload);
+      const added = state.attachments[state.attachments.length - 1];
+      if (added.attachmentId) replayEarlyAttachmentEvents(state, added);
+    },
+    updateAttachment: (
+      state,
+      action: PayloadAction<{
+        id: string;
+        updates: Partial<Attachment>;
+      }>,
+    ) => {
+      const index = state.attachments.findIndex(
+        (att) => att.id === action.payload.id,
+      );
+      if (index !== -1) {
+        state.attachments[index] = bindServerId({
+          ...state.attachments[index],
+          ...action.payload.updates,
+        });
+        // The upload response just told this row its attachment id:
+        // apply whatever the worker reported before it arrived.
+        if (action.payload.updates.attachmentId) {
+          replayEarlyAttachmentEvents(state, state.attachments[index]);
+        }
+      }
+    },
+    removeAttachment: (state, action: PayloadAction<string>) => {
+      state.attachments = state.attachments.filter(
+        (att) => att.id !== action.payload,
+      );
+    },
+    // Reorder attachments array by moving item from sourceIndex to destinationIndex
+    reorderAttachments: (
+      state,
+      action: PayloadAction<{ sourceIndex: number; destinationIndex: number }>,
+    ) => {
+      const { sourceIndex, destinationIndex } = action.payload;
+      if (
+        sourceIndex < 0 ||
+        destinationIndex < 0 ||
+        sourceIndex >= state.attachments.length ||
+        destinationIndex >= state.attachments.length
+      )
+        return;
+
+      const [moved] = state.attachments.splice(sourceIndex, 1);
+      state.attachments.splice(destinationIndex, 0, moved);
+    },
+    clearAttachments: (state) => {
+      state.attachments = state.attachments.filter(
+        (att) => att.status === 'uploading' || att.status === 'processing',
+      );
+    },
+    addUploadTask: (state, action: PayloadAction<UploadTask>) => {
+      state.tasks.unshift(action.payload);
+    },
+    updateUploadTask: (
+      state,
+      action: PayloadAction<{
+        id: string;
+        updates: Partial<UploadTask>;
+      }>,
+    ) => {
+      const index = state.tasks.findIndex(
+        (task) => task.id === action.payload.id,
+      );
+      if (index !== -1) {
+        const updates = action.payload.updates;
+        const existingSourceId = state.tasks[index].sourceId;
+        const incomingSourceId = updates.sourceId;
+        const effectiveSourceId = incomingSourceId ?? existingSourceId;
+        const sourceWasDismissed =
+          !!effectiveSourceId &&
+          isDismissed(state.dismissedSourceIds, effectiveSourceId);
+
+        // Re-surface on terminal status, except when the sourceId was
+        // dismissed in a prior session (don't re-pop after reload).
+        if (
+          (updates.status === 'completed' || updates.status === 'failed') &&
+          !sourceWasDismissed
+        ) {
+          state.tasks[index] = {
+            ...state.tasks[index],
+            ...updates,
+            dismissed: false,
+          };
+        } else {
+          state.tasks[index] = {
+            ...state.tasks[index],
+            ...updates,
+          };
+        }
+
+        // Absorb an SSE auto-created duplicate. When ``source.ingest.*``
+        // events arrive before this update binds the sourceId (worker
+        // beats the upload XHR's onload), the SSE reducer cannot match
+        // the client row and auto-creates a second row keyed by
+        // sourceId — the "two docs at once" toast. Merge whatever state
+        // the orphan accumulated during the race window and drop it.
+        if (incomingSourceId) {
+          const dupIndex = state.tasks.findIndex(
+            (t, i) => i !== index && t.sourceId === incomingSourceId,
+          );
+          if (dupIndex !== -1) {
+            const dup = state.tasks[dupIndex];
+            const row = state.tasks[index];
+            if (dup.progress > row.progress) row.progress = dup.progress;
+            if (dup.stage) row.stage = dup.stage;
+            if (dup.status === 'completed' || dup.status === 'failed') {
+              row.status = dup.status;
+              row.errorMessage = dup.errorMessage;
+              row.tokenLimitReached = dup.tokenLimitReached;
+              if (!sourceWasDismissed) row.dismissed = false;
+            }
+            state.tasks.splice(dupIndex, 1);
+          }
+        }
+      }
+    },
+    dismissUploadTask: (state, action: PayloadAction<string>) => {
+      const index = state.tasks.findIndex((task) => task.id === action.payload);
+      if (index !== -1) {
+        state.tasks[index] = {
+          ...state.tasks[index],
+          dismissed: true,
+        };
+        // Persist by sourceId so a reload doesn't re-pop via the SSE
+        // backlog replay's auto-create branch.
+        const sourceId = state.tasks[index].sourceId;
+        if (sourceId) {
+          state.dismissedSourceIds = recordDismissedSourceId(
+            state.dismissedSourceIds,
+            sourceId,
+          );
+          saveDismissed(
+            DISMISSED_SOURCE_IDS_STORAGE_KEY,
+            state.dismissedSourceIds,
+          );
+        }
+      }
+    },
+    removeUploadTask: (state, action: PayloadAction<string>) => {
+      state.tasks = state.tasks.filter((task) => task.id !== action.payload);
+    },
+  },
+  extraReducers: (builder) => {
+    // Consume backend SSE ingest events for sub-second progress and
+    // terminal-status updates. The match is by ``sourceId`` (set by
+    // the upload endpoint's response). Polling stays as the
+    // correctness-of-record fallback in Upload.tsx.
+    builder.addCase(sseEventReceived, (state, action) => {
+      const e = action.payload;
+      const scopeId =
+        typeof e.scope?.id === 'string' && e.scope.id.length > 0
+          ? e.scope.id
+          : undefined;
+
+      // Attachment events flow through the same SSE pipe; route them
+      // to ``state.attachments`` matched by ``attachmentId``. SSE is
+      // the sole driver of attachment state transitions — polling
+      // has been removed. An event that beats its upload response is
+      // stashed until the row learns its id; events for attachments
+      // uploaded in another session are dropped.
+      if (e.type.startsWith('attachment.') && scopeId) {
+        const attachment = state.attachments.find(
+          (a) => a.attachmentId === scopeId,
+        );
+        const payload = (e.payload || {}) as Record<string, unknown>;
+        if (attachment) {
+          applyAttachmentEvent(attachment, e.type, payload);
+        } else {
+          stashEarlyAttachmentEvent(state, scopeId, e.type, payload);
+        }
+        return;
+      }
+
+      if (!e.type.startsWith('source.ingest.')) return;
+      if (!scopeId) return;
+      // ``source.ingest.*`` payloads do not carry a celery task_id
+      // (see ``application/worker.py`` — only ``source_id`` /
+      // ``job_name`` / ``filename`` are published), so ``sourceId``
+      // is the only correlation key.
+      const payload = (e.payload || {}) as Record<string, unknown>;
+      let task = state.tasks.find((t) => t.sourceId === scopeId);
+      if (!task) {
+        // Auto-create on backlog/live SSE when the local task is gone
+        // (page refresh mid-ingest). Skip ``completed`` so the historical
+        // backlog doesn't pop toasts for already-finished sources.
+        if (e.type === 'source.ingest.completed') return;
+        const fileName =
+          (typeof payload.filename === 'string' && payload.filename) ||
+          (typeof payload.job_name === 'string' && payload.job_name) ||
+          scopeId;
+        const previouslyDismissed = isDismissed(
+          state.dismissedSourceIds,
+          scopeId,
+        );
+        task = {
+          id: scopeId,
+          fileName,
+          progress: 0,
+          status: 'training',
+          sourceId: scopeId,
+          dismissed: previouslyDismissed,
+        };
+        state.tasks.push(task);
+        task = state.tasks[state.tasks.length - 1];
+      }
+      const wasTerminal =
+        task.status === 'completed' || task.status === 'failed';
+      const sourceWasDismissed =
+        !!task.sourceId && isDismissed(state.dismissedSourceIds, task.sourceId);
+
+      switch (e.type) {
+        case 'source.ingest.queued':
+          // Don't regress a task already past 'training' (e.g. the
+          // queued event arrives after the upload XHR finished and
+          // status flipped to 'training'). Idempotent on retries.
+          if (task.status === 'preparing' || task.status === 'uploading') {
+            task.status = 'training';
+            task.progress = 0;
+          }
+          break;
+        case 'source.ingest.progress': {
+          const current = Number(payload.current);
+          if (!Number.isFinite(current)) break;
+          // Clamp + monotonic — never regress an already-higher value.
+          const clamped = Math.max(0, Math.min(100, current));
+          if (task.status === 'completed' || task.status === 'failed') break;
+          task.status = 'training';
+          if (clamped > task.progress) task.progress = clamped;
+          if (payload.stage === 'parsing' || payload.stage === 'embedding') {
+            task.stage = payload.stage;
+          }
+          break;
+        }
+        case 'source.ingest.completed':
+          if (payload.limited === true) {
+            // Token-cap reached during ingest — surface as a failure
+            // so the toast shows the translated limit message rather
+            // than a misleading success state.
+            task.status = 'failed';
+            task.progress = 100;
+            task.tokenLimitReached = true;
+            task.errorMessage = undefined;
+            // Only un-dismiss on the initial terminal transition;
+            // duplicate envelopes (StrictMode remount, reconnect
+            // overlap) must not re-pop a user-dismissed toast.
+            if (!wasTerminal && !sourceWasDismissed) task.dismissed = false;
+          } else {
+            task.status = 'completed';
+            task.progress = 100;
+            task.errorMessage = undefined;
+            task.tokenLimitReached = false;
+            if (!wasTerminal && !sourceWasDismissed) task.dismissed = false;
+          }
+          break;
+        case 'source.ingest.failed':
+          task.status = 'failed';
+          task.errorMessage =
+            typeof payload.error === 'string'
+              ? payload.error
+              : i18n.t('modals.uploadDoc.progress.ingestionFailed');
+          if (!wasTerminal && !sourceWasDismissed) task.dismissed = false;
+          break;
+        default:
+          break;
+      }
+    });
+  },
+});
+
+export const {
+  addAttachment,
+  updateAttachment,
+  removeAttachment,
+  reorderAttachments,
+  clearAttachments,
+  addUploadTask,
+  updateUploadTask,
+  dismissUploadTask,
+  removeUploadTask,
+} = uploadSlice.actions;
+
+export const selectAttachments = (state: RootState) => state.upload.attachments;
+export const selectCompletedAttachments = createSelector(
+  [selectAttachments],
+  (attachments) => attachments.filter((att) => att.status === 'completed'),
+);
+export const selectSendableAttachments = createSelector(
+  [selectAttachments],
+  toSendableAttachments,
+);
+export const selectSendableAttachmentIds = createSelector(
+  [selectSendableAttachments],
+  (sendable) => sendable.map((attachment) => attachment.id),
+);
+export const selectUploadTasks = (state: RootState) => state.upload.tasks;
+
+export default uploadSlice.reducer;

@@ -1,0 +1,46 @@
+{
+  "all_non_source_contract_fields_identical": true,
+  "controller_sha256": "d5f7d8b7702b4ec0c68eac1ab6857fd6129005d8842d56c03f57f40c5be0bd23",
+  "controller_synthetic_passed": 19,
+  "core": {
+    "exit_code": 0,
+    "passed": 833,
+    "session": 56282,
+    "warnings": 4
+  },
+  "corrected_contract_preflight_sha256": "5b0e89be88826853c5cbe1808d85798a8369791d9d757773c5cc18bd334e4674",
+  "independent_controller_synthetic_passed": 16,
+  "independent_core_passed": 833,
+  "main_commit": "fa9a1859a4d341d2a2b2a033d8c5801365200330",
+  "no_original_paid_TEST_attempt": true,
+  "observed_at_utc": "2026-10-10T07:10:32.700068+00:00",
+  "original_final_sha256": "9c9e0edf88fd1903d0f25bff4d9f2d22ca4c604245f51769596a675866bfb65c",
+  "original_records_preserved": 750,
+  "review_p1_p2_remaining": 0,
+  "source_snapshots": {
+    "devsupport/scripts/audit_context_budget.py": {
+      "corrected": "9ff808417944f2ff53b789f251b83958d7678a27daab26ceebc37dc3bbe76f48",
+      "original": "ac84defa1e7ceb30d26ce183ae66227dd5cf6e9cd50a4bed97650891b7a703ad"
+    },
+    "devsupport/scripts/evaluate_pipeline.py": {
+      "corrected": "91602cf03ebd8f51bd498c87e4c6cec9f64fa132420212ca83080c73f7492f27",
+      "original": "06bba358096bae1a254cebfcadf67c743243b55c2959e1abff7345e18fa1b390"
+    },
+    "devsupport/scripts/evaluate_reranking.py": {
+      "corrected": "e2afa0c4f8f5062ae626f7cd62addd4292f35caa580b85ebe4b991840f88060a",
+      "original": "5cdd585445a3b04468f688845928d2a98ad8c134751bb385948180f503588211"
+    },
+    "devsupport/scripts/report_evaluation.py": {
+      "corrected": "648a4467695ea38b13cc6e168cdc96c09ad8e58d53a5e8c1e7674ed0f9ad06e8",
+      "original": "647e445471c8557152c0773d0b2fdd73772481324a7ceac1afa4984b6c1b50a6"
+    },
+    "devsupport/src/devsupport/evaluate.py": {
+      "corrected": "4e336f657922641df05421ce908ce79f5e84eac9f1e42ed83a02a9ffad453734",
+      "original": "55d0eebf9fcc7782bddacf29996c1c6dbc90879fb655177eb9348186b431bfc8"
+    },
+    "devsupport/src/devsupport/experiments.py": {
+      "corrected": "0e505770adc6ca61836f62198202fa1417b3804f9f2a0fbc52050f2fbed90ac0",
+      "original": "2d6c6917df3a47032e6765940bc3a01488cb6a47410ac7718336744ae9ea9f3f"
+    }
+  }
+}
