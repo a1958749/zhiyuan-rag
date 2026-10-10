@@ -56,7 +56,17 @@ INTERNAL_KEY=<生成的一串随机值，API和worker使用同一个值>
 
 普通启动会按原生配置准备 embedding 模型，首次下载需要网络和时间。没有自己的回答模型时，可以临时使用下一步的 `--mock-llm` 检查界面连通性；mock 输出不能作为真实文档问答或效果验证。
 
-### 3. 启动服务与页面
+### 3. 配置前端的本地 API 地址
+
+在仓库根目录执行（已有 `frontend/.env.local` 时不要覆盖，打开后核对地址）：
+
+```powershell
+Copy-Item frontend/.env.example frontend/.env.local
+```
+
+macOS / Linux 对应 `cp frontend/.env.example frontend/.env.local`。模板指向 `http://localhost:7091`；自定义API端口时同时修改 `VITE_API_HOST` 与 `VITE_BASE_URL`。这个步骤不能省略：源码开发页面不会自动从后端 `.env` 获取API地址，未配置时部分请求会使用上游云端地址或空地址。前端配置只存公开地址和功能开关，**不要放模型密钥**。
+
+### 4. 启动服务与页面
 
 ```powershell
 uv run python -m docsgpt dev --ui
@@ -70,7 +80,7 @@ Windows 再在第二个终端、同一仓库根目录启动调度器：
 uv run python -m docsgpt beat
 ```
 
-无付费生成的界面连通性检查用 `uv run python -m docsgpt dev --ui --mock-llm`；完成后切回真实配置，才能检验回答质量。自定义 API 端口时也要在 `frontend/.env.local` 设置对应 `VITE_API_HOST`，避免页面请求旧端口。
+无付费生成的界面连通性检查用 `uv run python -m docsgpt dev --ui --mock-llm`；完成后切回真实配置，才能检验回答质量。修改前端 `.env.local` 后重启开发命令，页面才会读取新地址。
 
 不要用上游已构建的远程镜像替代本仓库源码 UI，否则会看不到知源的名称、语言选择和使用指南。
 
@@ -81,6 +91,7 @@ uv run python -m docsgpt beat
 | 上传了却答不出 | 处理是否完成、聊天中是否选中正确来源、原文是否含答案 |
 | 文档入库失败 | worker 是否运行、INTERNAL_KEY 是否一致、文件是否能提取文字 |
 | 模型连接失败 | API 地址、模型名、密钥、额度和服务商状态 |
+| 页面连接不到本地 API | 是否复制了frontend/.env.example、两个API地址与实际端口是否一致、修改后是否重启 |
 | 知识库为空 | 自己的文件、数据库、索引没有随源码打包，需要重新添加 |
 | 想更换知识主题 | 新建来源并上传即可；不需要重新训练大模型 |
 | 想改分块方式 | 来源设置中修改；重新索引后生效 |
@@ -96,6 +107,6 @@ uv run python -m docsgpt beat
 
 ## English quick guide
 
-This download contains source code, not a standalone desktop installer. Install Python 3.12, Node.js 22, uv and Docker, then follow the dependency, database and `.env` steps above with your own model credentials. Start `uv run python -m docsgpt dev --ui`, open **http://localhost:5173**, and keep the worker running. On Windows, run `uv run python -m docsgpt beat` in a second terminal.
+This download contains source code, not a standalone desktop installer. Install Python 3.12, Node.js 22, uv and Docker, then follow the dependency, database and `.env` steps above with your own model credentials. Copy **frontend/.env.example** to **frontend/.env.local** without overwriting an existing configuration; the frontend needs both API URLs to point to your local backend. Never put model keys in frontend variables. Start `uv run python -m docsgpt dev --ui`, open **http://localhost:5173**, and keep the worker running. On Windows, run `uv run python -m docsgpt beat` in a second terminal.
 
 In **Settings → General → Language**, choose **English**. Open **User guide**, download the sample TXT, upload it in **Settings → Knowledge**, wait for indexing, then select that source in the chat input. Ask who owns the Star River demo and when it starts; check for **Lin**, **Friday at 3 pm** and a citation you can open. Product help is fixed text and does not call an AI model.

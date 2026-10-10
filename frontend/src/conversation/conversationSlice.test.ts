@@ -1,5 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
+// These cases inspect the REST mock. A developer's streaming .env.local
+// must not silently send them to a different mocked handler at import time.
+vi.hoisted(() => {
+  vi.stubEnv('VITE_API_STREAMING', 'false');
+  vi.stubEnv('VITE_USE_V1_API', 'false');
+});
+
 vi.mock('./conversationHandlers', () => ({
   handleFetchAnswer: vi.fn().mockResolvedValue(null),
   handleFetchAnswerSteaming: vi.fn().mockResolvedValue(undefined),
