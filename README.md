@@ -6,6 +6,8 @@
 
 这是需要自行部署的源码版。先阅读 **[安装与首次使用指南](GETTING_STARTED.md)**，配置自己的数据库和模型服务，再开始使用。
 
+首次部署使用指南中的源码启动流程。根目录旧 `setup.ps1` / `setup.sh` 默认安装上游镜像，可能显示原版 DocsGPT 界面。
+
 [安装与首次使用](GETTING_STARTED.md) · [下载最新源码 ZIP](https://github.com/a1958749/zhiyuan-rag/archive/refs/heads/main.zip) · [反馈问题](https://github.com/a1958749/zhiyuan-rag/issues)
 
 ## 可以做什么
@@ -93,6 +95,9 @@ Coverage@10 增量的 95% 配对 bootstrap 区间为 **[+3.16, +13.53] 个百分
 
 普通使用者先按 **[GETTING_STARTED.md](GETTING_STARTED.md)** 启动，无需逐个阅读源码目录。
 
+<details>
+<summary>展开源码目录用途</summary>
+
 | 目录 / 文件 | 用途 |
 |---|---|
 | `frontend/` | 网页界面与中英文使用引导 |
@@ -106,6 +111,8 @@ Coverage@10 增量的 95% 配对 bootstrap 区间为 **[+3.16, +13.53] 个百分
 | `.env-template`、`pyproject.toml`、`uv.lock` | 配置模板与 Python 依赖 |
 
 许可证和来源说明保留在根目录；贡献说明、安全提示和来源版本记录统一放在 `.github/`。
+
+</details>
 
 ## 使用时注意
 

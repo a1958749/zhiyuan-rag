@@ -1,4 +1,6 @@
 # DocsGPT Setup PowerShell Script for Windows
+# Legacy upstream installer: defaults to upstream Docker images, not the Zhiyuan source UI.
+# For Zhiyuan, follow GETTING_STARTED.md instead.
 # PowerShell -ExecutionPolicy Bypass -File .\setup.ps1
 
 # Script execution policy - uncomment if needed

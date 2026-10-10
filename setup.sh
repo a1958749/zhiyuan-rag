@@ -1,4 +1,6 @@
 #!/bin/bash
+# Legacy upstream installer: defaults to upstream Docker images, not the Zhiyuan source UI.
+# For Zhiyuan, follow GETTING_STARTED.md instead.
 
 # Color codes
 GREEN='\033[0;32m'
