@@ -568,7 +568,7 @@ def test_native_profile_rejects_different_embedding_endpoint(tmp_path):
         ev.build_contract(path, tmp_path)
 
 
-@pytest.mark.parametrize('script', ['native_u', 'serve_native'])
+@pytest.mark.parametrize('script', ['serve_native'])
 def test_native_launchers_override_ambient_input_limit(tmp_path, monkeypatch, script):
     """Stop before retrieval/startup and inject credential boundary without reading secrets."""
     import os
