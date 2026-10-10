@@ -1,7 +1,11 @@
 import { renderToStaticMarkup } from 'react-dom/server';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import i18n from '../../locale/i18n';
+
+beforeEach(async () => {
+  await i18n.changeLanguage('en');
+});
 
 import ScheduleStatusBadge, {
   formatStatusLabel,

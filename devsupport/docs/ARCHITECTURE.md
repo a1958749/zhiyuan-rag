@@ -1,11 +1,14 @@
 # 架构与工程决策
 
-更新：2026-10-09。
+更新：2026-10-10。产品名称为“知源 · 个人 RAG 知识助手”，DevSupport 保留为专业演示和实验模块名称。
 
 ```mermaid
 flowchart LR
-  UI[DocsGPT 原生 UI 7091] --> Native[ASGI API / 原生权限与来源]
-  Native --> Bridge[DevSupport 适配器]
+  UI[知源 UI / DocsGPT 外壳 7091] --> Help[独立产品帮助 / 固定本地文本]
+  UI --> Native[ASGI API / 原生权限与来源]
+  Native --> Source{选择的来源}
+  Source -->|用户上传的知识库| NativeRAG[原生解析 / 分块 / 索引 / RAG]
+  Source -->|AI开发演示来源| Bridge[DevSupport 适配器]
   Bridge --> Pipeline[共享 Pipeline 8094]
   Eval[离线评测器] --> Core[同一 Retriever / Pipeline]
   Pipeline --> Core
@@ -15,6 +18,10 @@ flowchart LR
   Native --> Worker[Celery worker + beat]
   Worker --> DB[现有 PostgreSQL / Redis]
 ```
+
+普通上传资料走 DocsGPT 的原生入库和检索路径；FreshStack 演示来源走独立共享 pipeline。两者都能用于知识问答，但专用 Hybrid 实验并未自动迁移到任意上传知识库，不能把专业演示成绩归给普通上传功能。
+
+产品帮助是第三条路径：`productHelp.ts` 使用已初始化的 i18next 实例读取固定中英文文本，Redux 不触发 React 翻译初始化。独立帮助请求在 `fetchAnswer` 中直接返回，不发出回答请求；历史产品问答在显示层替换为同一说明，服务器原记录仍保留。正常内容问题或带附件请求不走帮助快捷分支。首页与 `/help` 页面提供上传、等待入库、选来源、查引用的步骤，说明见根目录 `GETTING_STARTED.md`。
 
 ## 数据与接口边界
 
@@ -56,7 +63,7 @@ Provider trace 包含 requested_model、actual_model、identity_status、usage�
 |---|---|
 | 复用 DocsGPT 与共享 pipeline | 避免演示 UI 与评测走不同检索实现；增加适配和多进程运行成本 |
 | 完整语料、官方 ID 和审计去重 | 保留可比性及困难干扰项；索引和实验更耗时 |
-| 下一阶段以 H0 为基础、暂不加 R | DEV12 AI 评价中含失败整体效用最高；仍是诊断性小样本，须完成后续 DEV 选择并验证留出集 |
+| 正式默认 H0，不加 R/Q/G | 完整 DEV 评价及控制完成后在 TEST 前选定；TEST150八种本地条件已完成，其余生成/控制/复检仍在验证，不能依 TEST 改选 |
 | Q/G 分开消融 | 避免把多检索与多拒答混成单一收益 |
 | 统一代理 token 装箱 | 替代造成证据不足的旧字节协议；可复现但不等同未知生成 tokenizer |
 | 配置后 U 单列 | U 共用 Qwen，且原生 45,000 token 候选预算会裁剪；不可冒充原厂默认基线 |

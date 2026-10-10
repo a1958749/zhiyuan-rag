@@ -4,6 +4,10 @@
 
 当前配置为 `configs/evaluation.final.v2.json`，与 v1 配置字节相同；锁为 `reports/final-evaluation-lock-v2.json`，SHA256 为 `5b0e89be88826853c5cbe1808d85798a8369791d9d757773c5cc18bd334e4674`。实际启动证明为 `reports/final-controller-launch-verification-20261010-v2.json`。源代码修正提交为 fa9a185。原750条的修正后离线上下文审计也已完整通过，见 `reports/test-initial-framing-context-v1/summary.json`；这不是另一个独立测试样本。
 
+后续进程状态：最初v2与第一次续跑v3已明确异常退出；当前v4只继续原目录未尝试的问题，保留B0的19条、20条历史前缀及失败记录，不重放付费失败。当前权威状态为 `reports/final-workflow-resume-20261010-v4.json`；不能把旧v2状态文件称为仍在运行。八种本地TEST150已完成，TEST30生成仍在执行。
+
+最终公开工具现在核验v2停止、v3停止、v4完成，三者合同一致，并对B0已计费前缀同时校验字节hash、记录digest与顺序。仍要求完整20个队列文件、1,720条记录和全部后续审计；续跑不能绕过完成门槛。37项离线回归通过，实际预检因v4尚在执行而正确拒绝最终发布，见 `reports/final-publication-preparation-v3/verification.json`。该验证只证明报告工具，当前没有生成最终完整公开结果。
+
 ## DEV 选择的前置证据
 
 当前四组 `H0 / Q / G / Full` 必须各有相同顺序的全部 12 条记录，失败保留，且没有未决调用。完成对应 AI 评分和 10 道 DEV 控制题的四组对照后，联合记录：含失败效用、回答覆盖、误拒答、无支持控制题回答率、澄清决策、分阶段耗时、实际请求与 token 使用。控制标签未经人工审核，AI 分数不称准确率。生成失败不能充当知识不足拒答；回退和已修复的中间错误单列。

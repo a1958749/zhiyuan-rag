@@ -303,6 +303,9 @@ describe('fixed product help without model calls', () => {
       '个人 RAG 知识助手',
     );
     expect(store.getState().conversation.queries[0].response).toContain('等待');
+    expect(store.getState().conversation.queries[0].response).not.toMatch(
+      /\[使用指南\]\(\/help\)/,
+    );
     expect(store.getState().conversation.status).toBe('idle');
     expect(handleFetchAnswer).not.toHaveBeenCalled();
     expect(handleFetchAnswerSteaming).not.toHaveBeenCalled();

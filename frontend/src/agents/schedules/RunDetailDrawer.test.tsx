@@ -2,7 +2,7 @@ import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import '../../locale/i18n';
+import i18n from '../../locale/i18n';
 import type { ScheduleRun } from '../types/schedule';
 import RunDetailDrawer from './RunDetailDrawer';
 
@@ -11,7 +11,8 @@ Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
 let container: HTMLDivElement;
 let root: Root;
 
-beforeEach(() => {
+beforeEach(async () => {
+  await i18n.changeLanguage('en');
   container = document.createElement('div');
   document.body.appendChild(container);
   root = createRoot(container);

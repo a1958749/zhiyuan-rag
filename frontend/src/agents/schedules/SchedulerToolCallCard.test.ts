@@ -1,8 +1,12 @@
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import '../../locale/i18n';
+import i18n from '../../locale/i18n';
+
+beforeEach(async () => {
+  await i18n.changeLanguage('en');
+});
 
 import SchedulerToolCallCard, {
   extractToolError,

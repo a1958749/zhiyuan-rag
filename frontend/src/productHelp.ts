@@ -1,4 +1,4 @@
-import i18n from './locale/i18n';
+import i18n from 'i18next';
 
 export const helpSteps = ['upload', 'wait', 'select', 'ask'] as const;
 export const helpFacts = [
@@ -40,6 +40,5 @@ export function productHelpAnswer(): string {
       (fact) =>
         `- **${i18n.t(`productHelp.facts.${fact}.title`)}**：${i18n.t(`productHelp.facts.${fact}.body`)}`,
     ),
-    `[${i18n.t('productHelp.title')}](/help)`,
   ].join('\n\n');
 }

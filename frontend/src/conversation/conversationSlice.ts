@@ -1,5 +1,5 @@
 import { envVar } from '@/env';
-import i18n from '../locale/i18n';
+import i18n from 'i18next';
 import { isProductHelpQuestion, productHelpAnswer } from '../productHelp';
 import {
   createAsyncThunk,
