@@ -1,6 +1,0 @@
-DevSupport native upload acceptance fixture
-
-This file is a synthetic local test document. It is separate from the frozen FreshStack benchmark.
-The fixture release marker is DS-UPLOAD-OCT08.
-The fixture's document-processing check is: upload, parse, embed, save, and retrieve the original text.
-No user credentials, external account data, or benchmark reference answers are included.
