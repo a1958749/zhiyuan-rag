@@ -68,19 +68,32 @@ macOS / Linux 对应 `cp frontend/.env.example frontend/.env.local`。模板指�
 
 ### 4. 启动服务与页面
 
+**Windows / PowerShell：使用三个终端，均从仓库根目录开始。**
+
+终端一启动 API 和 worker，并保持运行：
+
 ```powershell
-uv run python -m docsgpt dev --ui
+uv run python -m docsgpt dev
 ```
 
-保持这个终端运行，打开 **http://localhost:5173**。API 默认在 **http://localhost:7091**；本地 Vite 页面是 5173。普通知识查询需要 worker，不能只开一个前端页面。
+终端二启动前端，并保持运行：
 
-Windows 再在第二个终端、同一仓库根目录启动调度器：
+```powershell
+Set-Location frontend
+npm run dev
+```
+
+终端三启动调度器，并保持运行：
 
 ```powershell
 uv run python -m docsgpt beat
 ```
 
-无付费生成的界面连通性检查用 `uv run python -m docsgpt dev --ui --mock-llm`；完成后切回真实配置，才能检验回答质量。修改前端 `.env.local` 后重启开发命令，页面才会读取新地址。
+然后打开 **http://localhost:5173**。API 默认在 **http://localhost:7091**；本地 Vite 页面是 5173。普通知识查询需要 worker，不能只开一个前端页面。Windows 当前 CLI 的 `--ui` 子进程使用 `npm`，本机实测得到 `FileNotFoundError`，因此指南使用上述分别启动的方式；PowerShell 中的 `npm run dev` 可以解析到 `npm.cmd`。
+
+**macOS / Linux：**可以在终端一使用 `uv run python -m docsgpt dev --ui`，由开发命令同时启动 API、worker 和前端。Windows 的终端二对应 `cd frontend`，适用于需要单独启动前端的情况。
+
+无付费生成的界面连通性检查：Windows 将终端一改为 `uv run python -m docsgpt dev --mock-llm`，保留另外两个终端；macOS / Linux 使用 `uv run python -m docsgpt dev --ui --mock-llm`。完成后切回真实配置，才能检验回答质量。修改前端 `.env.local` 后重启前端命令，页面才会读取新地址。
 
 不要用上游已构建的远程镜像替代本仓库源码 UI，否则会看不到知源的名称、语言选择和使用指南。
 
@@ -92,6 +105,7 @@ uv run python -m docsgpt beat
 | 文档入库失败 | worker 是否运行、INTERNAL_KEY 是否一致、文件是否能提取文字 |
 | 模型连接失败 | API 地址、模型名、密钥、额度和服务商状态 |
 | 页面连接不到本地 API | 是否复制了frontend/.env.example、两个API地址与实际端口是否一致、修改后是否重启 |
+| Windows启动提示找不到npm | 按上方三个终端方式启动，前端在PowerShell中执行npm run dev |
 | 知识库为空 | 自己的文件、数据库、索引没有随源码打包，需要重新添加 |
 | 想更换知识主题 | 新建来源并上传即可；不需要重新训练大模型 |
 | 想改分块方式 | 来源设置中修改；重新索引后生效 |
@@ -107,6 +121,6 @@ uv run python -m docsgpt beat
 
 ## English quick guide
 
-This download contains source code, not a standalone desktop installer. Install Python 3.12, Node.js 22, uv and Docker, then follow the dependency, database and `.env` steps above with your own model credentials. Copy **frontend/.env.example** to **frontend/.env.local** without overwriting an existing configuration; the frontend needs both API URLs to point to your local backend. Never put model keys in frontend variables. Start `uv run python -m docsgpt dev --ui`, open **http://localhost:5173**, and keep the worker running. On Windows, run `uv run python -m docsgpt beat` in a second terminal.
+This download contains source code, not a standalone desktop installer. Install Python 3.12, Node.js 22, uv and Docker, then follow the dependency, database and `.env` steps above with your own model credentials. Copy **frontend/.env.example** to **frontend/.env.local** without overwriting an existing configuration; the frontend needs both API URLs to point to your local backend. Never put model keys in frontend variables. On **Windows**, use three terminals: `uv run python -m docsgpt dev`; `cd frontend` then `npm run dev`; and `uv run python -m docsgpt beat`. Keep them running and open **http://localhost:5173**. The current CLI cannot locate the Windows npm executable when using `--ui`, so the frontend starts separately. On **macOS/Linux**, use `uv run python -m docsgpt dev --ui`.
 
 In **Settings → General → Language**, choose **English**. Open **User guide**, download the sample TXT, upload it in **Settings → Knowledge**, wait for indexing, then select that source in the chat input. Ask who owns the Star River demo and when it starts; check for **Lin**, **Friday at 3 pm** and a citation you can open. Product help is fixed text and does not call an AI model.

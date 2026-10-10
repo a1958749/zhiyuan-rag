@@ -12,7 +12,9 @@
 
 当前共享上下文协议为4,000 `cl100k_base_proxy_v1`代理tokens，校验上游打包tokenizer的SHA256，不代表未知网关生成模型的精确token数。旧4,000 UTF-8字节报告仅作被取代的诊断，不混合汇总。DEV所有选型对照、四组控制与八种本地TEST150及上下文审计已完成；最终TEST30生成/控制、Q/QAlways TEST150、完整汇总及最终版视频仍在进行。真人盲评按用户要求暂缓，实际0。详情见`EXPERIMENTS.md`。
 
-当前最终默认是H0，Full仅是评测合同中H0的别名；服务的旧`--enable-full`开关会启用历史Q+gate实验流程，与选定H0不等价，因此仍不启用该开关。实际串行控制器为PID3308/session86337，合同SHA为`5b0e89be88826853c5cbe1808d85798a8369791d9d757773c5cc18bd334e4674`。进程、阶段和健康每次以新鲜检查为准，不凭这些历史标识重新启动。禁止在付费队列活跃时并行提交UI问题或网关探针。
+当前最终默认是H0，Full仅是评测合同中H0的别名；服务的旧`--enable-full`开关会启用历史Q+gate实验流程，与选定H0不等价，因此仍不启用该开关。最初PID3308/session86337与v3续跑均已异常退出；当前续跑入口为v4，状态为`reports/final-workflow-resume-20261010-v4.json`，最近确认的运行会话为26952、PID32496。合同SHA仍为`5b0e89be88826853c5cbe1808d85798a8369791d9d757773c5cc18bd334e4674`。进程、阶段和健康每次以新鲜检查为准，不凭这些历史标识重新启动。禁止在付费队列活跃时并行提交UI问题或网关探针。
+
+普通下载者的入口是根目录`GETTING_STARTED.md`，不必照搬本机F盘路径或先重建FreshStack。Windows首次启动使用三个PowerShell终端：`uv run python -m docsgpt dev`启动API/worker；在`frontend`执行`npm run dev`；另开终端`uv run python -m docsgpt beat`。当前CLI的`--ui`在Python子进程中使用`npm`，本机真实探针得到`FileNotFoundError`，而`npm.cmd --version`成功。此处采用独立启动前端的方式，未修改正在评测的原生Python源码，也未宣称整套新机器安装已通过。
 
 ## 环境与启动顺序
 

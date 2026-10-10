@@ -1,0 +1,43 @@
+{
+  "schema": "devsupport.windows-first-run-verification.v1",
+  "observed_at_utc": "2026-10-10T10:49:01.246002+00:00",
+  "source_sha256": {
+    "GETTING_STARTED.md": "425520666547d92d1bcfcf7bcf52604cc1372d6efffd9f592b3a1ef74cb79da3",
+    "devsupport/docs/RUNBOOK.md": "a518b6263df0b3fb6d247ccfdb4861cee28bf1d3877a7343a20651f702c22dbd",
+    "frontend/.env.example": "c9a00456ae5c8c8cab8afba105a8ab11ec2e221c438c9e9dc6b75b3ad89cd0ed",
+    "docsgpt/deploy/dev.py": "f955e2e72c298c2549653e286bda1f1c440de962ff62b53bdaaccc546bb0b12b",
+    "devsupport/reports/ui/zhiyuan-extracted-guide-20261010.png": "c3ba912e2bb328d8adfea0de6f77a306f9ca662762934f3abb8b26bf3f0e23e5"
+  },
+  "subprocess_probe": {
+    "npm": {
+      "error_type": "FileNotFoundError"
+    },
+    "npm.cmd": {
+      "exit_code": 0,
+      "version": "11.9.0"
+    }
+  },
+  "documentation_workaround": "Three PowerShell terminals: dev, frontend npm run dev, beat",
+  "cli_source_mutated": false,
+  "frozen_contract_sha256": "5b0e89be88826853c5cbe1808d85798a8369791d9d757773c5cc18bd334e4674",
+  "extracted_frontend": {
+    "source_archive_sha256": "9c099ced3e951f5e39fcb94f5ca926f8c737208011566d7cc8f2ba54ebc87df3",
+    "node": "22.23.3",
+    "vite": "8.3.1",
+    "url": "http://127.0.0.1:7096/help",
+    "guide_rendered": true,
+    "existing_backend_conversations_loaded": true,
+    "sample_download_link_rendered": true,
+    "frontend_environment_exact_template_copy": true,
+    "node_modules_reused_via_junction": true,
+    "existing_backend_reused": true,
+    "temporary_vite_session": 21568,
+    "temporary_vite_session_stopped": true,
+    "fresh_dependency_install_executed": false,
+    "fresh_machine_full_install_verified": false,
+    "new_document_upload_or_paid_answer_executed": false,
+    "existing_controlled_select_warning_retained": true
+  },
+  "paid_calls": 0,
+  "project_complete": false
+}
