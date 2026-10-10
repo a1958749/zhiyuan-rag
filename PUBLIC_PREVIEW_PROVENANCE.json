@@ -236,5 +236,12 @@
     },
     "paid_calls": 0,
     "project_complete": false
+  },
+  "publication_authorization": {
+    "user_instruction": "先推送一版",
+    "visibility": "public",
+    "destination": "https://github.com/a1958749/zhiyuan-rag",
+    "version": "v0.1.0-preview",
+    "project_complete": false
   }
 }
