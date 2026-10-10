@@ -94,13 +94,3 @@ note. Hidden entries are left out. After adding, moving or removing a page, or c
 npm run llms          # rewrite public/llms.txt
 npm run llms:check    # what CI runs: fails if the committed file is out of date
 ```
-
-## Style
-
-Prose is checked by [Vale](https://vale.sh) with the rules in `.github/styles`. CI runs it on
-pull requests that change Markdown and fails on errors. If you have Vale installed, run the same
-check from the repository root:
-
-```bash
-vale --minAlertLevel=error docs
-```

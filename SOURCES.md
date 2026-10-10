@@ -1,6 +1,6 @@
 # 来源与许可证
 
-本项目基于 [DocsGPT](https://github.com/arc53/DocsGPT/tree/43bc3dfd0e0fca2246e669e34aadabe03fa70a1d) 二次开发。聊天、原生文档上传、会话、基础引用和其他上游能力来自 DocsGPT。上游 MIT 许可证保留在根目录 [LICENSE](LICENSE)，固定来源记录见 [UPSTREAM_PROVENANCE.json](UPSTREAM_PROVENANCE.json)。
+本项目基于 [DocsGPT](https://github.com/arc53/DocsGPT/tree/43bc3dfd0e0fca2246e669e34aadabe03fa70a1d) 二次开发。聊天、原生文档上传、会话、基础引用和其他上游能力来自 DocsGPT。上游 MIT 许可证保留在根目录 [LICENSE](LICENSE)，固定来源记录见 [UPSTREAM_PROVENANCE.json](.github/UPSTREAM_PROVENANCE.json)。
 
 技术文档检索组件可使用以下独立资源；源码不分发这些模型权重或完整数据。部署者需要遵守对应许可证和模型服务条款。
 
